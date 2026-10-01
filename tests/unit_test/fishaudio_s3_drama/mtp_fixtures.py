@@ -10,10 +10,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 import torch
 from pydantic import BaseModel
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
     Qwen3_5MoeTextConfig as TransformersTextConfig,
 )
@@ -132,6 +133,21 @@ PROMPT_LENGTHS = {
     "c100": 100,
 }
 WAVE_PROMPTS = ["p2", "p5", "p9", "p13", "p23", "p31", "p40", "p60"]
+FP8_MAX = 448.0
+FP8_BLOCK_SIZE = 128
+# The offline quantizer floors a block's bfloat16 amax at bfloat16(1e-10).
+FP8_BLOCK_AMAX_FLOOR = 1e-10
+QUANTIZATION_CONFIG: dict[str, str | list[int]] = {
+    "quant_method": "bsgemm-moe",
+    "weight_block_size": [FP8_BLOCK_SIZE, FP8_BLOCK_SIZE],
+    "activation_scheme": "dynamic",
+}
+EXPERT_WEIGHT_SUFFIXES = (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")
+# How a checkpoint stores the routed experts: block-fp8 with fp32 dequant
+# multipliers, or those values multiplied back out to bfloat16.
+ExpertFormat = Literal["fp8", "dequantized"]
+# The layers a quantization config chooses a method for.
+QuantizableLayerKind = Literal["linear", "embedding", "routed_experts"]
 
 
 class RequestSpec(BaseModel):
@@ -158,6 +174,7 @@ class EngineSpec(BaseModel):
     total_gpu_memory_fraction: float
     prompts: dict[str, list[list[int]]]
     scenarios: list[Scenario]
+    record_moe_calls: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -184,10 +201,23 @@ class RequestStep:
 
 
 @dataclass(frozen=True, kw_only=True)
+class MoeCall:
+    """One routed-expert (FusedMoE) call, copied before the shared expert is added."""
+
+    layer_index: int
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    output: torch.Tensor
+
+
+@dataclass(frozen=True, kw_only=True)
 class ForwardRecord:
     forward_index: int
     is_extend: bool
     steps: list[RequestStep]
+    # Every FusedMoE call of the forward, when the spec records them.
+    moe_calls: list[MoeCall] = field(default_factory=list)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -233,8 +263,39 @@ class EngineFacts:
 
 
 @dataclass(frozen=True, kw_only=True)
+class ExpertLayerFacts:
+    """A FusedMoE layer as the engine runs it, after weight post-processing."""
+
+    quant_method: str
+    runner_backend: str
+    uses_fp8_w8a8: bool
+    block_shape: list[int] | None
+    fused_shared_expert_count: int
+    # The layer's w13 / w2 weights, and their scales when quantized.
+    tensors: dict[str, torch.Tensor]
+
+
+@dataclass(frozen=True, kw_only=True)
+class LayerQuantMethod:
+    layer_kind: QuantizableLayerKind
+    quant_method: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class LoadFacts:
+    # Parameters still holding the NaN they were filled with before loading.
+    unloaded_parameters: list[str]
+    quant_methods: dict[str, LayerQuantMethod]
+    parameter_dtypes: dict[str, torch.dtype]
+    expert_layers: dict[int, ExpertLayerFacts]
+    is_deep_gemm_enabled: bool
+    device_capability: tuple[int, int]
+
+
+@dataclass(frozen=True, kw_only=True)
 class EngineRun:
     facts: EngineFacts
+    load_facts: LoadFacts
     baseline_free_counts: FreePoolCounts
     scenarios: list[ScenarioOutcome]
     outcomes: dict[str, RequestOutcome]
@@ -346,6 +407,82 @@ def write_synthetic_checkpoint(checkpoint_dir: Path) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     save_file(tensors, checkpoint_dir / "model.safetensors")
     (checkpoint_dir / "config.json").write_text(json.dumps(CHECKPOINT_CONFIG))
+
+
+def block_expanded(block_values: torch.Tensor) -> torch.Tensor:
+    """Per-block values repeated over each 128x128 block of the weight."""
+    return block_values.repeat_interleave(FP8_BLOCK_SIZE, dim=0).repeat_interleave(
+        FP8_BLOCK_SIZE, dim=1
+    )
+
+
+def quantize_block_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """e4m3 values and fp32 per-128x128-block dequant multipliers, as quantized offline.
+
+    The block amax is taken in bfloat16; the multiplier is 1 / (448 / amax), two
+    fp32 divisions, so that value * multiplier dequantizes.
+    """
+    row_count, column_count = weight.shape
+    if row_count % FP8_BLOCK_SIZE != 0 or column_count % FP8_BLOCK_SIZE != 0:
+        raise ValueError(
+            f"block-fp8 needs dims divisible by {FP8_BLOCK_SIZE}; got "
+            f"{tuple(weight.shape)}"
+        )
+    else:
+        pass
+    weight = weight.to(torch.bfloat16)
+    blocks = weight.reshape(
+        row_count // FP8_BLOCK_SIZE,
+        FP8_BLOCK_SIZE,
+        column_count // FP8_BLOCK_SIZE,
+        FP8_BLOCK_SIZE,
+    )
+    amax_floor = torch.tensor(FP8_BLOCK_AMAX_FLOOR).to(torch.bfloat16)
+    amax = torch.maximum(blocks.abs().amax(dim=(1, 3)), amax_floor).float()
+    quant_scale = FP8_MAX / amax
+    scale_inv = 1.0 / quant_scale
+    values = (weight.float() * block_expanded(quant_scale)).clamp(-FP8_MAX, FP8_MAX)
+    return values.to(torch.float8_e4m3fn), scale_inv
+
+
+def dequantize_block_fp8(values: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    """fp32 weight the block-fp8 values stand for."""
+    return values.float() * block_expanded(scale_inv)
+
+
+def is_routed_expert_weight(checkpoint_name: str) -> bool:
+    return ".mlp.experts." in checkpoint_name and checkpoint_name.endswith(
+        EXPERT_WEIGHT_SUFFIXES
+    )
+
+
+def write_expert_variant(
+    source_dir: Path, target_dir: Path, expert_format: ExpertFormat
+) -> dict[str, torch.Tensor]:
+    """Rewrite the source checkpoint's routed experts in expert_format; copy the rest.
+
+    Returns the expert tensors written: values and their .weight_scale_inv for
+    fp8, bfloat16 weights for dequantized.
+    """
+    tensors = load_file(source_dir / "model.safetensors")
+    expert_tensors = {}
+    for name in [name for name in tensors if is_routed_expert_weight(name)]:
+        values, scale_inv = quantize_block_fp8(tensors[name])
+        if expert_format == "fp8":
+            expert_tensors[name] = values
+            expert_tensors[f"{name}_scale_inv"] = scale_inv
+        else:
+            dequantized = dequantize_block_fp8(values, scale_inv)
+            expert_tensors[name] = dequantized.to(torch.bfloat16)
+    tensors.update(expert_tensors)
+    if expert_format == "fp8":
+        config = {**CHECKPOINT_CONFIG, "quantization_config": QUANTIZATION_CONFIG}
+    else:
+        config = CHECKPOINT_CONFIG
+    target_dir.mkdir(parents=True, exist_ok=True)
+    save_file(tensors, target_dir / "model.safetensors")
+    (target_dir / "config.json").write_text(json.dumps(config))
+    return expert_tensors
 
 
 def decoder_checkpoint() -> dict[str, torch.Tensor]:

@@ -9,17 +9,27 @@ sampled token is a deterministic argmax.
 from __future__ import annotations
 
 import argparse
+import functools
 import logging
 import queue
 import threading
 import time
+from collections.abc import Iterable
 from dataclasses import replace
 from pathlib import Path
 
 import torch
+from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import get_attn_backend
@@ -51,8 +61,13 @@ from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
     EngineFacts,
     EngineRun,
     EngineSpec,
+    ExpertLayerFacts,
     ForwardRecord,
     FreePoolCounts,
+    LayerQuantMethod,
+    LoadFacts,
+    MoeCall,
+    QuantizableLayerKind,
     RequestOutcome,
     RequestSpec,
     RequestStep,
@@ -136,6 +151,55 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
         self.head_logits: list[torch.Tensor] = []
         for head in self.audio_decoder.codebook_heads:
             head.register_forward_hook(self.keep_head_logits)
+        self.moe_calls: list[MoeCall] = []
+        self.unloaded_parameters: list[str] = []
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        """NaN-fill every parameter first, so what the checkpoint misses stays NaN."""
+        with torch.no_grad():
+            for parameter in self.parameters():
+                parameter.fill_(float("nan"))
+        super().load_weights(weights)
+        self.unloaded_parameters = [
+            name
+            for name, parameter in self.named_parameters()
+            if bool(parameter.detach().float().isnan().any())
+        ]
+
+    def record_moe_calls(self) -> None:
+        for module in self.model.modules():
+            if isinstance(module, FusedMoE):
+                module.register_forward_hook(
+                    functools.partial(self.keep_moe_call, module.layer_id),
+                    with_kwargs=True,
+                )
+            else:
+                pass
+
+    def keep_moe_call(
+        self,
+        layer_index: int,
+        module: nn.Module,
+        args: tuple[torch.Tensor | StandardTopKOutput, ...],
+        kwargs: dict[str, torch.Tensor | StandardTopKOutput],
+        output: torch.Tensor,
+    ) -> None:
+        """Forward-hook contract; copies before the shared expert is added in place."""
+        hidden_states = (
+            kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+        )
+        topk_output = kwargs["topk_output"] if "topk_output" in kwargs else args[1]
+        assert isinstance(hidden_states, torch.Tensor)
+        assert isinstance(topk_output, StandardTopKOutput)
+        self.moe_calls.append(
+            MoeCall(
+                layer_index=layer_index,
+                hidden_states=hidden_states.cpu(),
+                topk_ids=topk_output.topk_ids.cpu(),
+                topk_weights=topk_output.topk_weights.cpu(),
+                output=output.cpu(),
+            )
+        )
 
     def keep_backbone_hidden_states(
         self,
@@ -166,6 +230,7 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
         # The staged frames carry the batch's tokens as their main tokens.
         assert torch.equal(staged_inputs.frames[:, 0], input_ids)
         self.head_logits.clear()
+        self.moe_calls.clear()
         self.step_exchange.stage(
             replace(
                 staged_inputs,
@@ -248,7 +313,10 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
                 )
             )
         return ForwardRecord(
-            forward_index=len(self.forwards), is_extend=is_extend, steps=steps
+            forward_index=len(self.forwards),
+            is_extend=is_extend,
+            steps=steps,
+            moe_calls=list(self.moe_calls),
         )
 
 
@@ -268,6 +336,57 @@ def tower_cache(
             for layer_id in tower_layer_ids
         ]
     ).cpu()
+
+
+def load_facts(model: RecordingS3DramaModel) -> LoadFacts:
+    """How the loaded model quantizes and runs each layer, and what it left unloaded."""
+    quant_methods = {}
+    expert_layers = {}
+    for name, module in model.named_modules():
+        layer_kind: QuantizableLayerKind
+        if isinstance(module, LinearBase):
+            layer_kind = "linear"
+        elif isinstance(module, VocabParallelEmbedding):
+            layer_kind = "embedding"
+        elif isinstance(module, FusedMoE):
+            layer_kind = "routed_experts"
+        else:
+            continue
+        quant_methods[name] = LayerQuantMethod(
+            layer_kind=layer_kind, quant_method=type(module.quant_method).__name__
+        )
+        if isinstance(module, FusedMoE):
+            method = module.quant_method
+            if isinstance(method, Fp8MoEMethod):
+                quant_info = method.get_triton_quant_info(module)
+                uses_fp8_w8a8 = quant_info.use_fp8_w8a8
+                block_shape = quant_info.block_shape
+            else:
+                uses_fp8_w8a8 = False
+                block_shape = None
+            expert_layers[module.layer_id] = ExpertLayerFacts(
+                quant_method=type(method).__name__,
+                runner_backend=method.runner.runner_backend.name,
+                uses_fp8_w8a8=uses_fp8_w8a8,
+                block_shape=block_shape,
+                fused_shared_expert_count=module.num_fused_shared_experts,
+                tensors={
+                    parameter_name: parameter.detach().cpu()
+                    for parameter_name, parameter in module.named_parameters()
+                },
+            )
+        else:
+            pass
+    return LoadFacts(
+        unloaded_parameters=model.unloaded_parameters,
+        quant_methods=quant_methods,
+        parameter_dtypes={
+            name: parameter.dtype for name, parameter in model.named_parameters()
+        },
+        expert_layers=expert_layers,
+        is_deep_gemm_enabled=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM,
+        device_capability=torch.cuda.get_device_capability(),
+    )
 
 
 class RecordingEngineBuilder(S3DramaEngineBuilder):
@@ -512,6 +631,10 @@ def run_engine(spec: EngineSpec) -> EngineRun:
     sglang_runner = scheduler.tp_worker.model_runner
     model = sglang_runner.model
     assert isinstance(model, RecordingS3DramaModel)
+    if spec.record_moe_calls:
+        model.record_moe_calls()
+    else:
+        pass
     kv_pool = sglang_runner.token_to_kv_pool
     request_pool = sglang_runner.req_to_token_pool
     assert isinstance(kv_pool, HybridLinearKVPool)
@@ -539,6 +662,7 @@ def run_engine(spec: EngineSpec) -> EngineRun:
         driver.stop_and_drain()
     return EngineRun(
         facts=facts,
+        load_facts=load_facts(model),
         baseline_free_counts=baseline,
         scenarios=scenarios,
         outcomes=driver.outcomes,

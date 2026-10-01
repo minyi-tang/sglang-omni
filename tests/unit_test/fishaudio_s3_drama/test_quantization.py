@@ -11,6 +11,13 @@ from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 from sglang_omni.models.fishaudio_s3_drama.quantization import ExpertFp8Config
+from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
+    FP8_BLOCK_AMAX_FLOOR,
+    FP8_MAX,
+    block_expanded,
+    dequantize_block_fp8,
+    quantize_block_fp8,
+)
 
 CHECKPOINT_QUANTIZATION = {
     "quant_method": "bsgemm-moe",
@@ -82,3 +89,35 @@ def test_missing_block_size_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="weight_block_size"):
         ExpertFp8Config.from_config(quantization)
+
+
+def test_block_quantizer_keeps_each_block_scale_in_place() -> None:
+    """The format the engine test writes: one multiplier per 128x128 block."""
+    # These block amaxes give exact multipliers 2^-10, 2^-4 and 2^-7; one block is zero.
+    block_amaxes = torch.tensor([[448 * 2.0**-10, 448 * 2.0**-4], [448 * 2.0**-7, 0.0]])
+    unit_weight = (
+        torch.rand(256, 256, generator=torch.Generator().manual_seed(0)) * 2 - 1
+    )
+    unit_weight[0::128, 0::128] = 1.0
+    weight = (unit_weight * block_expanded(block_amaxes)).to(torch.bfloat16)
+    floor = torch.tensor(FP8_BLOCK_AMAX_FLOOR).to(torch.bfloat16).float()
+
+    values, scale_inv = quantize_block_fp8(weight)
+
+    assert values.dtype == torch.float8_e4m3fn
+    assert scale_inv.dtype == torch.float32
+    assert torch.equal(
+        scale_inv,
+        torch.tensor([[2.0**-10, 2.0**-4], [2.0**-7, float(1.0 / (FP8_MAX / floor))]]),
+    )
+    assert values[0::128, 0::128].float().tolist() == [
+        [FP8_MAX, FP8_MAX],
+        [FP8_MAX, 0.0],
+    ]
+    assert not values[128:, 128:].float().any()
+    # e4m3 keeps 3 mantissa bits; below its normal range the spacing is 2^-9.
+    error_bound = 2.0**-4 * weight.float().abs() + 2.0**-10 * block_expanded(scale_inv)
+    dequantized = dequantize_block_fp8(values, scale_inv)
+    assert bool(((dequantized - weight.float()).abs() <= error_bound).all())
+    with pytest.raises(ValueError, match="divisible by 128"):
+        quantize_block_fp8(torch.zeros(100, 128))

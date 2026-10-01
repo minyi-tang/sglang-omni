@@ -15,7 +15,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import pytest
 import torch
@@ -81,6 +81,28 @@ TOWER_CACHE_TOLERANCES = (
 HEAD_LOGIT_TOLERANCES = (0.52, 0.63, 0.89, 0.94, 1.3, 1.36, 1.34, 2.1, 2.6)
 SEMANTIC_LOGIT_GAP = 3.4
 HIDDEN_MEAN_TOLERANCE = 0.1
+
+
+# How a run's first split from a reference run is judged: the choice must sit
+# within the gap limit of the reference's best logit, and for top_two_within_gap
+# also among the reference's two best.
+DecisionRule = Literal["top_two_within_gap", "within_gap"]
+
+
+@dataclass(frozen=True, kw_only=True)
+class BackboneTolerances:
+    """How far a run may sit from its reference runs, and how close a split decision."""
+
+    hidden_mean: float
+    semantic_gap: float
+    head_gaps: tuple[float, ...]
+
+
+SAME_ENGINE_TOLERANCES = BackboneTolerances(
+    hidden_mean=HIDDEN_MEAN_TOLERANCE,
+    semantic_gap=SEMANTIC_LOGIT_GAP,
+    head_gaps=HEAD_LOGIT_TOLERANCES,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -491,9 +513,20 @@ def single_request_runs(run: EngineRun) -> dict[str, list[RequestStep]]:
     }
 
 
-def backbone_problems(
-    run: EngineRun, single_runs: dict[str, list[RequestStep]]
-) -> list[str]:
+@dataclass(frozen=True, kw_only=True)
+class BackboneComparison:
+    problems: list[str]
+    compared_request_ids: list[str]
+
+
+def backbone_comparison(
+    run: EngineRun,
+    single_runs: dict[str, list[RequestStep]],
+    tolerances: BackboneTolerances,
+    *,
+    is_same_engine: bool,
+    decision_rule: DecisionRule,
+) -> BackboneComparison:
     """Each request against the single-request run of its prompt.
 
     Prefill rows see the same inputs, so their hidden states must agree. Frames
@@ -501,10 +534,16 @@ def backbone_problems(
     still shared, so the first differing entry must be a near tie in the
     single run's own logits; after it the histories differ and comparing stops.
     A request without a single run to compare with is a problem, not a skip.
+    When the single runs come from run's own engine, they are not compared with
+    themselves; from another engine, every request is compared, same ids too.
     """
     problems = []
+    compared_request_ids = []
     steps_by_request = request_steps(run)
-    reference_request_ids = {steps[0].request_id for steps in single_runs.values()}
+    if is_same_engine:
+        reference_request_ids = {steps[0].request_id for steps in single_runs.values()}
+    else:
+        reference_request_ids = set()
     semantic_bias = torch.full((int(TEXT_CONFIG["vocab_size"]),), float("-inf"))
     semantic_bias[SEMANTIC_START_TOKEN_ID : SEMANTIC_END_TOKEN_ID + 1] = 0.0
     semantic_bias[EOS_TOKEN_ID] = 0.0
@@ -521,6 +560,7 @@ def backbone_problems(
             continue
         else:
             pass
+        compared_request_ids.append(request_id)
         prompt_row_count = len(PROMPTS[request_spec.prompt_name])
         single_prefill = single_steps[0].hidden_states.float()
         for step in steps:
@@ -531,7 +571,7 @@ def backbone_problems(
                     .mean()
                     .item()
                 )
-                if not deviation <= HIDDEN_MEAN_TOLERANCE:
+                if not deviation <= tolerances.hidden_mean:
                     problems.append(
                         f"{request_id}: prefill hidden states are {deviation:.4f} off "
                         f"the single run on average"
@@ -558,27 +598,65 @@ def backbone_problems(
             single_step = single_steps[frame_index]
             if entry == 0:
                 logits = single_step.semantic_logits + semantic_bias
-                gap_limit = SEMANTIC_LOGIT_GAP
+                gap_limit = tolerances.semantic_gap
             elif entry >= 2:
                 logits = single_step.head_logits[entry - 2]
-                gap_limit = HEAD_LOGIT_TOLERANCES[entry - 2]
+                gap_limit = tolerances.head_gaps[entry - 2]
             else:
                 problems.append(
                     f"{request_id} frame {frame_index}: code 0 alone differs"
                 )
                 break
-            top = torch.topk(logits, 2)
-            gap = float(top.values[0] - logits[chosen])
-            if chosen not in top.indices.tolist() or not gap <= gap_limit:
+            reason = split_decision_problem(logits, chosen, gap_limit, decision_rule)
+            if reason is not None:
                 problems.append(
-                    f"{request_id} frame {frame_index} entry {entry}: chose {chosen}, "
-                    f"the single run's top-2 is {top.indices.tolist()} "
-                    f"{[round(value, 3) for value in top.values.tolist()]}"
+                    f"{request_id} frame {frame_index} entry {entry}: {reason}"
                 )
             else:
                 pass
             break
-    return problems
+    return BackboneComparison(
+        problems=problems, compared_request_ids=compared_request_ids
+    )
+
+
+def split_decision_problem(
+    logits: torch.Tensor, chosen: int, gap_limit: float, rule: DecisionRule
+) -> str | None:
+    """Why the reference's logits do not explain the chosen entry; None when they do."""
+    if not 0 <= chosen < logits.numel():
+        return f"chose {chosen}, outside the {logits.numel()} candidates"
+    else:
+        pass
+    top = torch.topk(logits, 2)
+    gap = float(logits.max() - logits[chosen])
+    rank = int((logits > logits[chosen]).sum()) + 1
+    if rule == "top_two_within_gap" and chosen not in top.indices.tolist():
+        return (
+            f"chose {chosen}, the single run's top-2 is {top.indices.tolist()} "
+            f"{[round(value, 3) for value in top.values.tolist()]}"
+        )
+    # Written this way round, a NaN gap fails too.
+    elif not gap <= gap_limit:
+        return (
+            f"chose {chosen} (rank {rank}), {gap:.4f} under the reference's best "
+            f"logit; the limit is {gap_limit}"
+        )
+    else:
+        return None
+
+
+def backbone_problems(
+    run: EngineRun, single_runs: dict[str, list[RequestStep]]
+) -> list[str]:
+    """Each request of run against its own engine's single-request runs."""
+    return backbone_comparison(
+        run,
+        single_runs,
+        SAME_ENGINE_TOLERANCES,
+        is_same_engine=True,
+        decision_rule="top_two_within_gap",
+    ).problems
 
 
 def test_tower_cache_and_codes_match_the_dense_recompute(
