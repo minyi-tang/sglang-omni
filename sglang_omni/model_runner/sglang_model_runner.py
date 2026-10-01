@@ -113,9 +113,11 @@ class OmniKVCacheConfigurator(KVCacheConfigurator):
         total GPU memory times that budget minus this stage's measured memory.
         NVML process accounting is preferred. If NVML cannot identify the
         current process, use the stage-local load delta measured inside
-        SGLang's serialized initialization window. Without a stage budget, keep
-        upstream SGLang profiling semantics for ordinary non-colocated AR
-        serving.
+        SGLang's serialized initialization window. A hybrid linear-attention
+        model then sizes its recurrent-state pool out of that headroom, as
+        upstream profiling does, and the KV pool gets the rest. Without a stage
+        budget, keep upstream SGLang profiling semantics for ordinary
+        non-colocated AR serving.
         """
         if self.kv_cache_bytes is not None:
             if self.kv_cache_bytes <= 0:
@@ -175,17 +177,41 @@ class OmniKVCacheConfigurator(KVCacheConfigurator):
             pass
 
         if process_memory is None or process_memory <= 0:
-            return self.profile_available_bytes_from_stage_load_delta(
+            available_bytes = self.profile_available_bytes_from_stage_load_delta(
                 pre_model_load_memory,
                 total_memory,
             )
         else:
-            pass
+            available_bytes = self.profile_available_bytes_from_process_memory(
+                total_memory,
+                process_memory,
+            )
 
-        return self.profile_available_bytes_from_process_memory(
-            total_memory,
-            process_memory,
+        if self.mambaish_config is None:
+            return available_bytes
+        else:
+            pass
+        kv_bytes = int(
+            self._handle_max_mamba_cache(  # noqa: leading-underscore  # upstream name
+                available_bytes / (1 << 30)
+            )
+            * (1 << 30)
         )
+        state_bytes = available_bytes - kv_bytes
+        if kv_bytes <= 0:
+            raise RuntimeError(
+                "Colocated GPU memory budget leaves no KV-cache headroom after the "
+                f"hybrid state cache: state={format_bytes_gib(state_bytes)}, "
+                f"budget={format_bytes_gib(available_bytes)}. Raise the stage memory "
+                "fraction or lower max_running_requests."
+            )
+        else:
+            pass
+        logger.info(
+            f"SGLang AR memory profile: hybrid_state={format_bytes_gib(state_bytes)} "
+            f"available_for_kv={format_bytes_gib(kv_bytes)}"
+        )
+        return kv_bytes
 
     def free_gpu_memory_bytes(self) -> int:
         return free_gpu_memory_bytes(self.device, self.gpu_id)

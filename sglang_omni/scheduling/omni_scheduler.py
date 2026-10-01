@@ -47,7 +47,7 @@ from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -620,7 +620,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # Upstream processing mode; explicit Prefill remains NULL, Decode overrides.
         self.disaggregation_mode = self.initial_disaggregation_mode()
         self.is_hybrid_swa = False
-        self.is_hybrid_ssm = False
+        self.is_hybrid_ssm = isinstance(req_to_token_pool, HybridReqToTokenPool)
         self.offload_tags: set = set()
         self.is_initializing = False
         self.truncation_align_size = None
