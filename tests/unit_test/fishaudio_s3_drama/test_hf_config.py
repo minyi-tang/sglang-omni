@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""S3-drama HF config: Qwen3_5MoeTextConfig conversion, round trips, rejections."""
+"""S3-drama HF config: backbone config conversion, tower layer ids, rejections."""
 
 from __future__ import annotations
 
@@ -13,7 +13,10 @@ import pytest
 from sglang.srt.configs.qwen3_5 import Qwen3_5MoeTextConfig
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
-from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.hf_config import (
+    FishOmniConfig,
+    S3DramaTextConfig,
+)
 
 FISH_ONLY_TEXT_KEYS = (
     "layer_types",
@@ -129,13 +132,17 @@ def test_fish_text_config_becomes_a_qwen3_5_moe_text_config() -> None:
     config = FishOmniConfig(**fish_config_dict())
     text_config = config.text_config
 
+    assert isinstance(text_config, S3DramaTextConfig)
     assert isinstance(text_config, Qwen3_5MoeTextConfig)
     assert text_config.model_type == "qwen3_5_moe_text"
     assert text_config.layers_block_type == [
         BACKBONE_BLOCK_TYPES[layer_type]
         for layer_type in fish_text_config_dict()["layer_types"]
     ]
-    assert text_config.full_attention_layer_ids == [1, 3]
+    # Four backbone layers, then the decoder's 2 shared + 3 residual tower layers.
+    assert text_config.tower_layer_count == 5
+    assert text_config.full_attention_layer_ids == [1, 3, 4, 5, 6, 7, 8]
+    assert text_config.linear_layer_ids == [0, 2]
     assert get_rope_config(text_config)[0] == 1000.0
     assert text_config.rope_theta == 1000.0
     assert text_config.partial_rotary_factor == 0.5
@@ -160,6 +167,7 @@ def test_saved_config_reloads_to_the_same_config(tmp_path: Path) -> None:
 
     saved = json.loads((tmp_path / "config.json").read_text())
     assert saved["text_config"]["model_type"] == "qwen3_5_moe_text"
+    assert saved["text_config"]["tower_layer_count"] == 5
     assert "layer_types" not in saved["text_config"]
     assert reloaded.to_dict() == config.to_dict()
     assert rebuilt.to_dict() == config.to_dict()
@@ -481,6 +489,11 @@ REJECTED_CONFIGS = [
         changed_top("fish_schema_version", 2),
         "fish_schema_version",
         id="schema-version",
+    ),
+    pytest.param(
+        changed_saved_text("tower_layer_count", 4),
+        "tower_layer_count",
+        id="saved-tower-layer-count",
     ),
 ]
 

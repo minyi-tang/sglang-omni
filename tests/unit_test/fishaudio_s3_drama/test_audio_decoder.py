@@ -21,6 +21,10 @@ from sglang_omni.models.fishaudio_s3_drama.weights import (
     load_audio_decoder_weights,
     parameter_shard,
 )
+from tests.unit_test.fishaudio_s3_drama.dense_attention import (
+    CacheEntry,
+    DenseAttention,
+)
 from tests.unit_test.fishaudio_s3_drama.test_hf_config import fish_config_dict
 
 # Geometry of fish_config_dict(), written out so the reference never reads the module.
@@ -46,7 +50,6 @@ WINDOW_FRAMES = 16
 EMPTY_WINDOW_TOKEN = -1
 BFLOAT16_CACHE_DRIFT = 0.05
 
-CacheEntry = tuple[int, torch.Tensor, torch.Tensor]
 DeviceType = Literal["cpu", "cuda"]
 CheckpointProblem = Literal[
     "missing-up-half",
@@ -143,61 +146,6 @@ def loaded_decoder(
     decoder = AudioDecoder(small_config())
     load_audio_decoder_weights(decoder, checkpoint.items())
     return decoder.to(dtype=dtype, device=device)
-
-
-class DenseAttention:
-    """Test-side DecoderAttention: dense key/value lists per (layer, request)."""
-
-    def __init__(self) -> None:
-        self.entries: dict[tuple[int, str], list[CacheEntry]] = {}
-        self.request_ids: list[str] = []
-        self.positions: list[int] = []
-
-    def bind(self, request_ids: list[str], positions: list[int]) -> None:
-        self.request_ids = request_ids
-        self.positions = positions
-
-    def __call__(
-        self,
-        layer_index: int,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-    ) -> torch.Tensor:
-        for row, (request_id, position) in enumerate(
-            zip(self.request_ids, self.positions)
-        ):
-            self.entries.setdefault((layer_index, request_id), []).append(
-                (
-                    position,
-                    key[row].view(KV_HEAD_COUNT, HEAD_DIM),
-                    value[row].view(KV_HEAD_COUNT, HEAD_DIM),
-                )
-            )
-        outputs = []
-        for row, (request_id, position) in enumerate(
-            zip(self.request_ids, self.positions)
-        ):
-            visible = [
-                entry
-                for entry in self.entries[(layer_index, request_id)]
-                if entry[0] <= position
-            ]
-            keys = torch.stack([entry[1] for entry in visible]).float()
-            values = torch.stack([entry[2] for entry in visible]).float()
-            group_size = HEAD_COUNT // KV_HEAD_COUNT
-            scores = torch.einsum(
-                "hd,nhd->hn",
-                query[row].view(HEAD_COUNT, HEAD_DIM).float(),
-                keys.repeat_interleave(group_size, dim=1),
-            ) / math.sqrt(HEAD_DIM)
-            attended = torch.einsum(
-                "hn,nhd->hd",
-                torch.softmax(scores, dim=-1),
-                values.repeat_interleave(group_size, dim=1),
-            )
-            outputs.append(attended.reshape(-1).to(query.dtype))
-        return torch.stack(outputs)
 
 
 def reference_norm(values: torch.Tensor, gain_minus_one: torch.Tensor) -> torch.Tensor:
@@ -543,7 +491,9 @@ def test_tower_matches_the_hand_written_formulas() -> None:
     checkpoint = random_checkpoint(seed=0)
     prefill_hidden, decode_hidden, semantic_logits = random_inputs(seed=1)
     decoder = loaded_decoder(checkpoint, torch.float32, "cpu")
-    attention = DenseAttention()
+    attention = DenseAttention(
+        head_count=HEAD_COUNT, kv_head_count=KV_HEAD_COUNT, head_dim=HEAD_DIM
+    )
 
     positions_after_prefill, frames = run_decoder(
         decoder, attention, prefill_hidden, decode_hidden, semantic_logits
@@ -585,7 +535,9 @@ def test_bfloat16_tower_tracks_the_fp32_formulas(device: DeviceType) -> None:
     checkpoint = random_checkpoint(seed=0)
     prefill_hidden, decode_hidden, semantic_logits = random_inputs(seed=1)
     decoder = loaded_decoder(checkpoint, torch.bfloat16, device)
-    attention = DenseAttention()
+    attention = DenseAttention(
+        head_count=HEAD_COUNT, kv_head_count=KV_HEAD_COUNT, head_dim=HEAD_DIM
+    )
 
     _, frames = run_decoder(
         decoder,

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """HF config for S3-drama checkpoints (model_type fish_omni).
 
-A fish_omni_text text_config is validated and converted to Qwen3_5MoeTextConfig;
-the converted form is what to_dict writes and what a saved config reloads from.
+A fish_omni_text text_config is validated and converted to S3DramaTextConfig, a
+Qwen3_5MoeTextConfig whose full-attention layer ids also cover the decoder
+tower; the converted form is what to_dict writes and what a saved config
+reloads from.
 """
 
 from __future__ import annotations
@@ -52,6 +54,26 @@ POSITIVE_TEXT_FIELDS = (
     "linear_num_value_heads",
     "full_attention_interval",
 )
+
+
+class S3DramaTextConfig(Qwen3_5MoeTextConfig):
+    """Backbone config whose full-attention layer ids continue into the decoder tower.
+
+    The tower's layers keep their key/value cache in the backbone's paged pool,
+    under the ids that follow the backbone's own layers; the linear-attention
+    layers and the backbone layer count are unchanged.
+    """
+
+    def __init__(self, *, tower_layer_count: int = 0, **kwargs: object) -> None:
+        self.tower_layer_count = tower_layer_count
+        super().__init__(**kwargs)
+
+    @property
+    def full_attention_layer_ids(self) -> list[int]:
+        tower_layer_ids = range(
+            self.num_hidden_layers, self.num_hidden_layers + self.tower_layer_count
+        )
+        return [*super().full_attention_layer_ids, *tower_layer_ids]
 
 
 def checked_int(value: object, name: str, minimum: int) -> int:
@@ -164,7 +186,7 @@ def fish_text_kwargs(text_config: Mapping[str, object]) -> dict[str, object]:
     return kwargs
 
 
-def checked_text_config(text_kwargs: dict[str, object]) -> Qwen3_5MoeTextConfig:
+def checked_text_config(text_kwargs: dict[str, object]) -> S3DramaTextConfig:
     """Build the backbone config; its RoPE fields must all repeat rope_parameters."""
     rope_parameters = text_kwargs.get("rope_parameters")
     rope = checked_rope_parameters(rope_parameters)
@@ -184,7 +206,7 @@ def checked_text_config(text_kwargs: dict[str, object]) -> Qwen3_5MoeTextConfig:
         text_kwargs["shared_expert_intermediate_size"] = 0
     else:
         pass
-    text_config = Qwen3_5MoeTextConfig(**text_kwargs)
+    text_config = S3DramaTextConfig(**text_kwargs)
     for name in POSITIVE_TEXT_FIELDS:
         checked_int(getattr(text_config, name), f"text_config.{name}", 1)
     checked_int(
@@ -422,7 +444,7 @@ class FishOmniConfig(PretrainedConfig):
 
     model_type = "fish_omni"
     sub_configs = {
-        "text_config": Qwen3_5MoeTextConfig,
+        "text_config": S3DramaTextConfig,
         "audio_decoder_config": FishOmniAudioDecoderConfig,
     }
     has_no_defaults_at_init = True
@@ -470,8 +492,20 @@ class FishOmniConfig(PretrainedConfig):
                 f"text_config.model_type={text_config.get('model_type')!r}; expected "
                 f"{FISH_TEXT_MODEL_TYPE!r} or {Qwen3_5MoeTextConfig.model_type!r}"
             )
-        self.text_config = checked_text_config(text_kwargs)
         self.audio_decoder_config = FishOmniAudioDecoderConfig(**audio_decoder_config)
+        tower_layer_count = (
+            self.audio_decoder_config.shared_enrichment_layers
+            + self.audio_decoder_config.num_codebooks
+            - 1
+        )
+        if text_kwargs.get("tower_layer_count", tower_layer_count) != tower_layer_count:
+            raise ValueError(
+                f"text_config.tower_layer_count={text_kwargs['tower_layer_count']!r} "
+                f"disagrees with the decoder's {tower_layer_count} tower layers"
+            )
+        else:
+            text_kwargs["tower_layer_count"] = tower_layer_count
+        self.text_config = checked_text_config(text_kwargs)
         self.fish_schema_version = fish_schema_version
         self.speech_template_version = speech_template_version
         self.audio_encoder_config = None

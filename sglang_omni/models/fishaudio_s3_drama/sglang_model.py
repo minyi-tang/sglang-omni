@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: Apache-2.0
+"""S3-drama as an SGLang model: the Qwen3.5 MoE backbone plus the codebook tower.
+
+The tower keeps its key/value cache in the backbone's paged pool, under the
+layer ids that follow the backbone's. One forward runs the backbone, fills the
+tower cache of the extend rows, and samples the next frame of every request.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from collections.abc import Iterable, Iterator
+
+import torch
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.models.qwen3_5 import Qwen3_5MoeForCausalLM
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import add_prefix
+from torch import nn
+
+from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
+from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.weights import (
+    checkpoint_part,
+    load_audio_decoder_weights,
+)
+
+BACKBONE_CHECKPOINT_PREFIX = "model.language_model."
+LM_HEAD_CHECKPOINT_NAME = "lm_head.weight"
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class S3DramaStepInputs:
+    """What one forward needs besides the batch, staged by the model runner.
+
+    frames holds the input frame of every forward row; the other tensors hold
+    one entry per request, in batch order.
+    """
+
+    request_ids: list[str]
+    frames: torch.Tensor
+    ras_windows: torch.Tensor
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+
+
+class StepExchange:
+    """Hands each forward its staged inputs, and the runner that forward's frames.
+
+    Both are handed over once: a forward clears what it did not produce, so a
+    failed step leaves nothing for the next one to pick up.
+    """
+
+    def __init__(self) -> None:
+        self.staged_inputs: S3DramaStepInputs | None = None
+        self.sampled_frames: torch.Tensor | None = None
+
+    def stage(self, step_inputs: S3DramaStepInputs) -> None:
+        self.staged_inputs = step_inputs
+
+    def clear(self) -> None:
+        self.staged_inputs = None
+
+    def take_inputs(self, request_ids: list[str], row_count: int) -> S3DramaStepInputs:
+        """The inputs staged for a batch of these requests and forward rows."""
+        step_inputs = self.staged_inputs
+        self.staged_inputs = None
+        self.sampled_frames = None
+        if step_inputs is None:
+            raise RuntimeError("the model runner staged no inputs for this forward")
+        elif step_inputs.request_ids != request_ids:
+            raise RuntimeError(
+                f"staged requests {step_inputs.request_ids} are not the batch's "
+                f"{request_ids}"
+            )
+        elif step_inputs.frames.shape[0] != row_count:
+            raise RuntimeError(
+                f"staged {step_inputs.frames.shape[0]} frames for {row_count} rows"
+            )
+        else:
+            return step_inputs
+
+    def publish(self, frames: torch.Tensor) -> None:
+        self.sampled_frames = frames
+
+    def take_frames(self) -> torch.Tensor:
+        frames = self.sampled_frames
+        self.sampled_frames = None
+        if frames is None:
+            raise RuntimeError("no forward has sampled frames since the last take")
+        else:
+            return frames
+
+
+def next_frame_labels(
+    frames: torch.Tensor, last_rows: torch.Tensor, eos_token_id: int
+) -> torch.Tensor:
+    """Each extend row's next frame; a request's last row gets [eos, 0, ...].
+
+    The placeholder only fills that row's slot until the same forward's decode
+    step rewrites it, before any row attends to it.
+    """
+    next_frames = frames.roll(-1, dims=0)
+    next_frames[last_rows] = 0
+    next_frames[last_rows, 0] = eos_token_id
+    return next_frames
+
+
+class PagedTowerAttention:
+    """DecoderAttention over the paged pool; tower layer i is RadixAttention layer i."""
+
+    def __init__(self, layers: nn.ModuleList, forward_batch: ForwardBatch) -> None:
+        self.layers = layers
+        self.forward_batch = forward_batch
+
+    def __call__(
+        self,
+        layer_index: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        assert isinstance(layer, RadixAttention)
+        return layer(query, key, value, self.forward_batch)
+
+
+class S3DramaForCausalLM(nn.Module):
+    """Backbone, lm_head and codebook tower; one forward samples one frame per request."""
+
+    def __init__(
+        self,
+        config: FishOmniConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        text_config = config.text_config
+        decoder_config = config.audio_decoder_config
+        tower_layer_count = (
+            decoder_config.shared_enrichment_layers + decoder_config.num_codebooks - 1
+        )
+        tower_geometry = (
+            decoder_config.n_head,
+            decoder_config.n_local_heads,
+            decoder_config.head_dim,
+        )
+        backbone_geometry = (
+            text_config.num_attention_heads,
+            text_config.num_key_value_heads,
+            text_config.head_dim,
+        )
+        if text_config.tie_word_embeddings:
+            raise NotImplementedError("S3-drama checkpoints keep a separate lm_head")
+        elif tower_geometry != backbone_geometry:
+            # The tower shares the backbone's KV pool and attention buffers.
+            raise ValueError(
+                f"decoder (n_head, n_local_heads, head_dim)={tower_geometry} must "
+                f"equal the backbone's {backbone_geometry}"
+            )
+        elif text_config.tower_layer_count != tower_layer_count:
+            raise ValueError(
+                f"text_config.tower_layer_count={text_config.tower_layer_count} but "
+                f"the decoder has {tower_layer_count} tower layers"
+            )
+        elif get_parallel().pp_size != 1 or get_parallel().tp_size != 1:
+            raise NotImplementedError("S3-drama runs with one tensor and pipeline rank")
+        else:
+            pass
+        self.config = config
+        self.model = Qwen3_5MoeForCausalLM(
+            text_config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        self.lm_head = ParallelLMHead(
+            text_config.vocab_size,
+            text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+        )
+        self.logits_processor = LogitsProcessor(text_config)
+        self.audio_decoder = AudioDecoder(config)
+        self.tower_attention = nn.ModuleList(
+            RadixAttention(
+                num_heads=decoder_config.n_head,
+                head_dim=decoder_config.head_dim,
+                scaling=decoder_config.head_dim**-0.5,
+                num_kv_heads=decoder_config.n_local_heads,
+                layer_id=text_config.num_hidden_layers + tower_index,
+                prefix=add_prefix(f"tower_attention.{tower_index}", prefix),
+            )
+            for tower_index in range(tower_layer_count)
+        )
+        self.step_exchange = StepExchange()
+
+    @property
+    def start_layer(self) -> int:
+        return self.model.start_layer
+
+    @property
+    def end_layer(self) -> int:
+        """One past the last tower layer id, so the KV pool covers the tower."""
+        return self.model.end_layer + len(self.tower_attention)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        step_inputs = self.step_exchange.take_inputs(
+            forward_batch.rids, input_ids.shape[0]
+        )
+        forward_mode = forward_batch.forward_mode
+        if forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            raise NotImplementedError(f"forward mode {forward_mode} is not supported")
+        else:
+            pass
+        frames = step_inputs.frames
+        input_embeds = self.audio_decoder.embed_backbone(
+            frames, self.model.embed_tokens(frames[:, 0])
+        )
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds=input_embeds
+        )
+        logits_output = self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
+        if forward_mode == ForwardMode.EXTEND:
+            last_rows = (
+                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            )
+            self.audio_decoder.prefill(
+                hidden_states,
+                positions,
+                frames,
+                next_frame_labels(frames, last_rows, self.config.eos_token_id),
+                PagedTowerAttention(self.tower_attention, forward_batch),
+            )
+            # The backbone is done with the extend metadata, so the full-attention
+            # backend is re-planned for one newest row per request.
+            step_batch = dataclasses.replace(
+                forward_batch,
+                forward_mode=ForwardMode.DECODE,
+                out_cache_loc=forward_batch.out_cache_loc[last_rows],
+                positions=positions[last_rows],
+            )
+            attention_backend = get_attn_backend()
+            assert isinstance(attention_backend, HybridLinearAttnBackend)
+            attention_backend.full_attn_backend.init_forward_metadata(step_batch)
+            step_hidden_states = hidden_states[last_rows]
+            step_input_frames = frames[last_rows]
+        else:
+            step_batch = forward_batch
+            step_hidden_states = hidden_states
+            step_input_frames = frames
+        sampled_frames = self.audio_decoder.decode_step(
+            logits_output.next_token_logits,
+            step_hidden_states,
+            step_batch.positions,
+            step_input_frames,
+            step_inputs.ras_windows,
+            step_inputs.temperature,
+            step_inputs.top_k,
+            step_inputs.top_p,
+            PagedTowerAttention(self.tower_attention, step_batch),
+        )
+        self.step_exchange.publish(sampled_frames)
+        return logits_output
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        decoder_weights: list[tuple[str, torch.Tensor]] = []
+        lm_head_weights: list[torch.Tensor] = []
+
+        # Streams the backbone tensors so the checkpoint is never held whole.
+        def backbone_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            for checkpoint_name, tensor in weights:
+                if checkpoint_part(checkpoint_name) == "audio_decoder":
+                    decoder_weights.append((checkpoint_name, tensor))
+                elif checkpoint_name == LM_HEAD_CHECKPOINT_NAME:
+                    lm_head_weights.append(tensor)
+                elif checkpoint_name.startswith(BACKBONE_CHECKPOINT_PREFIX):
+                    backbone_name = checkpoint_name.removeprefix(
+                        BACKBONE_CHECKPOINT_PREFIX
+                    )
+                    yield backbone_name, tensor
+                else:
+                    raise ValueError(
+                        f"checkpoint key {checkpoint_name!r} is not a backbone weight"
+                    )
+
+        self.model.load_weights(backbone_weights())
+        if len(lm_head_weights) != 1:
+            raise ValueError(
+                f"the checkpoint holds {len(lm_head_weights)} {LM_HEAD_CHECKPOINT_NAME} "
+                f"tensors; expected one"
+            )
+        else:
+            pass
+        self.lm_head.weight_loader(self.lm_head.weight, lm_head_weights[0])
+        load_audio_decoder_weights(self.audio_decoder, decoder_weights)
