@@ -11,7 +11,7 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
-from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig, checked_int
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
 
@@ -48,12 +48,17 @@ class S3DramaRequestData(SGLangARRequestData):
 class S3DramaRequestBuilder:
     """Validates an S3DramaGenerationInput payload and builds its SGLang request."""
 
-    def __init__(self, *, config: FishOmniConfig, context_length: int) -> None:
+    def __init__(
+        self, *, config: FishOmniConfig, context_length: int, max_prompt_rows: int
+    ) -> None:
         self.vocab_size = config.text_config.vocab_size
         self.codebook_size = config.audio_decoder_config.vocab_size
         self.frame_width = 1 + config.audio_decoder_config.num_codebooks
         self.eos_token_id = config.eos_token_id
         self.context_length = context_length
+        self.max_prompt_rows = checked_int(
+            max_prompt_rows, "max_prompt_rows", MINIMUM_PROMPT_ROWS
+        )
 
     def __call__(self, payload: StagePayload) -> S3DramaRequestData:
         generation_input = payload.data
@@ -78,6 +83,11 @@ class S3DramaRequestBuilder:
             raise ValueError(
                 f"a prompt needs at least {MINIMUM_PROMPT_ROWS} rows; got "
                 f"{prompt_rows.shape[0]}"
+            )
+        elif prompt_rows.shape[0] > self.max_prompt_rows:
+            raise ValueError(
+                f"a prompt of {prompt_rows.shape[0]} rows exceeds the maximum allowed "
+                f"length of {self.max_prompt_rows} rows"
             )
         elif not bool(
             ((prompt_rows[:, 0] >= 0) & (prompt_rows[:, 0] < self.vocab_size)).all()

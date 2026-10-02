@@ -40,6 +40,7 @@ from sglang_omni.scheduling import sglang_backend
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
 )
+from sglang_omni.serve.openai_errors import is_bad_request_error
 from tests.unit_test.fishaudio_s3_drama.dense_attention import DenseAttention
 from tests.unit_test.fishaudio_s3_drama.test_audio_decoder import (
     CODEBOOK_SIZE,
@@ -57,6 +58,9 @@ from tests.unit_test.fishaudio_s3_drama.test_hf_config import fish_config_dict
 
 FRAME_WIDTH = 5
 CONTEXT_LENGTH = 32
+MAX_PROMPT_ROWS = 6
+# The prompt cap the serving contract asks for by default.
+SERVING_PROMPT_CAP_ROWS = 8192
 SamplingField = Literal["max_new_tokens", "temperature", "top_k", "top_p"]
 
 
@@ -96,7 +100,9 @@ def generation_input(prompt_rows: torch.Tensor) -> S3DramaGenerationInput:
 
 def built_request(prompt_rows: list[list[int]]) -> S3DramaRequestData:
     builder = S3DramaRequestBuilder(
-        config=FishOmniConfig(**fish_config_dict()), context_length=CONTEXT_LENGTH
+        config=FishOmniConfig(**fish_config_dict()),
+        context_length=CONTEXT_LENGTH,
+        max_prompt_rows=MAX_PROMPT_ROWS,
     )
     return builder(
         StagePayload(
@@ -209,7 +215,9 @@ def test_request_builder_rejects_bad_inputs(
     change: GenerationInputChange, error: str
 ) -> None:
     builder = S3DramaRequestBuilder(
-        config=FishOmniConfig(**fish_config_dict()), context_length=CONTEXT_LENGTH
+        config=FishOmniConfig(**fish_config_dict()),
+        context_length=CONTEXT_LENGTH,
+        max_prompt_rows=MAX_PROMPT_ROWS,
     )
     payload = StagePayload(
         request_id="request-a",
@@ -223,7 +231,9 @@ def test_request_builder_rejects_bad_inputs(
 
 def test_request_builder_rejects_a_foreign_payload() -> None:
     builder = S3DramaRequestBuilder(
-        config=FishOmniConfig(**fish_config_dict()), context_length=CONTEXT_LENGTH
+        config=FishOmniConfig(**fish_config_dict()),
+        context_length=CONTEXT_LENGTH,
+        max_prompt_rows=MAX_PROMPT_ROWS,
     )
     payload = StagePayload(
         request_id="request-a", request=OmniRequest(inputs="prompt"), data=[1, 2, 3]
@@ -231,6 +241,72 @@ def test_request_builder_rejects_a_foreign_payload() -> None:
 
     with pytest.raises(TypeError, match="S3DramaGenerationInput"):
         builder(payload)
+
+
+def test_prompt_cap_is_inclusive_and_refused_as_a_bad_request() -> None:
+    built_request(frame_rows_of([MAX_PROMPT_ROWS], seed=4)[0])
+
+    with pytest.raises(ValueError) as rejection:
+        built_request(frame_rows_of([MAX_PROMPT_ROWS + 1], seed=4)[0])
+
+    assert is_bad_request_error(rejection.value)
+
+
+class ConfigOnlyModel(S3DramaForCausalLM):
+    """S3DramaForCausalLM for make_adapters, which reads only the config."""
+
+    def __init__(self, config: FishOmniConfig) -> None:
+        torch.nn.Module.__init__(self)
+        self.config = config
+
+
+def test_default_prompt_cap_reaches_the_request_builder() -> None:
+    """8192 rows pass and 8193 are refused; the context budget is still checked."""
+    request_builder, _ = S3DramaEngineBuilder(
+        context_length=SERVING_PROMPT_CAP_ROWS + 5, max_running_requests=1
+    ).make_adapters(ConfigOnlyModel(FishOmniConfig(**fish_config_dict())))
+    capped_rows, past_cap_rows = (
+        torch.tensor(rows, dtype=torch.int64)
+        for rows in frame_rows_of(
+            [SERVING_PROMPT_CAP_ROWS, SERVING_PROMPT_CAP_ROWS + 1], seed=5
+        )
+    )
+
+    def payload(prompt_rows: torch.Tensor, max_new_tokens: int) -> StagePayload:
+        return StagePayload(
+            request_id="request-a",
+            request=OmniRequest(inputs="prompt"),
+            data=replace(generation_input(prompt_rows), max_new_tokens=max_new_tokens),
+        )
+
+    request_data = request_builder(payload(capped_rows, max_new_tokens=5))
+    assert request_data.prompt_row_count == SERVING_PROMPT_CAP_ROWS
+    with pytest.raises(ValueError, match="exceeds the maximum allowed length"):
+        request_builder(payload(past_cap_rows, max_new_tokens=4))
+    with pytest.raises(ValueError, match="context length"):
+        request_builder(payload(capped_rows, max_new_tokens=6))
+
+
+@pytest.mark.parametrize(
+    "max_prompt_rows",
+    [
+        True,
+        1,
+        -SERVING_PROMPT_CAP_ROWS,
+        math.inf,
+        math.nan,
+        float(SERVING_PROMPT_CAP_ROWS),
+    ],
+)
+def test_prompt_cap_must_be_an_integer_of_at_least_two_rows(
+    max_prompt_rows: int | float,
+) -> None:
+    with pytest.raises(ValueError, match="max_prompt_rows"):
+        S3DramaRequestBuilder(
+            config=FishOmniConfig(**fish_config_dict()),
+            context_length=CONTEXT_LENGTH,
+            max_prompt_rows=max_prompt_rows,
+        )
 
 
 @pytest.mark.parametrize(

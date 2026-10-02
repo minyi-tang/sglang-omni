@@ -225,6 +225,10 @@ def changed_top(key: str, value: object) -> ConfigChange:
     return change
 
 
+def without_template_version(config: ConfigDict) -> None:
+    config.pop("speech_template_version")
+
+
 def band_past_vocabulary(config: ConfigDict) -> None:
     changed_top("semantic_start_token_id", 90)(config)
     changed_top("semantic_end_token_id", 97)(config)
@@ -474,6 +478,9 @@ REJECTED_CONFIGS = [
         changed_top("speech_template_version", "legacy-s2"),
         "speech_template_version",
         id="template",
+    ),
+    pytest.param(
+        without_template_version, "speech_template_version", id="template-absent"
     ),
     pytest.param(
         changed_top("extra_samplable_token_ids", [5]),

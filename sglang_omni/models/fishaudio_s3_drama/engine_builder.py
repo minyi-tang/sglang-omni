@@ -30,6 +30,8 @@ from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputP
 FISH_OMNI_ARCHITECTURE = "FishOmniModel"
 # The tower re-plans this backend's metadata for its first frame.
 ATTENTION_BACKEND = "triton"
+# A prompt with more rows is refused before admission (HTTP 400).
+DEFAULT_MAX_PROMPT_ROWS = 8192
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
@@ -37,9 +39,16 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
 
     model_name = "FishAudio S3-drama"
 
-    def __init__(self, *, context_length: int, max_running_requests: int) -> None:
+    def __init__(
+        self,
+        *,
+        context_length: int,
+        max_running_requests: int,
+        max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
+    ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
+        self.max_prompt_rows = max_prompt_rows
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         """Register the classes the checkpoint names; the directory is the contract."""
@@ -115,7 +124,9 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     ) -> tuple[S3DramaRequestBuilder, S3DramaResultAdapter]:
         return (
             S3DramaRequestBuilder(
-                config=model.config, context_length=self.context_length
+                config=model.config,
+                context_length=self.context_length,
+                max_prompt_rows=self.max_prompt_rows,
             ),
             S3DramaResultAdapter(eos_token_id=model.config.eos_token_id),
         )
