@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Literal, Protocol
 from unittest.mock import Mock, patch
 
+import huggingface_hub
 import pytest
 import torch
 from sglang.srt.arg_groups.model_override_base import resolved_view
@@ -39,6 +40,7 @@ from sglang_omni.models.fishaudio_s3_drama.model_runner import (
     stage_decode_rows,
 )
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
+    S3DramaFrameStreamer,
     S3DramaGenerationInput,
     S3DramaGenerationResult,
     S3DramaRequestBuilder,
@@ -65,6 +67,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
+    RequestOutput,
     SchedulerOutput,
     SchedulerRequest,
 )
@@ -88,8 +91,11 @@ from tests.unit_test.fishaudio_s3_drama.test_hf_config import fish_config_dict
 FRAME_WIDTH = 5
 CONTEXT_LENGTH = 32
 MAX_PROMPT_ROWS = 6
+MAX_NEW_TOKENS_CAP = 16
 # The prompt cap the serving contract asks for by default.
 SERVING_PROMPT_CAP_ROWS = 8192
+# The new-frame cap the serving contract asks for by default.
+SERVING_MAX_NEW_TOKENS_CAP = 2048
 SamplingField = Literal["max_new_tokens", "temperature", "top_k", "top_p"]
 
 
@@ -134,6 +140,7 @@ def built_request(
         config=FishOmniConfig(**fish_config_dict()),
         context_length=CONTEXT_LENGTH,
         max_prompt_rows=MAX_PROMPT_ROWS,
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
     )
     return builder(
         StagePayload(
@@ -208,6 +215,7 @@ def with_entry(row: int, column: int, value: int) -> torch.Tensor:
 REJECTED_INPUTS = [
     pytest.param(changed_rows(GOOD_ROWS.float()), "int64", id="float-rows"),
     pytest.param(changed_rows(GOOD_ROWS[:, :4]), "int64", id="narrow-rows"),
+    pytest.param(changed_rows(GOOD_ROWS[0, 0]), "int64", id="scalar-rows"),
     pytest.param(changed_rows(GOOD_ROWS[:1]), "at least 2 rows", id="one-row"),
     pytest.param(
         changed_rows(with_entry(0, 0, TEXT_VOCAB_SIZE)),
@@ -229,6 +237,11 @@ REJECTED_INPUTS = [
         id="past-context",
     ),
     pytest.param(
+        changed_field("max_new_tokens", MAX_NEW_TOKENS_CAP + 1),
+        f"at most {MAX_NEW_TOKENS_CAP}",
+        id="past-cap",
+    ),
+    pytest.param(
         changed_field("temperature", -0.5), "temperature", id="negative-temperature"
     ),
     pytest.param(
@@ -236,6 +249,7 @@ REJECTED_INPUTS = [
     ),
     pytest.param(changed_field("top_k", 0), "top_k", id="zero-top-k"),
     pytest.param(changed_field("top_k", -1), "top_k", id="disabled-top-k"),
+    pytest.param(changed_field("top_k", 2**31), "top_k", id="top-k-past-int32"),
     pytest.param(changed_field("top_p", 0.0), "top_p", id="zero-top-p"),
     pytest.param(changed_field("top_p", 1.5), "top_p", id="top-p-above-one"),
 ]
@@ -249,6 +263,7 @@ def test_request_builder_rejects_bad_inputs(
         config=FishOmniConfig(**fish_config_dict()),
         context_length=CONTEXT_LENGTH,
         max_prompt_rows=MAX_PROMPT_ROWS,
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
     )
     payload = StagePayload(
         request_id="request-a",
@@ -256,8 +271,73 @@ def test_request_builder_rejects_bad_inputs(
         data=change(generation_input(GOOD_ROWS)),
     )
 
-    with pytest.raises(ValueError, match=error):
+    with pytest.raises(ValueError, match=error) as rejection:
         builder(payload)
+
+    assert is_bad_request_error(rejection.value)
+
+
+def unset_max_new_tokens_payload(prompt_row_count: int) -> StagePayload:
+    prompt_rows = torch.tensor(
+        frame_rows_of([prompt_row_count], seed=6)[0], dtype=torch.int64
+    )
+    return StagePayload(
+        request_id="request-a",
+        request=OmniRequest(inputs="prompt"),
+        data=replace(generation_input(prompt_rows), max_new_tokens=None),
+    )
+
+
+@pytest.mark.parametrize(
+    ("context_length", "max_new_tokens_cap", "prompt_row_count", "max_new_tokens"),
+    [
+        pytest.param(
+            CONTEXT_LENGTH, MAX_NEW_TOKENS_CAP, 4, MAX_NEW_TOKENS_CAP, id="cap"
+        ),
+        pytest.param(
+            CONTEXT_LENGTH, CONTEXT_LENGTH, 4, CONTEXT_LENGTH - 4, id="context-left"
+        ),
+        pytest.param(
+            MAX_PROMPT_ROWS,
+            MAX_NEW_TOKENS_CAP,
+            MAX_PROMPT_ROWS - 1,
+            1,
+            id="one-row-left",
+        ),
+    ],
+)
+def test_unset_max_new_tokens_fills_the_context_up_to_the_cap(
+    context_length: int,
+    max_new_tokens_cap: int,
+    prompt_row_count: int,
+    max_new_tokens: int,
+) -> None:
+    builder = S3DramaRequestBuilder(
+        config=FishOmniConfig(**fish_config_dict()),
+        context_length=context_length,
+        max_prompt_rows=MAX_PROMPT_ROWS,
+        max_new_tokens_cap=max_new_tokens_cap,
+    )
+
+    request_data = builder(unset_max_new_tokens_payload(prompt_row_count))
+
+    assert request_data.req is not None
+    assert request_data.max_new_tokens == max_new_tokens
+    assert request_data.req.sampling_params.max_new_tokens == max_new_tokens
+
+
+def test_unset_max_new_tokens_with_no_context_left_is_a_bad_request() -> None:
+    builder = S3DramaRequestBuilder(
+        config=FishOmniConfig(**fish_config_dict()),
+        context_length=MAX_PROMPT_ROWS,
+        max_prompt_rows=MAX_PROMPT_ROWS,
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
+    )
+
+    with pytest.raises(ValueError, match="leaves no room") as rejection:
+        builder(unset_max_new_tokens_payload(MAX_PROMPT_ROWS))
+
+    assert is_bad_request_error(rejection.value)
 
 
 def test_request_builder_rejects_a_foreign_payload() -> None:
@@ -265,6 +345,7 @@ def test_request_builder_rejects_a_foreign_payload() -> None:
         config=FishOmniConfig(**fish_config_dict()),
         context_length=CONTEXT_LENGTH,
         max_prompt_rows=MAX_PROMPT_ROWS,
+        max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
     )
     payload = StagePayload(
         request_id="request-a", request=OmniRequest(inputs="prompt"), data=[1, 2, 3]
@@ -318,6 +399,43 @@ def test_default_prompt_cap_reaches_the_request_builder() -> None:
         request_builder(payload(capped_rows, max_new_tokens=6))
 
 
+def test_engine_builder_wires_the_default_cap_and_a_frame_streamer() -> None:
+    """A request without max_new_tokens gets 2048 frames at most, and the scheduler
+    streams through the frame streamer make_adapters made."""
+    engine_builder = S3DramaEngineBuilder(
+        context_length=2 * SERVING_MAX_NEW_TOKENS_CAP, max_running_requests=1
+    )
+    request_builder, _ = engine_builder.make_adapters(
+        ConfigOnlyModel(FishOmniConfig(**fish_config_dict()))
+    )
+
+    request_data = request_builder(unset_max_new_tokens_payload(4))
+    frame_streamer = engine_builder.extra_scheduler_kwargs()["stream_output_builder"]
+
+    assert request_data.max_new_tokens == SERVING_MAX_NEW_TOKENS_CAP
+    assert isinstance(frame_streamer, S3DramaFrameStreamer)
+    assert frame_streamer.eos_token_id == EOS_TOKEN_ID
+
+
+def test_engine_builder_resolves_a_hub_id_to_a_local_snapshot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    downloads: list[tuple[str, str | None]] = []
+
+    def snapshot_download(repo_id: str, revision: str | None) -> str:
+        downloads.append((repo_id, revision))
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
+    engine_builder = S3DramaEngineBuilder(
+        context_length=CONTEXT_LENGTH, max_running_requests=1
+    )
+
+    assert engine_builder.resolve_checkpoint(str(tmp_path)) == str(tmp_path)
+    assert engine_builder.resolve_checkpoint("example/model@main") == str(tmp_path)
+    assert downloads == [("example/model", "main")]
+
+
 @pytest.mark.parametrize(
     "max_prompt_rows",
     [
@@ -337,20 +455,26 @@ def test_prompt_cap_must_be_an_integer_of_at_least_two_rows(
             config=FishOmniConfig(**fish_config_dict()),
             context_length=CONTEXT_LENGTH,
             max_prompt_rows=max_prompt_rows,
+            max_new_tokens_cap=MAX_NEW_TOKENS_CAP,
         )
 
 
 @pytest.mark.parametrize(
-    ("sampled_main_tokens", "kept_count"),
-    [([81, 84], 2), ([81, EOS_TOKEN_ID], 1), ([EOS_TOKEN_ID], 0)],
+    ("sampled_main_tokens", "kept_count", "finish_reason"),
+    [
+        ([81, 84], 2, "length"),
+        ([81, EOS_TOKEN_ID], 1, "stop"),
+        ([EOS_TOKEN_ID], 0, "stop"),
+    ],
     ids=["no-eos", "eos-last", "only-eos"],
 )
 def test_result_holds_the_sampled_frames_without_eos(
-    sampled_main_tokens: list[int], kept_count: int
+    sampled_main_tokens: list[int], kept_count: int, finish_reason: str
 ) -> None:
     data = built_request(frame_rows_of([3], seed=2)[0])
     sampled = [[token, 1, 2, 3, 0] for token in sampled_main_tokens]
     data.frame_rows.extend(sampled)
+    data.finish_reason = finish_reason
 
     payload = S3DramaResultAdapter(eos_token_id=EOS_TOKEN_ID)(data)
 
@@ -358,6 +482,53 @@ def test_result_holds_the_sampled_frames_without_eos(
     assert isinstance(result, S3DramaGenerationResult)
     assert result.frames.shape == (kept_count, FRAME_WIDTH)
     assert result.frames.tolist() == sampled[:kept_count]
+    assert (result.prompt_row_count, result.finish_reason) == (3, finish_reason)
+
+
+def test_frame_streamer_sends_each_new_audio_frame_only_when_streaming() -> None:
+    request_data = built_request(frame_rows_of([3], seed=6)[0])
+    payload = request_data.stage_payload
+    assert payload is not None
+    frame_streamer = S3DramaFrameStreamer(eos_token_id=EOS_TOKEN_ID)
+    request_output = RequestOutput(request_id="request-a")
+    request_data.frame_rows.append([81, 1, 2, 3, 0])
+
+    assert frame_streamer("request-a", request_data, request_output) == []
+    payload.request.params["stream"] = True
+    [message] = frame_streamer("request-a", request_data, request_output)
+    request_data.frame_rows.append([EOS_TOKEN_ID, 0, 0, 0, 0])
+
+    assert (message.request_id, message.type, message.target, message.metadata) == (
+        "request-a",
+        "stream",
+        "vocoder",
+        {"modality": "audio_codes"},
+    )
+    assert isinstance(message.data, torch.Tensor)
+    assert message.data.dtype == torch.int64
+    assert message.data.tolist() == [[81], [1], [2], [3], [0]]
+    assert frame_streamer("request-a", request_data, request_output) == []
+
+
+def test_streamed_and_result_frames_stay_on_cpu_under_another_default_device() -> None:
+    request_data = built_request(frame_rows_of([3], seed=7)[0])
+    payload = request_data.stage_payload
+    assert payload is not None
+    payload.request.params["stream"] = True
+    request_data.frame_rows.append([81, 1, 2, 3, 0])
+    request_data.finish_reason = "length"
+
+    with torch.device("meta"):
+        [message] = S3DramaFrameStreamer(eos_token_id=EOS_TOKEN_ID)(
+            "request-a", request_data, RequestOutput(request_id="request-a")
+        )
+        result = S3DramaResultAdapter(eos_token_id=EOS_TOKEN_ID)(request_data).data
+
+    assert isinstance(message.data, torch.Tensor)
+    assert isinstance(result, S3DramaGenerationResult)
+    for frames in (message.data.T, result.frames):
+        assert (frames.device.type, frames.dtype) == ("cpu", torch.int64)
+        assert frames.tolist() == [[81, 1, 2, 3, 0]]
 
 
 def admitted_for_prefill(data: S3DramaRequestData, start: int, end: int) -> None:

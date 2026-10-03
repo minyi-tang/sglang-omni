@@ -19,6 +19,7 @@ from sglang_omni.models.fishaudio_s3_drama.quantization import (
     ExpertFp8Config,
 )
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
+    S3DramaFrameStreamer,
     S3DramaRequestBuilder,
     S3DramaRequestData,
     S3DramaResultAdapter,
@@ -29,15 +30,19 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
 )
 from sglang_omni.scheduling.engine_factory import (
     GenerationDefaults,
+    SchedulerExtras,
     SGLangGenerationEngineBuilder,
 )
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.utils.checkpoint import resolve_checkpoint
 
 FISH_OMNI_ARCHITECTURE = "FishOmniModel"
 # The tower re-plans this backend's metadata for its first frame.
 ATTENTION_BACKEND = "triton"
 # A prompt with more rows is refused before admission (HTTP 400).
 DEFAULT_MAX_PROMPT_ROWS = 8192
+# A request that sets no max_new_tokens fills the remaining context up to this.
+DEFAULT_MAX_NEW_TOKENS_CAP = 2048
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
@@ -52,10 +57,16 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         context_length: int,
         max_running_requests: int,
         max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
+        max_new_tokens_cap: int = DEFAULT_MAX_NEW_TOKENS_CAP,
     ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
         self.max_prompt_rows = max_prompt_rows
+        self.max_new_tokens_cap = max_new_tokens_cap
+        self.frame_streamer: S3DramaFrameStreamer | None = None
+
+    def resolve_checkpoint(self, model_path: str) -> str:
+        return resolve_checkpoint(model_path)
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         """Register the classes the checkpoint names; the directory is the contract."""
@@ -163,11 +174,20 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     def make_adapters(
         self, model: S3DramaForCausalLM
     ) -> tuple[S3DramaRequestBuilder, S3DramaResultAdapter]:
+        self.frame_streamer = S3DramaFrameStreamer(
+            eos_token_id=model.config.eos_token_id
+        )
         return (
             S3DramaRequestBuilder(
                 config=model.config,
                 context_length=self.context_length,
                 max_prompt_rows=self.max_prompt_rows,
+                max_new_tokens_cap=self.max_new_tokens_cap,
             ),
             S3DramaResultAdapter(eos_token_id=model.config.eos_token_id),
         )
+
+    def extra_scheduler_kwargs(self) -> SchedulerExtras[S3DramaRequestData]:
+        """The frame streamer make_adapters created, which build calls first."""
+        assert self.frame_streamer is not None
+        return {"stream_output_builder": self.frame_streamer}

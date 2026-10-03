@@ -50,8 +50,7 @@ TextCarrier = Literal["system", "reference", "assistant", "user"]
 CodesCarrier = Literal["user", "reference"]
 
 
-@pytest.fixture(scope="module")
-def toy_tokenizer() -> Tokenizer:
+def build_toy_tokenizer() -> Tokenizer:
     """Byte-level BPE whose merges join two newlines and "t[", so a newline seam,
     or an infill transcript ending in "t" before its length hint, tells
     per-segment encoding apart from encoding the joined string."""
@@ -70,6 +69,11 @@ def toy_tokenizer() -> Tokenizer:
         + [f"<|semantic:{code}|>" for code in range(CODEBOOK_SIZE)]
     )
     return tokenizer
+
+
+@pytest.fixture(scope="module")
+def toy_tokenizer() -> Tokenizer:
+    return build_toy_tokenizer()
 
 
 @pytest.fixture(scope="module")
