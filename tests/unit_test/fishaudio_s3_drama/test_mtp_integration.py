@@ -3,24 +3,40 @@
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import math
 from array import array
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal, Protocol
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
+from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.server_args import ServerArgs
 
+from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import S3DramaEngineBuilder
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import (
-    EMPTY_RAS_SLOT,
+    S3DramaModelRunner,
     decode_frame_row,
     extend_frame_rows,
     ras_window,
+    request_data_of,
+    stage_decode_rows,
 )
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationInput,
@@ -29,18 +45,31 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaRequestData,
     S3DramaResultAdapter,
 )
+from sglang_omni.models.fishaudio_s3_drama.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_WINDOW_FRAMES,
+)
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
+    S3DramaDecodeBuffers,
     S3DramaForCausalLM,
     S3DramaStepInputs,
     StepExchange,
     next_frame_labels,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling import sglang_backend
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
 )
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
+    SchedulerOutput,
+    SchedulerRequest,
+)
 from sglang_omni.serve.openai_errors import is_bad_request_error
+from sglang_omni.vendor.sglang.core import GenerationBatchResult, ScheduleBatch
 from tests.unit_test.fishaudio_s3_drama.dense_attention import DenseAttention
 from tests.unit_test.fishaudio_s3_drama.test_audio_decoder import (
     CODEBOOK_SIZE,
@@ -98,7 +127,9 @@ def generation_input(prompt_rows: torch.Tensor) -> S3DramaGenerationInput:
     )
 
 
-def built_request(prompt_rows: list[list[int]]) -> S3DramaRequestData:
+def built_request(
+    prompt_rows: list[list[int]], request_id: str = "request-a"
+) -> S3DramaRequestData:
     builder = S3DramaRequestBuilder(
         config=FishOmniConfig(**fish_config_dict()),
         context_length=CONTEXT_LENGTH,
@@ -106,7 +137,7 @@ def built_request(prompt_rows: list[list[int]]) -> S3DramaRequestData:
     )
     return builder(
         StagePayload(
-            request_id="request-a",
+            request_id=request_id,
             request=OmniRequest(inputs="prompt"),
             data=generation_input(torch.tensor(prompt_rows, dtype=torch.int64)),
         )
@@ -448,6 +479,299 @@ def test_a_failed_step_never_feeds_the_next_step_of_the_same_requests() -> None:
         exchange.take_inputs(["a"], 1)
 
 
+def decoding_request(
+    prompt_rows: list[list[int]],
+    sampled_rows: list[list[int]],
+    request_id: str = "request-a",
+) -> S3DramaRequestData:
+    """A request whose prefill and decode steps so far sampled sampled_rows."""
+    request_data = built_request(prompt_rows, request_id)
+    request = request_data.req
+    assert request is not None
+    request.output_ids.extend(array("q", [row[0] for row in sampled_rows]))
+    request_data.frame_rows.extend(sampled_rows)
+    return request_data
+
+
+def buffer_addresses(buffers: S3DramaDecodeBuffers) -> list[int]:
+    return [
+        getattr(buffers, field.name).data_ptr() for field in dataclasses.fields(buffers)
+    ]
+
+
+@dataclass(frozen=True, kw_only=True)
+class StagedRows:
+    """The batch rows of the decode buffers, as a forward reads them."""
+
+    frames: list[list[int]]
+    ras_windows: list[list[int]]
+    sampling_knobs: list[tuple[float, int, float]]
+
+
+def staged_rows(buffers: S3DramaDecodeBuffers, row_count: int) -> StagedRows:
+    return StagedRows(
+        frames=buffers.frames[:row_count].tolist(),
+        ras_windows=buffers.ras_windows[:row_count].tolist(),
+        sampling_knobs=list(
+            zip(
+                buffers.temperature[:row_count].tolist(),
+                buffers.top_k[:row_count].tolist(),
+                buffers.top_p[:row_count].tolist(),
+                strict=True,
+            )
+        ),
+    )
+
+
+def as_float32(value: float) -> float:
+    return float(torch.tensor(value, dtype=torch.float32))
+
+
+def expected_rows(batch_request_data: list[S3DramaRequestData]) -> StagedRows:
+    return StagedRows(
+        frames=[request_data.frame_rows[-1] for request_data in batch_request_data],
+        ras_windows=[
+            ras_window(request_data.frame_rows) for request_data in batch_request_data
+        ],
+        sampling_knobs=[
+            (
+                as_float32(request_data.temperature),
+                request_data.top_k,
+                as_float32(request_data.top_p),
+            )
+            for request_data in batch_request_data
+        ],
+    )
+
+
+def test_decode_buffers_start_with_valid_sampling_knobs() -> None:
+    buffers = S3DramaDecodeBuffers.allocate(
+        row_count=3, frame_width=FRAME_WIDTH, device=torch.device("cpu")
+    )
+
+    assert buffers.frames.shape == buffers.sampled_frames.shape == (3, FRAME_WIDTH)
+    assert not buffers.frames.any() and not buffers.sampled_frames.any()
+    assert buffers.ras_windows.tolist() == [[EMPTY_RAS_SLOT] * RAS_WINDOW_FRAMES] * 3
+    assert buffers.temperature.tolist() == [1.0] * 3
+    assert buffers.top_k.tolist() == [1] * 3
+    assert buffers.top_p.tolist() == [1.0] * 3
+
+
+def test_decode_staging_rewrites_rows_in_place_as_the_batch_shrinks_and_grows() -> None:
+    buffers = S3DramaDecodeBuffers.allocate(
+        row_count=4, frame_width=FRAME_WIDTH, device=torch.device("cpu")
+    )
+    addresses = buffer_addresses(buffers)
+    batch_request_data = [
+        decoding_request(prompt_rows, [[81 + index, index, 1, 2, 3]])
+        for index, prompt_rows in enumerate(frame_rows_of([3, 4, 5, 2], seed=9))
+    ]
+
+    stage_decode_rows(buffers, batch_request_data[:3])
+    assert staged_rows(buffers, 3) == expected_rows(batch_request_data[:3])
+    third_row = (buffers.frames[2].clone(), buffers.ras_windows[2].clone())
+
+    for index, request_data in enumerate(batch_request_data):
+        request = request_data.req
+        assert request is not None
+        request.output_ids.append(90 + index)
+        request_data.frame_rows.append([90 + index, 4, 3, 2, 1])
+        request_data.temperature = 0.5 + index
+        request_data.top_k = 2 + index
+        request_data.top_p = 0.25 * (index + 1)
+    stage_decode_rows(buffers, batch_request_data[:2])
+    assert staged_rows(buffers, 2) == expected_rows(batch_request_data[:2])
+    # Rows past a smaller batch keep earlier valid inputs for padded graph rows.
+    assert torch.equal(buffers.frames[2], third_row[0])
+    assert torch.equal(buffers.ras_windows[2], third_row[1])
+
+    stage_decode_rows(buffers, batch_request_data)
+    assert staged_rows(buffers, 4) == expected_rows(batch_request_data)
+    assert buffer_addresses(buffers) == addresses
+
+
+# Written by a decode forward that fails, so collecting it would show.
+JUNK_TOKEN_ID = 7
+
+
+class FakeDecodeForward:
+    """Stands in for the GPU forward behind the model worker: reads the batch rows
+    of the decode buffers, then writes the next frames, or writes junk and fails."""
+
+    def __init__(self, buffers: S3DramaDecodeBuffers) -> None:
+        self.buffers = buffers
+        self.reads: list[StagedRows] = []
+        self.next_frames: list[list[int]] = []
+        self.error: RuntimeError | None = None
+
+    def __call__(self, forward_batch: ForwardBatch) -> GenerationBatchResult:
+        row_count = len(forward_batch.rids)
+        self.reads.append(staged_rows(self.buffers, row_count))
+        if self.error is not None:
+            self.buffers.sampled_frames[:row_count].fill_(JUNK_TOKEN_ID)
+            raise self.error
+        else:
+            self.buffers.sampled_frames[:row_count].copy_(
+                torch.tensor(self.next_frames)
+            )
+            return GenerationBatchResult(can_run_cuda_graph=True)
+
+
+class SuppliedBatchRunner(S3DramaModelRunner):
+    """S3DramaModelRunner whose ForwardBatch comes from the test instead of SGLang."""
+
+    def build_forward_batch(
+        self, scheduler_output: SchedulerOutput
+    ) -> tuple[ForwardBatch, ScheduleBatch, bool]:
+        schedule_batch = scheduler_output.batch_data
+        assert schedule_batch is not None
+        forward_batch = Mock(spec=ForwardBatch)
+        forward_batch.rids = scheduler_output.request_ids
+        return forward_batch, schedule_batch, False
+
+
+@dataclass(frozen=True, kw_only=True)
+class DecodeRunner:
+    runner: SuppliedBatchRunner
+    forward: FakeDecodeForward
+    execution_bridge: Mock
+
+
+def decode_runner(row_count: int) -> DecodeRunner:
+    """The real runner on stubbed SGLang infrastructure and a fake GPU forward."""
+    config = FishOmniConfig(**fish_config_dict())
+    text_config = config.text_config
+    buffers = S3DramaDecodeBuffers.allocate(
+        row_count=row_count, frame_width=FRAME_WIDTH, device=torch.device("cpu")
+    )
+    model = Mock(spec=S3DramaForCausalLM)
+    model.config = config
+    model.step_exchange = StepExchange()
+    model.decode_buffers = buffers
+    attention_backend = Mock(spec=HybridLinearAttnBackend)
+    attention_backend.full_attn_backend = Mock(spec=TritonAttnBackend)
+    kv_pool = Mock(spec=HybridLinearKVPool)
+    kv_pool.full_attention_layer_id_mapping = {
+        layer_id: index
+        for index, layer_id in enumerate(text_config.full_attention_layer_ids)
+    }
+    request_pool = Mock(spec=HybridReqToTokenPool)
+    request_pool.mamba_map = {
+        layer_id: index for index, layer_id in enumerate(text_config.linear_layer_ids)
+    }
+    request_pool.size = row_count
+    forward = FakeDecodeForward(buffers)
+    worker = Mock(spec=ModelWorker)
+    worker.gpu_id = 0
+    worker.model_runner = SimpleNamespace(
+        model=model,
+        attn_backend=attention_backend,
+        token_to_kv_pool=kv_pool,
+        req_to_token_pool=request_pool,
+        prefill_cuda_graph_runner=None,
+        decode_cuda_graph_runner=None,
+    )
+    worker.forward_batch_generation.side_effect = forward
+    # A host without an accelerator has no platform device to resolve.
+    with patch.object(current_platform, "get_device", return_value=torch.device("cpu")):
+        runner = SuppliedBatchRunner(worker, SGLangOutputProcessor())
+    execution_bridge = Mock(spec=SGLangExecutionBridge)
+    execution_bridge.forward_context.side_effect = (
+        lambda schedule_batch, isolate_sampling=False: contextlib.nullcontext()
+    )
+    runner.bind_execution_bridge(execution_bridge)
+    return DecodeRunner(
+        runner=runner, forward=forward, execution_bridge=execution_bridge
+    )
+
+
+def decode_output(
+    runner: S3DramaModelRunner, requests: list[SchedulerRequest]
+) -> ModelRunnerOutput:
+    """One decode step through the runner's own execute order."""
+    schedule_batch = Mock(spec=ScheduleBatch)
+    schedule_batch.forward_mode = ForwardMode.DECODE
+    schedule_batch.is_prefill_only = False
+    return runner.execute(SchedulerOutput(requests=requests, batch_data=schedule_batch))
+
+
+def decode_step(
+    runner: S3DramaModelRunner, requests: list[SchedulerRequest]
+) -> torch.Tensor:
+    """A successful decode step, then the scheduler's bookkeeping of its tokens."""
+    next_token_ids = decode_output(runner, requests).next_token_ids
+    assert next_token_ids is not None
+    for request, token_id in zip(requests, next_token_ids.tolist(), strict=True):
+        sglang_request = request_data_of(request).req
+        assert sglang_request is not None
+        sglang_request.output_ids.append(token_id)
+    return next_token_ids
+
+
+def decoding_scheduler_requests(lengths: list[int]) -> list[SchedulerRequest]:
+    return [
+        SchedulerRequest(
+            request_id=f"request-{index}",
+            data=decoding_request(
+                prompt_rows, [[81 + index, index, 1, 2, 3]], f"request-{index}"
+            ),
+        )
+        for index, prompt_rows in enumerate(frame_rows_of(lengths, seed=11))
+    ]
+
+
+def test_a_failed_decode_forward_collects_nothing_and_the_next_step_restages() -> None:
+    decode = decode_runner(row_count=4)
+    requests = decoding_scheduler_requests([3, 4, 2])
+    batch_request_data = [request_data_of(request) for request in requests]
+    decode.forward.next_frames = [[90 + index, 1, 1, 1, 1] for index in range(3)]
+    decode_step(decode.runner, requests)
+    histories = [list(request_data.frame_rows) for request_data in batch_request_data]
+    publish_count = decode.execution_bridge.publish_next_tokens.call_count
+
+    for index, request_data in enumerate(batch_request_data):
+        request_data.temperature = 0.3 + index
+        request_data.top_k = 2 + index
+    expected = expected_rows(batch_request_data)
+    decode.forward.error = RuntimeError("decode forward failed")
+    with pytest.raises(RuntimeError, match="decode forward failed"):
+        decode_output(decode.runner, requests)
+    # The hook staged the new knobs; nothing of the failed step was collected.
+    assert decode.forward.reads[-1] == expected
+    assert [request_data.frame_rows for request_data in batch_request_data] == (
+        histories
+    )
+    assert decode.execution_bridge.publish_next_tokens.call_count == publish_count
+
+    for request_data in batch_request_data:
+        request_data.top_p = 0.5
+    expected = expected_rows(batch_request_data)
+    decode.forward.error = None
+    decode.forward.next_frames = [[95 + index, 2, 2, 2, 2] for index in range(3)]
+    next_token_ids = decode_step(decode.runner, requests)
+    assert decode.forward.reads[-1] == expected
+    assert next_token_ids.tolist() == [95, 96, 97]
+    assert [request_data.frame_rows for request_data in batch_request_data] == [
+        history + [frame]
+        for history, frame in zip(histories, decode.forward.next_frames, strict=True)
+    ]
+
+
+def test_next_token_ids_from_post_decode_outlive_later_steps() -> None:
+    decode = decode_runner(row_count=4)
+    requests = decoding_scheduler_requests([3, 4, 2])
+    decode.forward.next_frames = [[90 + index, 1, 1, 1, 1] for index in range(3)]
+    first_token_ids = decode_step(decode.runner, requests)
+
+    decode.forward.next_frames = [[93 + index, 2, 2, 2, 2] for index in range(3)]
+    decode_step(decode.runner, requests)
+    decode.forward.error = RuntimeError("decode forward failed")
+    with pytest.raises(RuntimeError, match="decode forward failed"):
+        decode_output(decode.runner, requests)
+
+    assert first_token_ids.tolist() == [90, 91, 92]
+
+
 def test_next_frame_labels_pair_rows_within_each_request() -> None:
     frames = torch.tensor(sum(frame_rows_of([3, 2], seed=6), []))
     original = frames.clone()
@@ -597,8 +921,21 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     builder, server_args = engine_server_args(tmp_path, {})
 
     builder.validate_before_infrastructure(server_args)
+    graph_config = resolved_view(server_args).cuda_graph_config
     assert server_args.page_size == 1
     assert server_args.chunked_prefill_size == -1
+    assert not server_args.disable_cuda_graph
+    assert graph_config.decode.backend == CudaGraphBackend.FULL
+    assert graph_config.prefill.backend == CudaGraphBackend.DISABLED
+
+
+def test_engine_also_runs_without_cuda_graphs(tmp_path: Path) -> None:
+    builder, server_args = engine_server_args(tmp_path, {"disable_cuda_graph": True})
+
+    builder.validate_before_infrastructure(server_args)
+    assert resolved_view(server_args).cuda_graph_config.decode.backend == (
+        CudaGraphBackend.DISABLED
+    )
 
 
 @pytest.mark.parametrize(
@@ -606,8 +943,19 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     [
         ({"disable_radix_cache": False}, "disable_radix_cache"),
         ({"chunked_prefill_size": 64}, "chunked_prefill_size"),
-        ({"disable_cuda_graph": False}, "eager"),
-        ({"disable_overlap_schedule": False}, "eager"),
+        ({"cuda_graph_backend_prefill": "breakable"}, "prefill runs eager"),
+        ({"cuda_graph_backend_prefill": "full"}, "prefill runs eager"),
+        (
+            {"cuda_graph_config": {"prefill": {"backend": "breakable"}}},
+            "prefill runs eager",
+        ),
+        ({"cuda_graph_backend_decode": "breakable"}, "full decode CUDA graphs"),
+        ({"cuda_graph_backend_decode": "tc_piecewise"}, "full decode CUDA graphs"),
+        (
+            {"cuda_graph_config": {"decode": {"backend": "breakable"}}},
+            "full decode CUDA graphs",
+        ),
+        ({"disable_overlap_schedule": False}, "overlap"),
         ({"attention_backend": "flashinfer"}, "attention backend"),
         ({"page_size": 16}, "page_size"),
         ({"kv_cache_dtype": "fp8_e4m3"}, "model dtype"),
@@ -616,7 +964,12 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     ids=[
         "radix",
         "chunked-prefill",
-        "cuda-graph",
+        "breakable-prefill-graph",
+        "full-prefill-graph",
+        "nested-prefill-graph",
+        "breakable-decode-graph",
+        "piecewise-decode-graph",
+        "nested-decode-graph",
         "overlap",
         "flashinfer",
         "paged",

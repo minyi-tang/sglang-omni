@@ -9,6 +9,8 @@ import torch
 # when the first draw repeats a main token from the last 16 frames, the frame
 # takes a second draw made with these parameters instead.
 RAS_WINDOW_FRAMES = 16
+# Pads the windows of requests with fewer than 16 frames; matches no token id.
+EMPTY_RAS_SLOT = -1
 RAS_TEMPERATURE = 1.0
 RAS_TOP_P = 0.95
 RAS_TOP_K = 30

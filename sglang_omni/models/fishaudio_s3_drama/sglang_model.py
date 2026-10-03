@@ -4,6 +4,7 @@
 The tower keeps its key/value cache in the backbone's paged pool, under the
 layer ids that follow the backbone's. One forward runs the backbone, fills the
 tower cache of the extend rows, and samples the next frame of every request.
+A decode forward reads fixed-address buffers, so a CUDA graph can replay it.
 """
 
 from __future__ import annotations
@@ -28,6 +29,10 @@ from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_WINDOW_FRAMES,
+)
 from sglang_omni.models.fishaudio_s3_drama.weights import (
     checkpoint_part,
     load_audio_decoder_weights,
@@ -39,7 +44,7 @@ LM_HEAD_CHECKPOINT_NAME = "lm_head.weight"
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class S3DramaStepInputs:
-    """What one forward needs besides the batch, staged by the model runner.
+    """What one prefill forward needs besides the batch, staged by the model runner.
 
     frames holds the input frame of every forward row; the other tensors hold
     one entry per request, in batch order.
@@ -51,6 +56,39 @@ class S3DramaStepInputs:
     temperature: torch.Tensor
     top_k: torch.Tensor
     top_p: torch.Tensor
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class S3DramaDecodeBuffers:
+    """Decode inputs and sampled frames at fixed addresses, one row per batch slot;
+    rows past a batch keep earlier valid values that only padded graph rows read."""
+
+    frames: torch.Tensor
+    ras_windows: torch.Tensor
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    sampled_frames: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls, *, row_count: int, frame_width: int, device: torch.device
+    ) -> S3DramaDecodeBuffers:
+        """Rows that sample like a greedy request with an empty window."""
+        frames = torch.zeros((row_count, frame_width), dtype=torch.int64, device=device)
+        return cls(
+            frames=frames,
+            ras_windows=torch.full(
+                (row_count, RAS_WINDOW_FRAMES),
+                EMPTY_RAS_SLOT,
+                dtype=torch.int64,
+                device=device,
+            ),
+            temperature=torch.ones(row_count, dtype=torch.float32, device=device),
+            top_k=torch.ones(row_count, dtype=torch.int64, device=device),
+            top_p=torch.ones(row_count, dtype=torch.float32, device=device),
+            sampled_frames=torch.zeros_like(frames),
+        )
 
 
 class StepExchange:
@@ -200,6 +238,8 @@ class S3DramaForCausalLM(nn.Module):
             for tower_index in range(tower_layer_count)
         )
         self.step_exchange = StepExchange()
+        # The engine builder allocates these once the request pool is sized.
+        self.decode_buffers: S3DramaDecodeBuffers | None = None
 
     @property
     def start_layer(self) -> int:
@@ -217,57 +257,73 @@ class S3DramaForCausalLM(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> LogitsProcessorOutput:
-        step_inputs = self.step_exchange.take_inputs(
-            forward_batch.rids, input_ids.shape[0]
-        )
         forward_mode = forward_batch.forward_mode
-        if forward_mode not in (ForwardMode.EXTEND, ForwardMode.DECODE):
-            raise NotImplementedError(f"forward mode {forward_mode} is not supported")
-        else:
-            pass
-        frames = step_inputs.frames
-        input_embeds = self.audio_decoder.embed_backbone(
-            frames, self.model.embed_tokens(frames[:, 0])
-        )
-        hidden_states = self.model(
-            input_ids, positions, forward_batch, input_embeds=input_embeds
-        )
-        logits_output = self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
-        )
+        decode_buffers = self.decode_buffers
         if forward_mode == ForwardMode.EXTEND:
-            last_rows = (
-                forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+            return self.forward_extend(input_ids, positions, forward_batch)
+        elif forward_mode != ForwardMode.DECODE:
+            raise NotImplementedError(f"forward mode {forward_mode} is not supported")
+        elif decode_buffers is None:
+            raise RuntimeError("the engine allocated no S3-drama decode buffers")
+        else:
+            # A CUDA graph replays this branch with the batch padded to its size.
+            row_count = input_ids.shape[0]
+            frames = decode_buffers.frames[:row_count]
+            hidden_states, logits_output = self.backbone_logits(
+                input_ids, positions, forward_batch, frames
             )
-            self.audio_decoder.prefill(
+            sampled_frames = self.audio_decoder.decode_step(
+                logits_output.next_token_logits,
                 hidden_states,
                 positions,
                 frames,
-                next_frame_labels(frames, last_rows, self.config.eos_token_id),
+                decode_buffers.ras_windows[:row_count],
+                decode_buffers.temperature[:row_count],
+                decode_buffers.top_k[:row_count],
+                decode_buffers.top_p[:row_count],
                 PagedTowerAttention(self.tower_attention, forward_batch),
             )
-            # The backbone is done with the extend metadata, so the full-attention
-            # backend is re-planned for one newest row per request.
-            step_batch = dataclasses.replace(
-                forward_batch,
-                forward_mode=ForwardMode.DECODE,
-                out_cache_loc=forward_batch.out_cache_loc[last_rows],
-                positions=positions[last_rows],
-            )
-            attention_backend = get_attn_backend()
-            assert isinstance(attention_backend, HybridLinearAttnBackend)
-            attention_backend.full_attn_backend.init_forward_metadata(step_batch)
-            step_hidden_states = hidden_states[last_rows]
-            step_input_frames = frames[last_rows]
-        else:
-            step_batch = forward_batch
-            step_hidden_states = hidden_states
-            step_input_frames = frames
+            decode_buffers.sampled_frames[:row_count].copy_(sampled_frames)
+            return logits_output
+
+    def forward_extend(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> LogitsProcessorOutput:
+        """Fill the tower cache of every extend row, then sample each first frame."""
+        step_inputs = self.step_exchange.take_inputs(
+            forward_batch.rids, input_ids.shape[0]
+        )
+        frames = step_inputs.frames
+        hidden_states, logits_output = self.backbone_logits(
+            input_ids, positions, forward_batch, frames
+        )
+        last_rows = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+        self.audio_decoder.prefill(
+            hidden_states,
+            positions,
+            frames,
+            next_frame_labels(frames, last_rows, self.config.eos_token_id),
+            PagedTowerAttention(self.tower_attention, forward_batch),
+        )
+        # The backbone is done with the extend metadata, so the full-attention
+        # backend is re-planned for one newest row per request.
+        step_batch = dataclasses.replace(
+            forward_batch,
+            forward_mode=ForwardMode.DECODE,
+            out_cache_loc=forward_batch.out_cache_loc[last_rows],
+            positions=positions[last_rows],
+        )
+        attention_backend = get_attn_backend()
+        assert isinstance(attention_backend, HybridLinearAttnBackend)
+        attention_backend.full_attn_backend.init_forward_metadata(step_batch)
         sampled_frames = self.audio_decoder.decode_step(
             logits_output.next_token_logits,
-            step_hidden_states,
+            hidden_states[last_rows],
             step_batch.positions,
-            step_input_frames,
+            frames[last_rows],
             step_inputs.ras_windows,
             step_inputs.temperature,
             step_inputs.top_k,
@@ -276,6 +332,24 @@ class S3DramaForCausalLM(nn.Module):
         )
         self.step_exchange.publish(sampled_frames)
         return logits_output
+
+    def backbone_logits(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        frames: torch.Tensor,
+    ) -> tuple[torch.Tensor, LogitsProcessorOutput]:
+        """Final-norm hidden states of every row, and the logits SGLang keeps."""
+        input_embeds = self.audio_decoder.embed_backbone(
+            frames, self.model.embed_tokens(frames[:, 0])
+        )
+        hidden_states = self.model(
+            input_ids, positions, forward_batch, input_embeds=input_embeds
+        )
+        return hidden_states, self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         decoder_weights: list[tuple[str, torch.Tensor]] = []

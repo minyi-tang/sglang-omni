@@ -41,12 +41,12 @@ from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
     S3DramaEngineBuilder,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
-from sglang_omni.models.fishaudio_s3_drama.model_runner import EMPTY_RAS_SLOT
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationInput,
     S3DramaGenerationResult,
     S3DramaRequestData,
 )
+from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaForCausalLM,
     S3DramaStepInputs,
@@ -225,21 +225,43 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> LogitsProcessorOutput:
-        staged_inputs = self.step_exchange.staged_inputs
-        assert staged_inputs is not None
-        # The staged frames carry the batch's tokens as their main tokens.
-        assert torch.equal(staged_inputs.frames[:, 0], input_ids)
         self.head_logits.clear()
         self.moe_calls.clear()
-        self.step_exchange.stage(
-            replace(
-                staged_inputs,
-                ras_windows=torch.full_like(staged_inputs.ras_windows, EMPTY_RAS_SLOT),
+        row_count = input_ids.shape[0]
+        decode_buffers = self.decode_buffers
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            staged_inputs = self.step_exchange.staged_inputs
+            assert staged_inputs is not None
+            self.step_exchange.stage(
+                replace(
+                    staged_inputs,
+                    ras_windows=torch.full_like(
+                        staged_inputs.ras_windows, EMPTY_RAS_SLOT
+                    ),
+                )
             )
-        )
+        else:
+            assert decode_buffers is not None
+            staged_inputs = S3DramaStepInputs(
+                request_ids=forward_batch.rids,
+                frames=decode_buffers.frames[:row_count].clone(),
+                ras_windows=decode_buffers.ras_windows[:row_count].clone(),
+                temperature=decode_buffers.temperature[:row_count].clone(),
+                top_k=decode_buffers.top_k[:row_count].clone(),
+                top_p=decode_buffers.top_p[:row_count].clone(),
+            )
+            decode_buffers.ras_windows[:row_count].fill_(EMPTY_RAS_SLOT)
+        # The staged frames carry the batch's tokens as their main tokens.
+        assert torch.equal(staged_inputs.frames[:, 0], input_ids)
         output = super().forward(input_ids, positions, forward_batch)
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            sampled_frames = self.step_exchange.sampled_frames
+            assert sampled_frames is not None
+        else:
+            assert decode_buffers is not None
+            sampled_frames = decode_buffers.sampled_frames[:row_count]
         self.forwards.append(
-            self.forward_record(forward_batch, positions, staged_inputs)
+            self.forward_record(forward_batch, positions, staged_inputs, sampled_frames)
         )
         return output
 
@@ -248,6 +270,7 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
         forward_batch: ForwardBatch,
         positions: torch.Tensor,
         staged_inputs: S3DramaStepInputs,
+        sampled_frames: torch.Tensor,
     ) -> ForwardRecord:
         attention_backend = get_attn_backend()
         kv_pool = attention_backend.token_to_kv_pool
@@ -255,10 +278,8 @@ class RecordingS3DramaModel(S3DramaForCausalLM):
         request_slots = attention_backend.req_to_token_pool.req_to_token
         tower_layer_ids = [layer.layer_id for layer in self.tower_attention]
         hidden_states = self.backbone_hidden_states
-        sampled_frames = self.step_exchange.sampled_frames
         logits = self.eos_controlled_logits.last_logits
         assert hidden_states is not None
-        assert sampled_frames is not None
         assert logits is not None
         is_extend = forward_batch.forward_mode == ForwardMode.EXTEND
         if is_extend:
@@ -404,8 +425,10 @@ class RecordingEngineBuilder(S3DramaEngineBuilder):
         ModelRegistry.models[FISH_OMNI_ARCHITECTURE] = RecordingS3DramaModel
 
     def generation_defaults(self, *, dtype: str) -> GenerationDefaults:
+        # The recording model copies to the host inside its forward, so it runs eager.
         return {
             **super().generation_defaults(dtype=dtype),
+            "disable_cuda_graph": True,
             "max_prefill_tokens": self.spec.max_prefill_tokens,
             "max_total_tokens": self.spec.max_total_tokens,
         }

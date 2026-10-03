@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import torch
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.server_args import ServerArgs
 from transformers import AutoConfig
@@ -20,7 +23,10 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaRequestData,
     S3DramaResultAdapter,
 )
-from sglang_omni.models.fishaudio_s3_drama.sglang_model import S3DramaForCausalLM
+from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
+    S3DramaDecodeBuffers,
+    S3DramaForCausalLM,
+)
 from sglang_omni.scheduling.engine_factory import (
     GenerationDefaults,
     SGLangGenerationEngineBuilder,
@@ -35,7 +41,8 @@ DEFAULT_MAX_PROMPT_ROWS = 8192
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
-    """Single-GPU eager engine: no radix, chunked prefill, overlap or CUDA graphs."""
+    """Single-GPU engine replaying decode CUDA graphs over an eager prefill; no radix,
+    chunked prefill or overlap."""
 
     model_name = "FishAudio S3-drama"
 
@@ -59,7 +66,8 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     def generation_defaults(self, *, dtype: str) -> GenerationDefaults:
         return {
             "max_running_requests": self.max_running_requests,
-            "disable_cuda_graph": True,
+            "disable_cuda_graph": False,
+            "cuda_graph_backend_prefill": CudaGraphBackend.DISABLED,
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
             "enable_mixed_chunk": False,
@@ -81,6 +89,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         }
         parallel_sizes = (server_args.tp_size, server_args.pp_size, server_args.dp_size)
         chunked_prefill_size = server_args.chunked_prefill_size or 0
+        graph_config = resolved_view(server_args).cuda_graph_config
         if not server_args.disable_radix_cache:
             raise ValueError("S3-drama needs disable_radix_cache=True")
         elif chunked_prefill_size > 0 or server_args.enable_mixed_chunk:
@@ -88,10 +97,21 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
                 "S3-drama needs chunked_prefill_size <= 0 and no mixed chunk: a "
                 "prompt must reach the tower in one extend"
             )
-        elif not (
-            server_args.disable_cuda_graph and server_args.disable_overlap_schedule
+        elif not server_args.disable_overlap_schedule:
+            raise ValueError("S3-drama runs without overlap scheduling")
+        elif graph_config.prefill.backend != CudaGraphBackend.DISABLED:
+            raise ValueError(
+                f"S3-drama prefill runs eager; got the "
+                f"{graph_config.prefill.backend!r} prefill CUDA graph backend"
+            )
+        elif graph_config.decode.backend not in (
+            CudaGraphBackend.FULL,
+            CudaGraphBackend.DISABLED,
         ):
-            raise ValueError("S3-drama runs eager without overlap scheduling")
+            raise ValueError(
+                f"S3-drama replays full decode CUDA graphs; got the "
+                f"{graph_config.decode.backend!r} decode CUDA graph backend"
+            )
         elif server_args.enable_torch_compile:
             raise ValueError("S3-drama does not support torch.compile")
         elif attention_backends != {ATTENTION_BACKEND}:
@@ -113,6 +133,27 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             )
         else:
             pass
+
+    def setup_model(
+        self,
+        *,
+        model_worker: ModelWorker,
+        checkpoint_dir: str,
+        device: str,
+        gpu_id: int,
+        server_args: ServerArgs,
+    ) -> None:
+        """Allocate the decode buffers before graph capture; the checkpoint, GPU
+        and server arguments are the interface contract."""
+        sglang_runner = model_worker.model_runner
+        model = sglang_runner.model
+        assert isinstance(model, S3DramaForCausalLM)
+        # No decode batch or captured graph size exceeds the request slots.
+        model.decode_buffers = S3DramaDecodeBuffers.allocate(
+            row_count=sglang_runner.req_to_token_pool.size,
+            frame_width=1 + model.config.audio_decoder_config.num_codebooks,
+            device=torch.device(device),
+        )
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor

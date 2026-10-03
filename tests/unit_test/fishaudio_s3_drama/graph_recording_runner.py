@@ -1,0 +1,332 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The graph test's S3-drama runner: stages the test's controls and records every
+step after it ran, the same way with or without a CUDA graph."""
+
+from __future__ import annotations
+
+import hashlib
+import queue
+from dataclasses import replace
+
+import torch
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.models.fishaudio_s3_drama.model_runner import (
+    S3DramaModelRunner,
+    request_data_of,
+)
+from sglang_omni.models.fishaudio_s3_drama.request_builders import S3DramaRequestData
+from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
+from sglang_omni.models.fishaudio_s3_drama.sglang_model import S3DramaStepInputs
+from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.vendor.sglang.core import GenerationBatchResult, ScheduleBatch
+from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
+    GraphForwardRecord,
+    GraphRequestSpec,
+    GraphRequestStep,
+    SamplingMode,
+    bits,
+)
+from tests.unit_test.fishaudio_s3_drama.graph_recording_model import GraphRecordingModel
+
+# Far above any logit the synthetic heads produce, so greedy sampling takes eos.
+FORCED_END_OF_SPEECH_LOGIT = 1.0e4
+
+
+class GraphRecordingRunner(S3DramaModelRunner):
+    """S3DramaModelRunner that stages eos logits, greedy windows and aborts, and
+    reads each step's records from the pools and buffers after the step."""
+
+    model: GraphRecordingModel
+
+    def __init__(
+        self, tp_worker: ModelWorker, output_processor: SGLangOutputProcessor
+    ) -> None:
+        super().__init__(tp_worker, output_processor)
+        sglang_runner = tp_worker.model_runner
+        kv_pool = sglang_runner.token_to_kv_pool
+        request_pool = sglang_runner.req_to_token_pool
+        assert isinstance(kv_pool, HybridLinearKVPool)
+        assert isinstance(request_pool, HybridReqToTokenPool)
+        self.kv_pool = kv_pool
+        self.request_pool = request_pool
+        self.full_attention_layer_ids = sorted(kv_pool.full_attention_layer_id_mapping)
+        self.decode_graph_runner = sglang_runner.decode_cuda_graph_runner
+        self.request_specs: dict[str, GraphRequestSpec] = {}
+        self.sampling_mode: SamplingMode = "greedy"
+        self.scenario_name = ""
+        self.abort_inbox: queue.Queue[IncomingMessage] | None = None
+        self.aborted_after_frames: dict[str, int] = {}
+        self.forwards: list[GraphForwardRecord] = []
+        self.staged_ras_windows: list[list[int]] = []
+        self.staged_prefill_inputs: S3DramaStepInputs | None = None
+        self.kv_snapshot: list[torch.Tensor] = []
+        self.state_snapshot: list[torch.Tensor] = []
+
+    def kv_buffers(self) -> list[torch.Tensor]:
+        """Every full-attention layer's key and value buffer, slot-major."""
+        return [
+            buffer
+            for layer_id in self.full_attention_layer_ids
+            for buffer in (
+                self.kv_pool.get_key_buffer(layer_id),
+                self.kv_pool.get_value_buffer(layer_id),
+            )
+        ]
+
+    def state_buffers(self) -> list[torch.Tensor]:
+        """Every linear-attention state tensor, [layers, slots, ...]."""
+        cache = self.request_pool.mamba_pool.mamba_cache
+        return [*cache.conv, cache.temporal]
+
+    def sampled_count(self, request: SchedulerRequest) -> int:
+        request_data = request_data_of(request)
+        return len(request_data.frame_rows) - request_data.prompt_row_count
+
+    def stage_end_of_speech(self, requests: list[SchedulerRequest]) -> None:
+        end_of_speech_logits = [
+            (
+                FORCED_END_OF_SPEECH_LOGIT
+                if self.request_specs[request.request_id].end_at_frame
+                == self.sampled_count(request)
+                else float("-inf")
+            )
+            for request in requests
+        ]
+        recording_buffers = self.model.recording_buffers
+        assert recording_buffers is not None
+        recording_buffers.end_of_speech_logits[: len(requests)].copy_(
+            torch.tensor(end_of_speech_logits)
+        )
+
+    def before_prefill(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().before_prefill(forward_batch, schedule_batch, requests)
+        staged_inputs = self.model.step_exchange.staged_inputs
+        assert staged_inputs is not None
+        self.staged_ras_windows = staged_inputs.ras_windows.tolist()
+        if self.sampling_mode == "greedy":
+            staged_inputs = replace(
+                staged_inputs,
+                ras_windows=torch.full_like(staged_inputs.ras_windows, EMPTY_RAS_SLOT),
+            )
+            self.model.step_exchange.stage(staged_inputs)
+        else:
+            pass
+        self.staged_prefill_inputs = staged_inputs
+        self.stage_end_of_speech(requests)
+
+    def before_decode(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        *,
+        is_lookahead: bool = False,
+    ) -> None:
+        super().before_decode(
+            forward_batch, schedule_batch, requests, is_lookahead=is_lookahead
+        )
+        row_count = len(requests)
+        self.staged_ras_windows = self.decode_buffers.ras_windows[:row_count].tolist()
+        if self.sampling_mode == "greedy":
+            self.decode_buffers.ras_windows[:row_count].fill_(EMPTY_RAS_SLOT)
+        else:
+            pass
+        self.stage_end_of_speech(requests)
+        self.kv_snapshot = [buffer.clone() for buffer in self.kv_buffers()]
+        self.state_snapshot = [buffer.clone() for buffer in self.state_buffers()]
+
+    def post_prefill(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().post_prefill(result, forward_batch, schedule_batch, requests)
+        assert forward_batch is not None
+        self.record_forward(result, forward_batch, requests, is_extend=True)
+
+    def post_decode(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        super().post_decode(result, forward_batch, schedule_batch, requests)
+        assert forward_batch is not None
+        self.record_forward(result, forward_batch, requests, is_extend=False)
+
+    def changed_slots(
+        self, snapshot: list[torch.Tensor], buffers: list[torch.Tensor], slot_dim: int
+    ) -> set[int]:
+        changed = torch.zeros(
+            buffers[0].shape[slot_dim], dtype=torch.bool, device=buffers[0].device
+        )
+        for before, after in zip(snapshot, buffers, strict=True):
+            differs = bits(before) != bits(after)
+            changed |= differs.movedim(slot_dim, 0).flatten(1).any(dim=1)
+        return set(changed.nonzero().flatten().tolist())
+
+    def record_forward(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch,
+        requests: list[SchedulerRequest],
+        *,
+        is_extend: bool,
+    ) -> None:
+        recording_buffers = self.model.recording_buffers
+        assert recording_buffers is not None
+        request_count = len(requests)
+        if is_extend:
+            row_starts = forward_batch.extend_start_loc.tolist()
+            row_counts = forward_batch.extend_seq_lens.tolist()
+        else:
+            row_starts = list(range(request_count))
+            row_counts = [1] * request_count
+        positions = forward_batch.positions.tolist()
+        written_slots = forward_batch.out_cache_loc.tolist()
+        request_pool_rows = forward_batch.req_pool_indices.tolist()
+        mamba_slots = self.request_pool.translate_mamba_indices(
+            self.request_pool.get_mamba_indices(forward_batch.req_pool_indices)
+        ).tolist()
+        draws = recording_buffers.draws[:request_count].tolist()
+        if is_extend:
+            staged_inputs = self.staged_prefill_inputs
+            assert staged_inputs is not None
+            input_frames = staged_inputs.frames.tolist()
+            model_ras_windows = staged_inputs.ras_windows.tolist()
+            temperature = staged_inputs.temperature.tolist()
+            top_k = staged_inputs.top_k.tolist()
+            top_p = staged_inputs.top_p.tolist()
+            stray_kv_slots: list[int] = []
+            stray_mamba_slots: list[int] = []
+        else:
+            input_frames = recording_buffers.frames[:request_count].tolist()
+            model_ras_windows = recording_buffers.ras_windows[:request_count].tolist()
+            temperature = recording_buffers.temperature[:request_count].tolist()
+            top_k = recording_buffers.top_k[:request_count].tolist()
+            top_p = recording_buffers.top_p[:request_count].tolist()
+            # The KV pool's slot 0 is where padded graph rows write.
+            stray_kv_slots = sorted(
+                self.changed_slots(self.kv_snapshot, self.kv_buffers(), 0)
+                - set(written_slots)
+                - {0}
+            )
+            stray_mamba_slots = sorted(
+                self.changed_slots(self.state_snapshot, self.state_buffers(), 1)
+                - set(mamba_slots)
+            )
+        is_graph_replay = bool(result.can_run_cuda_graph) and not is_extend
+        steps = []
+        for index, request in enumerate(requests):
+            request_data = request_data_of(request)
+            forward_rows = slice(
+                row_starts[index], row_starts[index] + row_counts[index]
+            )
+            state = [
+                tensor[:, mamba_slots[index]].cpu() for tensor in self.state_buffers()
+            ]
+            state_digest = hashlib.sha256()
+            for tensor in state:
+                state_digest.update(bits(tensor.contiguous()).numpy().tobytes())
+            steps.append(
+                GraphRequestStep(
+                    request_id=request.request_id,
+                    request_row=request_pool_rows[index],
+                    mamba_slot=mamba_slots[index],
+                    positions=positions[forward_rows],
+                    written_slots=written_slots[forward_rows],
+                    input_frames=input_frames[forward_rows],
+                    staged_ras_window=self.staged_ras_windows[index],
+                    model_ras_window=model_ras_windows[index],
+                    temperature=temperature[index],
+                    top_k=top_k[index],
+                    top_p=top_p[index],
+                    first_draw=draws[index][0],
+                    ras_draw=draws[index][1],
+                    sampled_frame=request_data.frame_rows[-1],
+                    written_cache=self.written_cache(written_slots[forward_rows]),
+                    state_digest=state_digest.hexdigest(),
+                    is_state_finite=all(
+                        bool(tensor.isfinite().all()) for tensor in state
+                    ),
+                    final_state=(
+                        state
+                        if self.is_last_step(request_data, request.request_id)
+                        else None
+                    ),
+                    semantic_logits=recording_buffers.semantic_logits[index].cpu(),
+                    head_logits=recording_buffers.head_logits[index].cpu(),
+                )
+            )
+        self.forwards.append(
+            GraphForwardRecord(
+                forward_index=len(self.forwards),
+                scenario_name=self.scenario_name,
+                is_extend=is_extend,
+                is_graph_replay=is_graph_replay,
+                graph_batch_size=(
+                    self.decode_graph_runner.bs
+                    if is_graph_replay and self.decode_graph_runner is not None
+                    else None
+                ),
+                steps=steps,
+                stray_kv_slots=stray_kv_slots,
+                stray_mamba_slots=stray_mamba_slots,
+            )
+        )
+        self.abort_requests_due(requests)
+
+    def written_cache(self, slots: list[int]) -> torch.Tensor:
+        """[full-attention layers, slots, 2, kv width] as the pool stores them."""
+        slot_indices = torch.tensor(slots, device=self.device)
+        return torch.stack(
+            [
+                torch.stack(
+                    (
+                        self.kv_pool.get_key_buffer(layer_id)[slot_indices].flatten(1),
+                        self.kv_pool.get_value_buffer(layer_id)[slot_indices].flatten(
+                            1
+                        ),
+                    ),
+                    dim=1,
+                )
+                for layer_id in self.full_attention_layer_ids
+            ]
+        ).cpu()
+
+    def is_last_step(self, request_data: S3DramaRequestData, request_id: str) -> bool:
+        return (
+            request_data.frame_rows[-1][0] == self.model.config.eos_token_id
+            or len(request_data.frame_rows) - request_data.prompt_row_count
+            == self.request_specs[request_id].max_new_tokens
+        )
+
+    def abort_requests_due(self, requests: list[SchedulerRequest]) -> None:
+        """Abort through the inbox, so the scheduler acts on it at its next step."""
+        for request in requests:
+            request_id = request.request_id
+            sampled_count = self.sampled_count(request)
+            if (
+                self.request_specs[request_id].abort_after_frames == sampled_count
+                and request_id not in self.aborted_after_frames
+            ):
+                assert self.abort_inbox is not None
+                self.aborted_after_frames[request_id] = sampled_count
+                self.abort_inbox.put(
+                    IncomingMessage(request_id=request_id, type="abort")
+                )
+            else:
+                pass

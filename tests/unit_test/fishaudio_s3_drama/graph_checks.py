@@ -1,0 +1,352 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Checks of graph test engine runs, each returning one line per problem found:
+eager against graph bit for bit, and each run against its own histories."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from sglang_omni.models.fishaudio_s3_drama.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_WINDOW_FRAMES,
+)
+from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
+    CUDA_GRAPH_BATCH_SIZES,
+    GraphEngineRun,
+    GraphForwardRecord,
+    GraphRequestStep,
+    GraphScenario,
+    bits,
+)
+from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import EOS_TOKEN_ID, PROMPTS
+
+
+@dataclass(frozen=True, kw_only=True)
+class EnginePair:
+    eager: GraphEngineRun
+    graph: GraphEngineRun
+    scenarios: list[GraphScenario]
+
+
+def same_bits(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return (
+        left.dtype == right.dtype
+        and left.shape == right.shape
+        and torch.equal(bits(left), bits(right))
+    )
+
+
+def forward_name(record: GraphForwardRecord) -> str:
+    if record.is_extend:
+        return f"forward {record.forward_index} ({record.scenario_name}, extend)"
+    else:
+        return (
+            f"forward {record.forward_index} ({record.scenario_name}, decode of "
+            f"{len(record.steps)} on graph batch {record.graph_batch_size})"
+        )
+
+
+def forward_layout(
+    record: GraphForwardRecord,
+) -> tuple[str, bool, list[tuple[str, list[int], list[int], int, int]]]:
+    return (
+        record.scenario_name,
+        record.is_extend,
+        [
+            (
+                step.request_id,
+                step.positions,
+                step.written_slots,
+                step.request_row,
+                step.mamba_slot,
+            )
+            for step in record.steps
+        ],
+    )
+
+
+def schedule_problems(pair: EnginePair) -> list[str]:
+    """The batches differ: a harness failure, not a graph result."""
+    eager_forwards = pair.eager.forwards
+    graph_forwards = pair.graph.forwards
+    if len(eager_forwards) != len(graph_forwards):
+        return [
+            f"eager ran {len(eager_forwards)} forwards, graph {len(graph_forwards)}"
+        ]
+    else:
+        return [
+            f"forward {eager.forward_index}: eager ran {forward_layout(eager)}, "
+            f"graph ran {forward_layout(graph)}"
+            for eager, graph in zip(eager_forwards, graph_forwards, strict=True)
+            if forward_layout(eager) != forward_layout(graph)
+        ][:1]
+
+
+def prompt_row_counts(run: GraphEngineRun) -> dict[str, int]:
+    return {
+        request_id: len(PROMPTS[outcome.request_spec.prompt_name])
+        for request_id, outcome in run.outcomes.items()
+    }
+
+
+def wave_admission_problems(
+    run: GraphEngineRun, scenarios: list[GraphScenario]
+) -> list[str]:
+    """Each wave's requests take their first prefill together, in one forward."""
+    row_counts = prompt_row_counts(run)
+    first_prefills: dict[str, list[int]] = {}
+    for record in run.forwards:
+        for step in record.steps:
+            if record.is_extend and len(step.positions) == row_counts[step.request_id]:
+                # Request ids are scenario-wave-position-prompt.
+                wave_key = step.request_id.rsplit("-", 2)[0]
+                first_prefills.setdefault(wave_key, []).append(record.forward_index)
+            else:
+                pass
+    return [
+        f"{run.kind} wave {scenario.name}-{wave_index} prefilled in forwards "
+        f"{first_prefills.get(f'{scenario.name}-{wave_index}')}"
+        for scenario in scenarios
+        for wave_index, wave in enumerate(scenario.waves)
+        if first_prefills.get(f"{scenario.name}-{wave_index}")
+        != [first_prefills[f"{scenario.name}-{wave_index}"][0]] * len(wave)
+    ]
+
+
+def value_fields(step: GraphRequestStep) -> dict[str, str]:
+    return {
+        "sampled frame": repr(step.sampled_frame),
+        "input frames": repr(step.input_frames),
+        "staged RAS window": repr(step.staged_ras_window),
+        "model RAS window": repr(step.model_ras_window),
+        "sampling knobs": repr((step.temperature, step.top_k, step.top_p)),
+        "draws": repr((step.first_draw, step.ras_draw)),
+        "linear-attention state": step.state_digest,
+    }
+
+
+def tensor_fields(step: GraphRequestStep) -> dict[str, torch.Tensor]:
+    final_state = step.final_state or []
+    return {
+        "written key/value cache": step.written_cache,
+        "semantic logits": step.semantic_logits,
+        "head logits": step.head_logits,
+        **{
+            f"final state tensor {index}": tensor
+            for index, tensor in enumerate(final_state)
+        },
+    }
+
+
+def bit_problems(pair: EnginePair) -> list[str]:
+    """Every value the graph engine recorded that differs from the eager engine's."""
+    problems = []
+    for eager_record, graph_record in zip(
+        pair.eager.forwards, pair.graph.forwards, strict=True
+    ):
+        for eager_step, graph_step in zip(
+            eager_record.steps, graph_record.steps, strict=True
+        ):
+            where = f"{forward_name(graph_record)} {graph_step.request_id}"
+            eager_values = value_fields(eager_step)
+            graph_values = value_fields(graph_step)
+            eager_tensors = tensor_fields(eager_step)
+            graph_tensors = tensor_fields(graph_step)
+            problems.extend(
+                f"{where}: {name} eager {eager_values[name]} graph {graph_values[name]}"
+                for name in eager_values
+                if eager_values[name] != graph_values[name]
+            )
+            problems.extend(
+                f"{where}: {name} differs"
+                for name in eager_tensors.keys() | graph_tensors.keys()
+                if name not in eager_tensors
+                or name not in graph_tensors
+                or not same_bits(eager_tensors[name], graph_tensors[name])
+            )
+    return problems
+
+
+def finite_problems(run: GraphEngineRun) -> list[str]:
+    """Non-finite outputs of one run, whatever the other engine recorded; the only
+    exception is the eos logit the test masks with -inf."""
+    problems = []
+    for record in run.forwards:
+        for step in record.steps:
+            semantic_logits = step.semantic_logits
+            is_masked_eos = (torch.arange(semantic_logits.numel()) == EOS_TOKEN_ID) & (
+                semantic_logits == float("-inf")
+            )
+            is_finite = {
+                "written key/value cache": bool(step.written_cache.isfinite().all()),
+                "head logits": bool(step.head_logits.isfinite().all()),
+                "semantic logits": bool(
+                    (semantic_logits.isfinite() | is_masked_eos).all()
+                ),
+                "linear-attention state": step.is_state_finite,
+                "final state": all(
+                    bool(tensor.isfinite().all()) for tensor in step.final_state or []
+                ),
+            }
+            problems.extend(
+                f"{run.kind} {forward_name(record)} {step.request_id}: non-finite {name}"
+                for name, is_field_finite in is_finite.items()
+                if not is_field_finite
+            )
+    return problems
+
+
+def expected_ras_window(history: list[list[int]]) -> list[int]:
+    main_tokens = [row[0] for row in history[-RAS_WINDOW_FRAMES:]]
+    return [EMPTY_RAS_SLOT] * (RAS_WINDOW_FRAMES - len(main_tokens)) + main_tokens
+
+
+def as_float32(value: float) -> float:
+    return float(torch.tensor(value, dtype=torch.float32))
+
+
+def history_problems(run: GraphEngineRun, scenarios: list[GraphScenario]) -> list[str]:
+    """Inputs the model read against each request's own frame history."""
+    sampling_modes = {scenario.name: scenario.sampling_mode for scenario in scenarios}
+    histories: dict[str, list[list[int]]] = {}
+    problems = []
+    for record in run.forwards:
+        for step in record.steps:
+            request_spec = run.outcomes[step.request_id].request_spec
+            history = histories.setdefault(
+                step.request_id,
+                [list(row) for row in PROMPTS[request_spec.prompt_name]],
+            )
+            staged_window = expected_ras_window(history)
+            expected = {
+                "positions": repr(
+                    list(range(len(history)))
+                    if record.is_extend
+                    else [len(history) - 1]
+                ),
+                "input frames": repr(history if record.is_extend else history[-1:]),
+                "staged RAS window": repr(staged_window),
+                "model RAS window": repr(
+                    staged_window
+                    if sampling_modes[record.scenario_name] == "random"
+                    else [EMPTY_RAS_SLOT] * RAS_WINDOW_FRAMES
+                ),
+                "sampling knobs": repr(
+                    (
+                        as_float32(request_spec.temperature),
+                        request_spec.top_k,
+                        as_float32(request_spec.top_p),
+                    )
+                ),
+            }
+            actual = {
+                "positions": repr(step.positions),
+                "input frames": repr(step.input_frames),
+                "staged RAS window": repr(step.staged_ras_window),
+                "model RAS window": repr(step.model_ras_window),
+                "sampling knobs": repr((step.temperature, step.top_k, step.top_p)),
+            }
+            problems.extend(
+                f"{forward_name(record)} {step.request_id}: {name} {actual[name]} "
+                f"is not {expected[name]}"
+                for name in expected
+                if actual[name] != expected[name]
+            )
+            history.append(step.sampled_frame)
+    return problems
+
+
+def draw_problems(run: GraphEngineRun) -> list[str]:
+    """The main token is the RAS draw exactly when the first draw repeats the window."""
+    return [
+        f"{forward_name(record)} {step.request_id}: main token "
+        f"{step.sampled_frame[0]} from draws {step.first_draw}, {step.ras_draw} "
+        f"and window {step.model_ras_window}"
+        for record in run.forwards
+        for step in record.steps
+        if step.sampled_frame[0]
+        != (
+            step.ras_draw
+            if step.first_draw in step.model_ras_window
+            else step.first_draw
+        )
+    ]
+
+
+def resampled_choice_count(run: GraphEngineRun, scenario_name: str) -> int:
+    """Steps where a repeated first draw was replaced by a different RAS draw."""
+    return sum(
+        step.first_draw in step.model_ras_window and step.ras_draw != step.first_draw
+        for record in run.forwards
+        if record.scenario_name == scenario_name
+        for step in record.steps
+    )
+
+
+def padded_graph_batch_size(batch_size: int) -> int:
+    return min(size for size in CUDA_GRAPH_BATCH_SIZES if size >= batch_size)
+
+
+def replay_problems(pair: EnginePair) -> list[str]:
+    """Eager never replays; the graph engine replays every decode at its padded size."""
+    return [
+        f"eager {forward_name(record)} replayed a graph"
+        for record in pair.eager.forwards
+        if record.is_graph_replay
+    ] + [
+        f"graph {forward_name(record)} did not replay the graph for its batch"
+        for record in pair.graph.forwards
+        if not record.is_extend
+        and not (
+            record.is_graph_replay
+            and record.graph_batch_size == padded_graph_batch_size(len(record.steps))
+        )
+    ]
+
+
+def stray_write_problems(run: GraphEngineRun) -> list[str]:
+    return [
+        f"{run.kind} {forward_name(record)} changed KV slots {record.stray_kv_slots} "
+        f"and state slots {record.stray_mamba_slots} outside its batch"
+        for record in run.forwards
+        if record.stray_kv_slots or record.stray_mamba_slots
+    ]
+
+
+def outcome_problems(run: GraphEngineRun) -> list[str]:
+    """One result per finished request, holding its frames; aborts end silently."""
+    sampled_frames: dict[str, list[list[int]]] = {}
+    for record in run.forwards:
+        for step in record.steps:
+            sampled_frames.setdefault(step.request_id, []).append(step.sampled_frame)
+    problems = [
+        f"{run.kind} scenario {scenario.name} left free pools at "
+        f"{scenario.idle_free_counts}, not {run.baseline_free_counts}"
+        for scenario in run.scenarios
+        if scenario.idle_free_counts != run.baseline_free_counts
+    ]
+    for request_id, outcome in run.outcomes.items():
+        request_frames = sampled_frames.get(request_id, [])
+        returned_frames = (
+            request_frames[:-1]
+            if request_frames and request_frames[-1][0] == EOS_TOKEN_ID
+            else request_frames
+        )
+        if outcome.aborted_after_frames is not None:
+            expected_counts = (0, 0)
+        else:
+            expected_counts = (1, 0)
+        if (len(outcome.result_frames), len(outcome.error_messages)) != (
+            expected_counts
+        ):
+            problems.append(
+                f"{run.kind} {request_id}: {len(outcome.result_frames)} results and "
+                f"errors {outcome.error_messages}"
+            )
+        elif outcome.result_frames and outcome.result_frames[0] != returned_frames:
+            problems.append(f"{run.kind} {request_id}: result is not its frames")
+        else:
+            pass
+    return problems

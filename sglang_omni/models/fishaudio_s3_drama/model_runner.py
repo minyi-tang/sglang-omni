@@ -3,6 +3,7 @@
 
 Everything runs inside the model's forward, behind SGLang's own forward path,
 so the deferred clear of reused linear-attention state slots always happens.
+Decode steps go through the model's fixed buffers, which a decode CUDA graph reads.
 """
 
 from __future__ import annotations
@@ -13,6 +14,9 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -21,8 +25,12 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     MINIMUM_PROMPT_ROWS,
     S3DramaRequestData,
 )
-from sglang_omni.models.fishaudio_s3_drama.sampling import RAS_WINDOW_FRAMES
+from sglang_omni.models.fishaudio_s3_drama.sampling import (
+    EMPTY_RAS_SLOT,
+    RAS_WINDOW_FRAMES,
+)
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
+    S3DramaDecodeBuffers,
     S3DramaForCausalLM,
     S3DramaStepInputs,
 )
@@ -33,9 +41,6 @@ from sglang_omni.vendor.sglang.core import (
     GenerationBatchResult,
     ScheduleBatch,
 )
-
-# Pads the windows of requests with fewer than 16 frames; matches no token id.
-EMPTY_RAS_SLOT = -1
 
 
 def ras_window(frame_rows: list[list[int]]) -> list[int]:
@@ -91,6 +96,63 @@ def request_data_of(request: SchedulerRequest) -> S3DramaRequestData:
     return data
 
 
+def request_ids_of(batch_request_data: list[S3DramaRequestData]) -> list[str]:
+    request_ids = []
+    for request_data in batch_request_data:
+        request = request_data.req
+        assert request is not None
+        request_ids.append(request.rid)
+    return request_ids
+
+
+def stage_decode_rows(
+    buffers: S3DramaDecodeBuffers, batch_request_data: list[S3DramaRequestData]
+) -> None:
+    """Copy each request's newest frame, RAS window and sampling knobs into its row,
+    in place, since a captured decode graph reads these addresses."""
+    row_count = len(batch_request_data)
+    buffers.frames[:row_count].copy_(
+        torch.tensor(
+            [decode_frame_row(request_data) for request_data in batch_request_data],
+            dtype=torch.int64,
+        )
+    )
+    buffers.ras_windows[:row_count].copy_(
+        torch.tensor(
+            [
+                ras_window(request_data.frame_rows)
+                for request_data in batch_request_data
+            ],
+            dtype=torch.int64,
+        )
+    )
+    buffers.temperature[:row_count].copy_(
+        torch.tensor(
+            [request_data.temperature for request_data in batch_request_data],
+            dtype=torch.float32,
+        )
+    )
+    buffers.top_k[:row_count].copy_(
+        torch.tensor(
+            [request_data.top_k for request_data in batch_request_data],
+            dtype=torch.int64,
+        )
+    )
+    buffers.top_p[:row_count].copy_(
+        torch.tensor(
+            [request_data.top_p for request_data in batch_request_data],
+            dtype=torch.float32,
+        )
+    )
+
+
+def sampled_decode_frames(
+    buffers: S3DramaDecodeBuffers, row_count: int
+) -> torch.Tensor:
+    """The frames the last decode forward sampled, copied before the next overwrites them."""
+    return buffers.sampled_frames[:row_count].clone()
+
+
 class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
     """Hands each forward its frames, RAS windows and sampling knobs, then appends
     the frame the model sampled for every request."""
@@ -109,6 +171,8 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         kv_pool = sglang_runner.token_to_kv_pool
         request_pool = sglang_runner.req_to_token_pool
         prefill_graph_runner = sglang_runner.prefill_cuda_graph_runner
+        decode_graph_runner = sglang_runner.decode_cuda_graph_runner
+        decode_buffers = model.decode_buffers
         if not isinstance(attention_backend, HybridLinearAttnBackend):
             raise RuntimeError(
                 f"S3-drama needs the hybrid linear-attention backend; got "
@@ -119,11 +183,24 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
                 f"S3-drama needs triton for full attention; got "
                 f"{type(attention_backend.full_attn_backend).__name__}"
             )
-        elif sglang_runner.decode_cuda_graph_runner is not None or not (
+        elif not (
+            decode_graph_runner is None
+            or isinstance(decode_graph_runner, DecodeCudaGraphRunner)
+        ) or not (
             prefill_graph_runner is None
             or isinstance(prefill_graph_runner, EagerRunner)
         ):
-            raise RuntimeError("S3-drama runs eager; a CUDA graph runner was built")
+            raise RuntimeError(
+                "S3-drama replays decode CUDA graphs only; its prefill runs eager"
+            )
+        elif decode_buffers is None or decode_buffers.frames.shape[0] < max(
+            request_pool.size,
+            0 if decode_graph_runner is None else decode_graph_runner.max_bs,
+        ):
+            raise RuntimeError(
+                "the S3-drama decode buffers need a row for every request slot and "
+                "every captured decode batch size"
+            )
         elif not (
             isinstance(kv_pool, HybridLinearKVPool)
             and set(kv_pool.full_attention_layer_id_mapping)
@@ -143,6 +220,7 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
             )
         else:
             pass
+        self.decode_buffers: S3DramaDecodeBuffers = decode_buffers
 
     def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
         """Interface contract; never eligible, since collection publishes the frame."""
@@ -152,14 +230,9 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         self, requests: list[SchedulerRequest], frame_rows: list[list[int]]
     ) -> None:
         request_data = [request_data_of(request) for request in requests]
-        request_ids = []
-        for data in request_data:
-            req = data.req
-            assert req is not None
-            request_ids.append(req.rid)
         self.model.step_exchange.stage(
             S3DramaStepInputs(
-                request_ids=request_ids,
+                request_ids=request_ids_of(request_data),
                 frames=torch.tensor(frame_rows, dtype=torch.int64, device=self.device),
                 ras_windows=torch.tensor(
                     [ras_window(data.frame_rows) for data in request_data],
@@ -214,16 +287,24 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         *,
         is_lookahead: bool = False,
     ) -> None:
-        """Stage every request's newest frame; the other arguments are the contract."""
-        self.stage_step(
-            requests,
-            [decode_frame_row(request_data_of(request)) for request in requests],
-        )
+        """Stage every request's newest frame into the decode buffers, in batch
+        order; the other arguments are the interface contract."""
+        batch_request_data = [request_data_of(request) for request in requests]
+        request_ids = request_ids_of(batch_request_data)
+        if forward_batch is None or forward_batch.rids != request_ids:
+            raise RuntimeError(
+                f"decode requests {request_ids} are not the batch's "
+                f"{None if forward_batch is None else forward_batch.rids}"
+            )
+        else:
+            stage_decode_rows(self.decode_buffers, batch_request_data)
 
     def collect_frames(
-        self, result: GenerationBatchResult, requests: list[SchedulerRequest]
+        self,
+        result: GenerationBatchResult,
+        requests: list[SchedulerRequest],
+        frames: torch.Tensor,
     ) -> None:
-        frames = self.model.step_exchange.take_frames()
         result.next_token_ids = frames[:, 0]
         for request, frame_row in zip(requests, frames.tolist(), strict=True):
             request_data_of(request).frame_rows.append(frame_row)
@@ -236,7 +317,7 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         requests: list[SchedulerRequest],
     ) -> None:
         """Collect the first frames; the batch arguments are the interface contract."""
-        self.collect_frames(result, requests)
+        self.collect_frames(result, requests, self.model.step_exchange.take_frames())
 
     def post_decode(
         self,
@@ -246,4 +327,8 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         requests: list[SchedulerRequest],
     ) -> None:
         """Collect the next frames; the batch arguments are the interface contract."""
-        self.collect_frames(result, requests)
+        self.collect_frames(
+            result,
+            requests,
+            sampled_decode_frames(self.decode_buffers, len(requests)),
+        )
