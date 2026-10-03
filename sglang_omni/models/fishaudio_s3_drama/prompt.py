@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build S3-drama reference-bracket-v1 prompt rows from chat messages."""
+"""Build S3-drama prompt rows: reference-bracket-v1 chat messages and speech infill."""
 
 from __future__ import annotations
 
@@ -16,10 +16,14 @@ TTS_INSTRUCTION = "convert the provided text to speech"
 REFERENCE_INSTRUCTION = (
     "convert the provided text to speech reference to the following:"
 )
+INFILL_INSTRUCTION = (
+    "fill in the missing part of the speech; the suffix follows <|fim_suffix|> and "
+    "the prefix follows <|fim_prefix|>"
+)
 MESSAGE_END = "<|im_end|>\n"
 GENERATION_START = "<|im_start|>assistant\n<|voice|>"
+AUDIO_SEPARATOR = "\n<|audio_separator|>\n"
 SEMANTIC_BEGIN_TOKEN = "<|semantic:0|>"
-DEFAULT_SPEAKER_PREFIX = "<|speaker:0|> "
 # note (SunskyXH): only the builder writes these; other tokens in caller text
 # are content.
 STRUCTURAL_TOKENS = (
@@ -66,9 +70,17 @@ class ReferencePart:
 
 
 @dataclass(kw_only=True)
+class AudioSeparatorPart:
+    """Separates the lines of a user turn or the takes of an assistant turn."""
+
+
+PromptPart = TextPart | AudioCodesPart | ReferencePart | AudioSeparatorPart
+
+
+@dataclass(kw_only=True)
 class PromptMessage:
     role: MessageRole
-    parts: list[TextPart | AudioCodesPart | ReferencePart]
+    parts: list[PromptPart]
 
 
 def validate_caller_text(text: str, location: str) -> None:
@@ -114,6 +126,32 @@ def validate_audio_codes(
         raise ValueError(f"{location}: audio codes must be in [0, {codebook_size})")
     else:
         pass
+
+
+def with_speaker_tag(text: str, default_speaker_id: int) -> str:
+    """Tag text with default_speaker_id unless a tag leads it after white space."""
+    if SPEAKER_TAG_PATTERN.match(text.lstrip(UNICODE_WHITE_SPACE)) is None:
+        return f"<|speaker:{default_speaker_id}|> {text}"
+    else:
+        return text
+
+
+def references_from_speaker_groups(
+    speaker_groups: list[list[ReferencePart]],
+) -> list[ReferencePart]:
+    """Flatten grouped references; an untagged transcript takes its group's speaker id.
+
+    Empty groups take no speaker id.
+    """
+    non_empty_groups = [group for group in speaker_groups if group]
+    return [
+        ReferencePart(
+            transcript=with_speaker_tag(reference.transcript, speaker_id),
+            audio_codes=reference.audio_codes,
+        )
+        for speaker_id, group in enumerate(non_empty_groups)
+        for reference in group
+    ]
 
 
 def build_prompt_rows(
@@ -187,7 +225,10 @@ def build_prompt_rows(
                     f"{location}: a reference part is only allowed in the system "
                     f"message"
                 )
-            elif isinstance(part, AudioCodesPart) and message.role == "system":
+            elif (
+                isinstance(part, AudioCodesPart | AudioSeparatorPart)
+                and message.role == "system"
+            ):
                 raise ValueError(
                     f"{location}: the system message takes text and reference "
                     f"parts only"
@@ -203,17 +244,32 @@ def build_prompt_rows(
             else:
                 pass
 
-            if isinstance(part, TextPart):
-                validate_caller_text(part.text, location)
-                text_body = part.text.lstrip(UNICODE_WHITE_SPACE)
-                if (
-                    message.role == "user"
-                    and should_tag_user_text
-                    and SPEAKER_TAG_PATTERN.match(text_body) is None
-                ):
-                    segments.append(DEFAULT_SPEAKER_PREFIX + part.text)
+            if isinstance(part, TextPart | AudioSeparatorPart):
+                if isinstance(part, TextPart):
+                    validate_caller_text(part.text, location)
+                    is_spoken_line = message.role == "user" and should_tag_user_text
+                    text = (
+                        with_speaker_tag(part.text, 0) if is_spoken_line else part.text
+                    )
                 else:
-                    segments.append(part.text)
+                    text = AUDIO_SEPARATOR
+                previous_part = (
+                    message.parts[part_index - 1] if part_index > 0 else None
+                )
+                # note (SunskyXH): the separated lines of a user turn tokenize as one
+                # string, so a separator joins the text on both sides.
+                if message.role == "user" and (
+                    isinstance(previous_part, AudioSeparatorPart)
+                    or (
+                        isinstance(part, AudioSeparatorPart)
+                        and isinstance(previous_part, TextPart)
+                    )
+                ):
+                    previous_text = segments.pop()
+                    assert isinstance(previous_text, str)
+                    segments.append(previous_text + text)
+                else:
+                    segments.append(text)
             elif isinstance(part, AudioCodesPart):
                 validate_audio_codes(
                     part.audio_codes, num_codebooks, codebook_size, location
@@ -227,19 +283,18 @@ def build_prompt_rows(
                 reference_count += 1
                 # note (SunskyXH): the tag must follow "Text: " directly, so a tag
                 # behind leading white space moves in front of it.
-                transcript_body = part.transcript.lstrip(UNICODE_WHITE_SPACE)
+                tagged_transcript = with_speaker_tag(part.transcript, 0)
+                transcript_body = tagged_transcript.lstrip(UNICODE_WHITE_SPACE)
                 leading_speaker_tag = SPEAKER_TAG_PATTERN.match(transcript_body)
-                if leading_speaker_tag is None:
-                    transcript = DEFAULT_SPEAKER_PREFIX + part.transcript
-                else:
-                    leading_white_space = part.transcript[
-                        : len(part.transcript) - len(transcript_body)
-                    ]
-                    transcript = (
-                        leading_speaker_tag.group(0)
-                        + leading_white_space
-                        + transcript_body[leading_speaker_tag.end() :]
-                    )
+                assert leading_speaker_tag is not None
+                leading_white_space = tagged_transcript[
+                    : len(tagged_transcript) - len(transcript_body)
+                ]
+                transcript = (
+                    leading_speaker_tag.group(0)
+                    + leading_white_space
+                    + transcript_body[leading_speaker_tag.end() :]
+                )
                 segments += [
                     f"\n\n[Reference {reference_count}]\nText: {transcript}\nSpeech: ",
                     part.audio_codes,
@@ -262,3 +317,66 @@ def build_prompt_rows(
             audio_codes = segment.to(device="cpu", dtype=torch.long)
             rows.append(torch.cat([audio_codes[:1] + semantic_begin_id, audio_codes]).T)
     return torch.cat(rows)
+
+
+def build_infill_prompt_rows(
+    transcript: str,
+    tokenizer: Tokenizer,
+    *,
+    prefix_audio_codes: torch.Tensor,
+    suffix_audio_codes: torch.Tensor,
+    target_frame_count: int | None,
+    num_codebooks: int,
+    codebook_size: int,
+) -> torch.Tensor:
+    """Encode a speech infill prompt whose answer fills the gap between kept codes.
+
+    The suffix codes come before the prefix codes, so the prefix touches the
+    generated frames.
+
+    Args:
+        transcript: the text of the whole take; line breaks fold into spaces.
+        prefix_audio_codes: the kept codes before the gap, [num_codebooks, frames];
+            like suffix_audio_codes, a side without frames is left out.
+        target_frame_count: the length hint for the gap; None or 0 gives no hint.
+    """
+    # note (SunskyXH): the model reads an infill transcript as a single line.
+    folded_transcript = re.sub(r"\r\n?|\n", " ", transcript.strip(UNICODE_WHITE_SPACE))
+    validate_caller_text(folded_transcript, "transcript")
+    user_parts: list[PromptPart] = [
+        TextPart(text=with_speaker_tag(folded_transcript, 0))
+    ]
+    if target_frame_count is not None and (
+        isinstance(target_frame_count, bool)
+        or not isinstance(target_frame_count, int)
+        or target_frame_count < 0
+    ):
+        raise ValueError(
+            f"target_frame_count must be a non-negative int or None; got "
+            f"{target_frame_count!r}"
+        )
+    elif target_frame_count is None or target_frame_count == 0:
+        pass
+    else:
+        user_parts.append(TextPart(text=f"[audio tokens: {target_frame_count}]"))
+    user_parts.append(TextPart(text="<|fim_suffix|>"))
+    if suffix_audio_codes.numel() > 0:
+        user_parts.append(AudioCodesPart(audio_codes=suffix_audio_codes))
+    else:
+        pass
+    user_parts.append(TextPart(text="<|fim_prefix|>"))
+    if prefix_audio_codes.numel() > 0:
+        user_parts.append(AudioCodesPart(audio_codes=prefix_audio_codes))
+    else:
+        pass
+    messages = [
+        PromptMessage(role="system", parts=[TextPart(text=INFILL_INSTRUCTION)]),
+        PromptMessage(role="user", parts=user_parts),
+    ]
+    return build_prompt_rows(
+        messages,
+        tokenizer,
+        num_codebooks=num_codebooks,
+        codebook_size=codebook_size,
+        should_tag_user_text=False,
+    )

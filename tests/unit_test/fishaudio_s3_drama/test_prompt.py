@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""S3-drama reference-bracket-v1 prompt rows: byte layout, speaker rules, rejections."""
+"""S3-drama prompt rows: chat and infill byte layouts, speaker rules, rejections."""
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 from pathlib import Path
@@ -14,11 +15,15 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 
 from sglang_omni.models.fishaudio_s3_drama.prompt import (
     AudioCodesPart,
+    AudioSeparatorPart,
     MessageRole,
     PromptMessage,
+    PromptPart,
     ReferencePart,
     TextPart,
+    build_infill_prompt_rows,
     build_prompt_rows,
+    references_from_speaker_groups,
 )
 
 NUM_CODEBOOKS = 10
@@ -33,7 +38,13 @@ TTS_INSTRUCTION = "convert the provided text to speech"
 REFERENCE_INSTRUCTION = (
     "convert the provided text to speech reference to the following:"
 )
+INFILL_INSTRUCTION = (
+    "fill in the missing part of the speech; the suffix follows <|fim_suffix|> and "
+    "the prefix follows <|fim_prefix|>"
+)
+SEPARATOR = "\n<|audio_separator|>\n"
 DEFAULT_SYSTEM_TURN: list[str | torch.Tensor] = [SYSTEM, TTS_INSTRUCTION, END]
+INFILL_SYSTEM_TURN: list[str | torch.Tensor] = [SYSTEM, INFILL_INSTRUCTION, END]
 # Where the text or codes under test sit in a conversation.
 TextCarrier = Literal["system", "reference", "assistant", "user"]
 CodesCarrier = Literal["user", "reference"]
@@ -41,13 +52,15 @@ CodesCarrier = Literal["user", "reference"]
 
 @pytest.fixture(scope="module")
 def toy_tokenizer() -> Tokenizer:
-    """Byte-level BPE whose one merge joins two newlines, so a newline seam tells
+    """Byte-level BPE whose merges join two newlines and "t[", so a newline seam,
+    or an infill transcript ending in "t" before its length hint, tells
     per-segment encoding apart from encoding the joined string."""
     alphabet = sorted(pre_tokenizers.ByteLevel.alphabet())
     vocabulary = {symbol: token_id for token_id, symbol in enumerate(alphabet)}
     # Ċ is the byte-level symbol of a newline.
     vocabulary["ĊĊ"] = len(vocabulary)
-    tokenizer = Tokenizer(models.BPE(vocab=vocabulary, merges=[("Ċ", "Ċ")]))
+    vocabulary["t["] = len(vocabulary)
+    tokenizer = Tokenizer(models.BPE(vocab=vocabulary, merges=[("Ċ", "Ċ"), ("t", "[")]))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(
         add_prefix_space=False, use_regex=False
     )
@@ -93,8 +106,12 @@ def system_with(*parts: TextPart | ReferencePart) -> PromptMessage:
     return PromptMessage(role="system", parts=list(parts))
 
 
-def user_with(*parts: TextPart | AudioCodesPart | ReferencePart) -> PromptMessage:
+def user_with(*parts: PromptPart) -> PromptMessage:
     return PromptMessage(role="user", parts=list(parts))
+
+
+def assistant_with(*parts: PromptPart) -> PromptMessage:
+    return PromptMessage(role="assistant", parts=list(parts))
 
 
 def take(audio_codes: torch.Tensor) -> PromptMessage:
@@ -135,8 +152,9 @@ def expected_rows(
     return torch.tensor(rows, dtype=torch.long)
 
 
-DIRECTORS_SCENE = "场景：深夜电台，主播 Alice 疲惫低声。\n请按导演提示重新演绎。"
-DIRECTORS_NOTE = "再轻声些，声音和嘴巴再放松、虚一点"
+DIRECTORS_SCENE = "场景：雨后的天台，两位老友重逢。\n请按备注调整这一条。"
+DIRECTORS_NOTE = "语速放慢，尾音再收一点"
+IMITATE_INSTRUCTION = "Say the line below the way this clip sounds: "
 LAYOUT_CASES = [
     pytest.param(
         [said("user", "hello")],
@@ -146,129 +164,177 @@ LAYOUT_CASES = [
     ),
     pytest.param(
         [
-            system_with(reference("only clip", clip_codes(4, 1))),
-            said("user", "read this"),
+            system_with(reference("lone take", clip_codes(4, 1))),
+            said("user", "say it"),
         ],
         False,
-        [SYSTEM, REFERENCE_INSTRUCTION, reference_header(1, "<|speaker:0|> only clip")]
-        + [clip_codes(4, 1), END, USER, "read this", END, VOICE_TURN],
+        [SYSTEM, REFERENCE_INSTRUCTION, reference_header(1, "<|speaker:0|> lone take")]
+        + [clip_codes(4, 1), END, USER, "say it", END, VOICE_TURN],
         id="one-reference",
     ),
     pytest.param(
         [
             system_with(
-                reference("first clip", clip_codes(4, 1)),
-                reference("<|speaker:1|> second clip", clip_codes(5, 2)),
-                reference("<|speaker:2|> third clip", clip_codes(6, 3)),
+                reference("opening take", clip_codes(4, 1)),
+                reference("<|speaker:1|> answer take", clip_codes(5, 2)),
+                reference("<|speaker:2|> closing take", clip_codes(6, 3)),
             ),
-            said("user", "read this"),
+            said("user", "say it"),
         ],
         False,
         [SYSTEM, REFERENCE_INSTRUCTION]
-        + [reference_header(1, "<|speaker:0|> first clip"), clip_codes(4, 1)]
-        + [reference_header(2, "<|speaker:1|> second clip"), clip_codes(5, 2)]
-        + [reference_header(3, "<|speaker:2|> third clip"), clip_codes(6, 3)]
-        + [END, USER, "read this", END, VOICE_TURN],
+        + [reference_header(1, "<|speaker:0|> opening take"), clip_codes(4, 1)]
+        + [reference_header(2, "<|speaker:1|> answer take"), clip_codes(5, 2)]
+        + [reference_header(3, "<|speaker:2|> closing take"), clip_codes(6, 3)]
+        + [END, USER, "say it", END, VOICE_TURN],
         id="three-references-take-their-speakers-from-the-transcripts",
     ),
     pytest.param(
         [
             system_with(
-                reference("First complete clip.", clip_codes(8, 10)),
+                reference("A whole sample.", clip_codes(8, 10)),
                 reference(
-                    "<|speaker:1|> A reply. <|speaker:0|> A switch.", clip_codes(5, 40)
+                    "<|speaker:1|> One voice. <|speaker:0|> Another voice.",
+                    clip_codes(5, 40),
                 ),
             ),
             said("user", "hello"),
         ],
         True,
         [SYSTEM, REFERENCE_INSTRUCTION]
-        + [reference_header(1, "<|speaker:0|> First complete clip."), clip_codes(8, 10)]
-        + [reference_header(2, "<|speaker:1|> A reply. <|speaker:0|> A switch.")]
+        + [reference_header(1, "<|speaker:0|> A whole sample."), clip_codes(8, 10)]
+        + [reference_header(2, "<|speaker:1|> One voice. <|speaker:0|> Another voice.")]
         + [clip_codes(5, 40), END, USER, "<|speaker:0|> hello", END, VOICE_TURN],
         id="tts-references-keep-an-inner-speaker-switch",
     ),
     pytest.param(
         [
             system_with(
-                TextPart(text="两人深夜电台对谈，Alice 疲惫低声。\n参考如下："),
-                reference("参考转写", clip_codes(4, 1)),
+                TextPart(text="午后访谈节目，主持人语气轻快。\n示例如下："),
+                reference("示例转写", clip_codes(4, 1)),
             ),
-            said("user", "再来一次"),
+            said("user", "再说一遍"),
         ],
         False,
-        [SYSTEM, "两人深夜电台对谈，Alice 疲惫低声。\n参考如下："]
-        + [reference_header(1, "<|speaker:0|> 参考转写"), clip_codes(4, 1), END]
-        + [USER, "再来一次", END, VOICE_TURN],
+        [SYSTEM, "午后访谈节目，主持人语气轻快。\n示例如下："]
+        + [reference_header(1, "<|speaker:0|> 示例转写"), clip_codes(4, 1), END]
+        + [USER, "再说一遍", END, VOICE_TURN],
         id="free-form-multi-line-system-text",
     ),
     pytest.param(
         [
             system_with(
-                TextPart(text="read this line like a tired detective"),
+                TextPart(text="speak this line like a sleepy captain"),
                 reference("clip", clip_codes(3, 10)),
             ),
             said("user", "hello"),
         ],
         False,
-        [SYSTEM, "read this line like a tired detective"]
+        [SYSTEM, "speak this line like a sleepy captain"]
         + [reference_header(1, "<|speaker:0|> clip"), clip_codes(3, 10), END]
         + [USER, "hello", END, VOICE_TURN],
         id="custom-instruction-replaces-only-the-instruction-line",
     ),
     pytest.param(
         [
-            said("user", "<|speaker:0|> plain line"),
+            said("user", "<|speaker:0|> the base line"),
             take(clip_codes(6, 100)),
-            said("user", "<|speaker:0|> [softer versus previous] plain line"),
+            said("user", "<|speaker:0|> [warmer than before] the base line"),
             take(clip_codes(7, 200)),
-            said("user", "<|speaker:0|> now shout it"),
+            said("user", "<|speaker:0|> now whisper it"),
         ],
         True,
         DEFAULT_SYSTEM_TURN
-        + [USER, "<|speaker:0|> plain line", END]
+        + [USER, "<|speaker:0|> the base line", END]
         + [VOICE_TURN, clip_codes(6, 100), END]
-        + [USER, "<|speaker:0|> [softer versus previous] plain line", END]
+        + [USER, "<|speaker:0|> [warmer than before] the base line", END]
         + [VOICE_TURN, clip_codes(7, 200), END]
-        + [USER, "<|speaker:0|> now shout it", END, VOICE_TURN],
+        + [USER, "<|speaker:0|> now whisper it", END, VOICE_TURN],
         id="tts-prior-turns-replay-before-the-current-text",
     ),
     pytest.param(
         [
             user_with(
-                TextPart(text="<|speaker:0|> make this one deeper"),
+                TextPart(text="<|speaker:0|> make this one brighter"),
                 AudioCodesPart(audio_codes=clip_codes(9, 300)),
             ),
-            said("user", "<|speaker:0|> go"),
+            said("user", "<|speaker:0|> next"),
         ],
         True,
         DEFAULT_SYSTEM_TURN
-        + [USER, "<|speaker:0|> make this one deeper", clip_codes(9, 300), END]
-        + [USER, "<|speaker:0|> go", END, VOICE_TURN],
+        + [USER, "<|speaker:0|> make this one brighter", clip_codes(9, 300), END]
+        + [USER, "<|speaker:0|> next", END, VOICE_TURN],
         id="user-audio-follows-its-text-without-voice",
     ),
     pytest.param(
         [
             said("system", "scene"),
-            said("assistant", "kept as written"),
-            said("user", "<|speaker:3|> line"),
+            said("assistant", "plain reply text"),
+            said("user", "<|speaker:3|> my line"),
         ],
         False,
-        [SYSTEM, "scene", END, ASSISTANT, "kept as written", END]
-        + [USER, "<|speaker:3|> line", END, VOICE_TURN],
+        [SYSTEM, "scene", END, ASSISTANT, "plain reply text", END]
+        + [USER, "<|speaker:3|> my line", END, VOICE_TURN],
         id="assistant-text-has-no-voice",
     ),
     pytest.param(
         [
             said("system", DIRECTORS_SCENE),
-            said("user", "我从来没有那样说过。"),
+            said("user", "这件事我真的不知道。"),
             take(clip_codes(6, 9)),
             said("user", DIRECTORS_NOTE),
         ],
         False,
-        [SYSTEM, DIRECTORS_SCENE, END, USER, "我从来没有那样说过。", END]
+        [SYSTEM, DIRECTORS_SCENE, END, USER, "这件事我真的不知道。", END]
         + [VOICE_TURN, clip_codes(6, 9), END, USER, DIRECTORS_NOTE, END, VOICE_TURN],
         id="chat-mode-replays-a-take-and-leaves-a-directors-note-untagged",
+    ),
+    pytest.param(
+        [
+            said("system", "场景：雨夜的车站"),
+            said("user", "我等了你很久。"),
+            take(clip_codes(4, 3)),
+            said("user", "再冷淡一点"),
+        ],
+        False,
+        [SYSTEM, "场景：雨夜的车站", END, USER, "我等了你很久。", END]
+        + [VOICE_TURN, clip_codes(4, 3), END, USER, "再冷淡一点", END, VOICE_TURN],
+        id="chat-mode-replays-two-user-assistant-pairs",
+    ),
+    pytest.param(
+        [
+            user_with(
+                TextPart(text=IMITATE_INSTRUCTION),
+                AudioCodesPart(audio_codes=clip_codes(6, 2)),
+                TextPart(text="See you tomorrow."),
+            )
+        ],
+        False,
+        DEFAULT_SYSTEM_TURN
+        + [USER, IMITATE_INSTRUCTION, clip_codes(6, 2), "See you tomorrow.", END]
+        + [VOICE_TURN],
+        id="imitate-user-turn-has-audio-between-its-texts",
+    ),
+    pytest.param(
+        [
+            user_with(
+                TextPart(text="甲：大家早上好！"),
+                AudioSeparatorPart(),
+                TextPart(text="乙：早，今天开会吗？"),
+            ),
+            assistant_with(
+                AudioCodesPart(audio_codes=clip_codes(4, 4)),
+                AudioSeparatorPart(),
+                AudioCodesPart(audio_codes=clip_codes(5, 5)),
+            ),
+            said("user", "第二句再来一遍"),
+        ],
+        False,
+        DEFAULT_SYSTEM_TURN
+        + [USER, f"甲：大家早上好！{SEPARATOR}乙：早，今天开会吗？", END]
+        + [VOICE_TURN, clip_codes(4, 4), SEPARATOR, clip_codes(5, 5), END]
+        + [USER, "第二句再来一遍", END, VOICE_TURN],
+        id="dub-joins-user-lines-and-separates-assistant-takes",
     ),
 ]
 
@@ -380,6 +446,75 @@ def test_reference_numbers_count_past_nine(toy_tokenizer: Tokenizer) -> None:
     assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
 
 
+def grouped_references(speaker_groups: list[list[str]]) -> list[ReferencePart]:
+    """Grouped references whose codes number the clips in reading order from 1."""
+    clip_numbers = itertools.count(1)
+    return references_from_speaker_groups(
+        [
+            [
+                reference(transcript, clip_codes(1, next(clip_numbers)))
+                for transcript in group
+            ]
+            for group in speaker_groups
+        ]
+    )
+
+
+@pytest.mark.parametrize(
+    ("speaker_groups", "header_texts"),
+    [
+        pytest.param(
+            [["voice one", "voice two"]],
+            ["<|speaker:0|> voice one", "<|speaker:0|> voice two"],
+            id="one-group-is-speaker-0",
+        ),
+        pytest.param(
+            [["<|speaker:9|> tagged voice"], ["plain voice"]],
+            ["<|speaker:9|> tagged voice", "<|speaker:1|> plain voice"],
+            id="a-tagged-transcript-keeps-its-speaker",
+        ),
+        pytest.param(
+            [[], ["hi"], [" <|speaker:5|> hi"], ["x", "y"]],
+            ["<|speaker:0|> hi", "<|speaker:5|>  hi"]
+            + ["<|speaker:2|> x", "<|speaker:2|> y"],
+            id="empty-groups-take-no-speaker-id",
+        ),
+        pytest.param([["   "]], ["<|speaker:0|>    "], id="blank-transcript"),
+    ],
+)
+def test_speaker_groups_tag_untagged_transcripts_with_the_group_number(
+    toy_tokenizer: Tokenizer, speaker_groups: list[list[str]], header_texts: list[str]
+) -> None:
+    references = grouped_references(speaker_groups)
+    messages = [system_with(*references), said("user", "hello")]
+
+    rows = build(toy_tokenizer, messages, should_tag_user_text=True)
+
+    segments: list[str | torch.Tensor] = [SYSTEM, REFERENCE_INSTRUCTION]
+    for clip_number, header_text in enumerate(header_texts, start=1):
+        segments.append(reference_header(clip_number, header_text))
+        segments.append(clip_codes(1, clip_number))
+    segments += [END, USER, "<|speaker:0|> hello", END, VOICE_TURN]
+    assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+
+
+@pytest.mark.parametrize(
+    "speaker_groups",
+    [
+        pytest.param([["<|speaker:16|> voice"]], id="speaker-16"),
+        pytest.param([["<|speaker:abc|> voice"]], id="malformed-tag"),
+        pytest.param([["clip"]] * 17, id="an-untagged-seventeenth-group"),
+    ],
+)
+def test_speaker_groups_reject_tags_the_tokenizer_lacks(
+    toy_tokenizer: Tokenizer, speaker_groups: list[list[str]]
+) -> None:
+    messages = [system_with(*grouped_references(speaker_groups)), said("user", "hi")]
+
+    with pytest.raises(ValueError, match="speaker tags must be written"):
+        build(toy_tokenizer, messages, should_tag_user_text=True)
+
+
 def test_rows_are_cpu_int64_with_the_semantic_id_then_every_codebook(
     toy_tokenizer: Tokenizer,
 ) -> None:
@@ -436,6 +571,25 @@ def test_rows_are_cpu_int64_with_the_semantic_id_then_every_codebook(
             DEFAULT_SYSTEM_TURN + [USER, "a\n\nb", END, VOICE_TURN],
             id="adjacent-text-parts",
         ),
+        pytest.param(
+            [
+                said("user", "line"),
+                assistant_with(
+                    AudioCodesPart(audio_codes=clip_codes(2, 1)),
+                    TextPart(text="note\n"),
+                    AudioSeparatorPart(),
+                    AudioCodesPart(audio_codes=clip_codes(2, 2)),
+                ),
+                said("user", "again"),
+            ],
+            DEFAULT_SYSTEM_TURN
+            + [USER, "line", END, VOICE_TURN, clip_codes(2, 1), "note\n", SEPARATOR]
+            + [clip_codes(2, 2), END, USER, "again", END, VOICE_TURN],
+            DEFAULT_SYSTEM_TURN
+            + [USER, "line", END, VOICE_TURN, clip_codes(2, 1), "note\n" + SEPARATOR]
+            + [clip_codes(2, 2), END, USER, "again", END, VOICE_TURN],
+            id="assistant-separator",
+        ),
     ],
 )
 def test_each_literal_and_part_is_tokenized_on_its_own(
@@ -451,11 +605,115 @@ def test_each_literal_and_part_is_tokenized_on_its_own(
 
 
 @pytest.mark.parametrize(
+    ("user_parts", "segments", "split_segments"),
+    [
+        pytest.param(
+            [TextPart(text="a\n"), AudioSeparatorPart(), TextPart(text="\nb")],
+            [f"a\n{SEPARATOR}\nb"],
+            ["a\n", SEPARATOR, "\nb"],
+            id="between-two-lines",
+        ),
+        pytest.param(
+            [
+                TextPart(text="a\n"),
+                TextPart(text="\nb\n"),
+                AudioSeparatorPart(),
+                TextPart(text="\nc"),
+            ],
+            ["a\n", f"\nb\n{SEPARATOR}\nc"],
+            ["a\n", "\nb\n", SEPARATOR, "\nc"],
+            id="not-the-line-before-the-last",
+        ),
+        pytest.param(
+            [
+                TextPart(text="a\n"),
+                AudioSeparatorPart(),
+                TextPart(text="\nb"),
+                TextPart(text="\nc"),
+            ],
+            [f"a\n{SEPARATOR}\nb", "\nc"],
+            ["a\n", SEPARATOR, "\nb", "\nc"],
+            id="not-the-line-after-the-next",
+        ),
+        pytest.param(
+            [AudioSeparatorPart(), TextPart(text="\nb")],
+            [f"{SEPARATOR}\nb"],
+            [SEPARATOR, "\nb"],
+            id="leading",
+        ),
+        pytest.param(
+            [TextPart(text="a\n"), AudioSeparatorPart()],
+            [f"a\n{SEPARATOR}"],
+            ["a\n", SEPARATOR],
+            id="trailing",
+        ),
+        pytest.param(
+            [
+                TextPart(text="a\n"),
+                AudioSeparatorPart(),
+                AudioCodesPart(audio_codes=clip_codes(2, 1)),
+                TextPart(text="\nb"),
+            ],
+            [f"a\n{SEPARATOR}", clip_codes(2, 1), "\nb"],
+            ["a\n", SEPARATOR, clip_codes(2, 1), "\nb"],
+            id="audio-ends-the-line",
+        ),
+        pytest.param(
+            [
+                AudioCodesPart(audio_codes=clip_codes(2, 1)),
+                AudioSeparatorPart(),
+                TextPart(text="\nb"),
+            ],
+            [clip_codes(2, 1), f"{SEPARATOR}\nb"],
+            [clip_codes(2, 1), SEPARATOR, "\nb"],
+            id="audio-before-the-separator",
+        ),
+    ],
+)
+def test_user_separator_joins_the_text_around_it(
+    toy_tokenizer: Tokenizer,
+    user_parts: list[PromptPart],
+    segments: list[str | torch.Tensor],
+    split_segments: list[str | torch.Tensor],
+) -> None:
+    rows = build(toy_tokenizer, [user_with(*user_parts)], should_tag_user_text=False)
+
+    turn_start = DEFAULT_SYSTEM_TURN + [USER]
+    turn_end: list[str | torch.Tensor] = [END, VOICE_TURN]
+    expected = expected_rows(toy_tokenizer, turn_start + segments + turn_end)
+    split = expected_rows(toy_tokenizer, turn_start + split_segments + turn_end)
+    assert torch.equal(rows, expected)
+    assert not torch.equal(rows, split)
+
+
+def test_tts_mode_tags_each_line_before_a_separator_joins_them(
+    toy_tokenizer: Tokenizer,
+) -> None:
+    """The builder composes its two rules; no trained layout pins this one."""
+    user_parts = [
+        TextPart(text="first line\n"),
+        AudioSeparatorPart(),
+        TextPart(text="<|speaker:1|> second line"),
+    ]
+
+    rows = build(toy_tokenizer, [user_with(*user_parts)], should_tag_user_text=True)
+
+    turn_start = DEFAULT_SYSTEM_TURN + [USER]
+    turn_end: list[str | torch.Tensor] = [END, VOICE_TURN]
+    joined_lines = f"<|speaker:0|> first line\n{SEPARATOR}<|speaker:1|> second line"
+    split_lines = ["<|speaker:0|> first line\n", SEPARATOR, "<|speaker:1|> second line"]
+    expected = expected_rows(toy_tokenizer, turn_start + [joined_lines] + turn_end)
+    split = expected_rows(toy_tokenizer, turn_start + split_lines + turn_end)
+    assert torch.equal(rows, expected)
+    assert not torch.equal(rows, split)
+
+
+@pytest.mark.parametrize(
     "text",
     [
-        "Direction: [wearily] keep it under your breath\n"
-        "Line: <whisper>I never said that.</whisper>",
-        "first chunk<|endofturn|>lookahead",
+        "Direction: [quietly] hold back a little\n"
+        "Line: <soft>We should go home now.</soft>",
+        "current part<|endofturn|>next part",
         "hi <|audio_separator|> there",
         "<|fim_prefix|> hi",
         "<|speaker:15|> x",
@@ -482,6 +740,183 @@ def test_codes_take_both_ends_of_the_codebook_in_int32_and_int64(
     segments = DEFAULT_SYSTEM_TURN + [USER, "hi", audio_codes, END, VOICE_TURN]
     assert rows.dtype == torch.long
     assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+
+
+NO_FRAMES = torch.zeros((NUM_CODEBOOKS, 0), dtype=torch.long)
+
+
+def build_infill(
+    tokenizer: Tokenizer,
+    transcript: str,
+    *,
+    prefix_audio_codes: torch.Tensor,
+    suffix_audio_codes: torch.Tensor,
+    target_frame_count: int | None,
+) -> torch.Tensor:
+    return build_infill_prompt_rows(
+        transcript,
+        tokenizer,
+        prefix_audio_codes=prefix_audio_codes,
+        suffix_audio_codes=suffix_audio_codes,
+        target_frame_count=target_frame_count,
+        num_codebooks=NUM_CODEBOOKS,
+        codebook_size=CODEBOOK_SIZE,
+    )
+
+
+def test_infill_puts_the_suffix_before_the_prefix(toy_tokenizer: Tokenizer) -> None:
+    rows = build_infill(
+        toy_tokenizer,
+        "<|speaker:0|> a quick infill test",
+        prefix_audio_codes=clip_codes(5, 10),
+        suffix_audio_codes=clip_codes(3, 50),
+        target_frame_count=37,
+    )
+
+    segments = INFILL_SYSTEM_TURN + [USER, "<|speaker:0|> a quick infill test"]
+    segments += ["[audio tokens: 37]", "<|fim_suffix|>", clip_codes(3, 50)]
+    segments += ["<|fim_prefix|>", clip_codes(5, 10), END, VOICE_TURN]
+    joined_segments = INFILL_SYSTEM_TURN + [USER]
+    joined_segments += ["<|speaker:0|> a quick infill test[audio tokens: 37]"]
+    joined_segments += ["<|fim_suffix|>", clip_codes(3, 50)]
+    joined_segments += ["<|fim_prefix|>", clip_codes(5, 10), END, VOICE_TURN]
+    assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+    assert not torch.equal(rows, expected_rows(toy_tokenizer, joined_segments))
+
+
+@pytest.mark.parametrize(
+    ("target_frame_count", "hint_segments"),
+    [(None, []), (0, []), (1, ["[audio tokens: 1]"])],
+)
+def test_infill_hints_only_a_positive_frame_count(
+    toy_tokenizer: Tokenizer,
+    target_frame_count: int | None,
+    hint_segments: list[str | torch.Tensor],
+) -> None:
+    rows = build_infill(
+        toy_tokenizer,
+        "<|speaker:0|> a quick infill test",
+        prefix_audio_codes=clip_codes(2, 1),
+        suffix_audio_codes=NO_FRAMES,
+        target_frame_count=target_frame_count,
+    )
+
+    segments = INFILL_SYSTEM_TURN + [USER, "<|speaker:0|> a quick infill test"]
+    segments += hint_segments + ["<|fim_suffix|>", "<|fim_prefix|>", clip_codes(2, 1)]
+    segments += [END, VOICE_TURN]
+    assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+
+
+@pytest.mark.parametrize(
+    "target_frame_count", [True, False, 1.5, float("nan"), float("inf"), -1]
+)
+def test_infill_rejects_a_frame_count_that_is_not_a_non_negative_int(
+    toy_tokenizer: Tokenizer, target_frame_count: float
+) -> None:
+    with pytest.raises(
+        ValueError, match="target_frame_count must be a non-negative int or None"
+    ):
+        build_infill(
+            toy_tokenizer,
+            "line",
+            prefix_audio_codes=clip_codes(2, 1),
+            suffix_audio_codes=NO_FRAMES,
+            target_frame_count=target_frame_count,
+        )
+
+
+@pytest.mark.parametrize(
+    ("prefix_audio_codes", "suffix_audio_codes", "fill_segments"),
+    [
+        pytest.param(
+            clip_codes(5, 10),
+            NO_FRAMES,
+            ["<|fim_suffix|>", "<|fim_prefix|>", clip_codes(5, 10)],
+            id="no-suffix",
+        ),
+        pytest.param(
+            NO_FRAMES,
+            clip_codes(3, 50),
+            ["<|fim_suffix|>", clip_codes(3, 50), "<|fim_prefix|>"],
+            id="no-prefix",
+        ),
+        pytest.param(
+            NO_FRAMES, NO_FRAMES, ["<|fim_suffix|>", "<|fim_prefix|>"], id="neither"
+        ),
+    ],
+)
+def test_infill_leaves_out_a_side_without_frames(
+    toy_tokenizer: Tokenizer,
+    prefix_audio_codes: torch.Tensor,
+    suffix_audio_codes: torch.Tensor,
+    fill_segments: list[str | torch.Tensor],
+) -> None:
+    rows = build_infill(
+        toy_tokenizer,
+        "<|speaker:0|> regenerate the end",
+        prefix_audio_codes=prefix_audio_codes,
+        suffix_audio_codes=suffix_audio_codes,
+        target_frame_count=None,
+    )
+
+    segments = INFILL_SYSTEM_TURN + [USER, "<|speaker:0|> regenerate the end"]
+    segments += fill_segments + [END, VOICE_TURN]
+    assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+
+
+@pytest.mark.parametrize(
+    ("transcript", "spoken_transcript"),
+    [
+        ("a full take", "<|speaker:0|> a full take"),
+        ("  one\r\ntwo\rthree\nfour  ", "<|speaker:0|> one two three four"),
+        ("x\r\r\ny", "<|speaker:0|> x  y"),
+        (" <|speaker:2|> x", "<|speaker:2|> x"),
+        ("one <|speaker:3|> two", "<|speaker:0|> one <|speaker:3|> two"),
+    ],
+)
+def test_infill_folds_line_breaks_and_tags_the_transcript(
+    toy_tokenizer: Tokenizer, transcript: str, spoken_transcript: str
+) -> None:
+    rows = build_infill(
+        toy_tokenizer,
+        transcript,
+        prefix_audio_codes=clip_codes(2, 1),
+        suffix_audio_codes=NO_FRAMES,
+        target_frame_count=None,
+    )
+
+    segments = INFILL_SYSTEM_TURN + [USER, spoken_transcript, "<|fim_suffix|>"]
+    segments += ["<|fim_prefix|>", clip_codes(2, 1), END, VOICE_TURN]
+    assert torch.equal(rows, expected_rows(toy_tokenizer, segments))
+
+
+@pytest.mark.parametrize(
+    ("transcript", "error"),
+    [
+        pytest.param(" \r\n\t", "transcript: text must not be empty", id="blank"),
+        pytest.param(
+            "<|speaker:16|> line",
+            "transcript: speaker tags must be written",
+            id="speaker-16",
+        ),
+        pytest.param(
+            "line <|im_end|>",
+            "transcript: <|im_end|> is written by the prompt builder",
+            id="structural-token",
+        ),
+    ],
+)
+def test_infill_rejects_a_bad_transcript(
+    toy_tokenizer: Tokenizer, transcript: str, error: str
+) -> None:
+    with pytest.raises(ValueError, match=re.escape(error)):
+        build_infill(
+            toy_tokenizer,
+            transcript,
+            prefix_audio_codes=clip_codes(2, 1),
+            suffix_audio_codes=NO_FRAMES,
+            target_frame_count=None,
+        )
 
 
 BLANK_TEXT = " \n\t\N{IDEOGRAPHIC SPACE}"
@@ -532,6 +967,14 @@ REJECTED_CASES = [
         ],
         "messages[0].parts[0]: the system message takes text and reference parts only",
         id="audio-in-system",
+    ),
+    pytest.param(
+        [
+            PromptMessage(role="system", parts=[AudioSeparatorPart()]),
+            said("user", "hi"),
+        ],
+        "messages[0].parts[0]: the system message takes text and reference parts only",
+        id="separator-in-system",
     ),
     pytest.param(
         [
@@ -676,7 +1119,15 @@ def test_codebook_parameters_must_be_positive(
 def test_real_tokenizer_special_tokens_are_single_contiguous_ids(
     real_tokenizer: Tokenizer,
 ) -> None:
-    for token in ["<|im_start|>", "<|im_end|>", "<|voice|>"]:
+    for token in [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|voice|>",
+        "<|fim_prefix|>",
+        "<|fim_suffix|>",
+        "<|audio_separator|>",
+        "<|endofturn|>",
+    ]:
         assert real_tokenizer.encode(token).ids == [real_tokenizer.token_to_id(token)]
     speaker_begin_id = real_tokenizer.token_to_id("<|speaker:0|>")
     for speaker_id in range(16):
@@ -722,3 +1173,47 @@ def test_real_tokenizer_rows_follow_the_segment_boundaries(
     assert chat_rows[-1, 0] == real_tokenizer.token_to_id("<|voice|>")
     tts_segments = DEFAULT_SYSTEM_TURN + [USER, "<|speaker:0|> hello", END, VOICE_TURN]
     assert torch.equal(tts_rows, expected_rows(real_tokenizer, tts_segments))
+
+
+def test_real_tokenizer_rows_keep_the_infill_and_separator_seams(
+    real_tokenizer: Tokenizer,
+) -> None:
+    dub_messages = [
+        user_with(
+            TextPart(text="第一句。\n"), AudioSeparatorPart(), TextPart(text="\n第二句")
+        ),
+        assistant_with(
+            AudioCodesPart(audio_codes=clip_codes(2, 3)),
+            AudioSeparatorPart(),
+            AudioCodesPart(audio_codes=clip_codes(2, 4)),
+        ),
+        said("user", "再说一遍"),
+    ]
+
+    infill_rows = build_infill(
+        real_tokenizer,
+        "第一句。",
+        prefix_audio_codes=clip_codes(2, 1),
+        suffix_audio_codes=clip_codes(3, 2),
+        target_frame_count=37,
+    )
+    dub_rows = build(real_tokenizer, dub_messages, should_tag_user_text=False)
+
+    infill_segments = INFILL_SYSTEM_TURN + [USER, "<|speaker:0|> 第一句。"]
+    infill_segments += ["[audio tokens: 37]", "<|fim_suffix|>", clip_codes(3, 2)]
+    infill_segments += ["<|fim_prefix|>", clip_codes(2, 1), END, VOICE_TURN]
+    dub_segments = DEFAULT_SYSTEM_TURN + [USER, f"第一句。\n{SEPARATOR}\n第二句", END]
+    dub_segments += [VOICE_TURN, clip_codes(2, 3), SEPARATOR, clip_codes(2, 4), END]
+    dub_segments += [USER, "再说一遍", END, VOICE_TURN]
+    assert torch.equal(infill_rows, expected_rows(real_tokenizer, infill_segments))
+    assert torch.equal(dub_rows, expected_rows(real_tokenizer, dub_segments))
+    seams = [
+        ("<|speaker:0|> 第一句。", "[audio tokens: 37]"),
+        ("第一句。\n", SEPARATOR),
+        (SEPARATOR, "\n第二句"),
+    ]
+    for left, right in seams:
+        joined_token_ids = real_tokenizer.encode(left + right).ids
+        left_token_ids = real_tokenizer.encode(left).ids
+        right_token_ids = real_tokenizer.encode(right).ids
+        assert joined_token_ids != left_token_ids + right_token_ids
