@@ -12,6 +12,10 @@ from sglang.srt.server_args import ServerArgs
 from transformers import AutoConfig
 
 from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.models.fishaudio_s3_drama.config import (
+    DEFAULT_MAX_NEW_TOKENS_CAP,
+    DEFAULT_MAX_PROMPT_ROWS,
+)
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import S3DramaModelRunner
 from sglang_omni.models.fishaudio_s3_drama.quantization import (
@@ -39,10 +43,6 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint
 FISH_OMNI_ARCHITECTURE = "FishOmniModel"
 # The tower re-plans this backend's metadata for its first frame.
 ATTENTION_BACKEND = "triton"
-# A prompt with more rows is refused before admission (HTTP 400).
-DEFAULT_MAX_PROMPT_ROWS = 8192
-# A request that sets no max_new_tokens fills the remaining context up to this.
-DEFAULT_MAX_NEW_TOKENS_CAP = 2048
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):

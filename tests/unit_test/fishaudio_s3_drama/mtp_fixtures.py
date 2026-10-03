@@ -366,15 +366,24 @@ TEST_RETRACT_SCENARIOS = [
 ]
 
 
-def write_synthetic_checkpoint(checkpoint_dir: Path) -> None:
-    """S3-drama layout and names, random weights; the backbone as the library inits it."""
+def write_synthetic_checkpoint(
+    checkpoint_dir: Path, checkpoint_config: dict[str, object] | None = None
+) -> None:
+    """S3-drama layout and names, random weights; the backbone as the library inits it.
+
+    checkpoint_config defaults to CHECKPOINT_CONFIG.
+    """
+    config = CHECKPOINT_CONFIG if checkpoint_config is None else checkpoint_config
+    text_config = config["text_config"]
+    decoder_config = config["audio_decoder_config"]
+    assert isinstance(text_config, dict) and isinstance(decoder_config, dict)
     torch.manual_seed(0)
     backbone = TransformersBackbone(
         TransformersTextConfig(
-            **{key: value for key, value in TEXT_CONFIG.items() if key != "model_type"}
+            **{key: value for key, value in text_config.items() if key != "model_type"}
         )
     )
-    expert_width = int(TEXT_CONFIG["moe_intermediate_size"])
+    expert_width = int(text_config["moe_intermediate_size"])
     tensors: dict[str, torch.Tensor] = {}
     for name, tensor in backbone.state_dict().items():
         tensor = tensor.to(torch.bfloat16)
@@ -403,10 +412,10 @@ def write_synthetic_checkpoint(checkpoint_dir: Path) -> None:
                 ].contiguous()
         else:
             tensors[name] = tensor.contiguous()
-    tensors.update(decoder_checkpoint())
+    tensors.update(decoder_checkpoint(decoder_config))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     save_file(tensors, checkpoint_dir / "model.safetensors")
-    (checkpoint_dir / "config.json").write_text(json.dumps(CHECKPOINT_CONFIG))
+    (checkpoint_dir / "config.json").write_text(json.dumps(config))
 
 
 def block_expanded(block_values: torch.Tensor) -> torch.Tensor:
@@ -485,16 +494,20 @@ def write_expert_variant(
     return expert_tensors
 
 
-def decoder_checkpoint() -> dict[str, torch.Tensor]:
-    """Random tower tensors under the checkpoint's names and layouts."""
+def decoder_checkpoint(
+    decoder_config: dict[str, object] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Random tower tensors under the checkpoint's names and layouts; decoder_config
+    defaults to DECODER_CONFIG."""
+    config = DECODER_CONFIG if decoder_config is None else decoder_config
     generator = torch.Generator().manual_seed(1)
-    dim = int(DECODER_CONFIG["dim"])
-    head_count = int(DECODER_CONFIG["n_head"])
-    kv_head_count = int(DECODER_CONFIG["n_local_heads"])
-    head_dim = int(DECODER_CONFIG["head_dim"])
-    intermediate_size = int(DECODER_CONFIG["intermediate_size"])
-    codebook_size = int(DECODER_CONFIG["vocab_size"])
-    num_codebooks = int(DECODER_CONFIG["num_codebooks"])
+    dim = int(config["dim"])
+    head_count = int(config["n_head"])
+    kv_head_count = int(config["n_local_heads"])
+    head_dim = int(config["head_dim"])
+    intermediate_size = int(config["intermediate_size"])
+    codebook_size = int(config["vocab_size"])
+    num_codebooks = int(config["num_codebooks"])
 
     def random_tensor(*shape: int, std: float) -> torch.Tensor:
         return (torch.randn(*shape, generator=generator) * std).to(torch.bfloat16)
@@ -506,7 +519,7 @@ def decoder_checkpoint() -> dict[str, torch.Tensor]:
     }
     layers = [
         (f"audio_decoder_mtp_shared.layers.{index}.", "semantic_embedding")
-        for index in range(int(DECODER_CONFIG["shared_enrichment_layers"]))
+        for index in range(int(config["shared_enrichment_layers"]))
     ] + [
         (f"audio_decoder_mtp.layers.{index}.", "codebook_embedding")
         for index in range(num_codebooks - 1)
