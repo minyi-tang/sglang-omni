@@ -981,17 +981,20 @@ class SpeechRequestValidator:
 
 
 def explicit_generation_params(request: CreateSpeechRequest) -> list[str]:
+    """Generation fields the caller gave a value; null means unset."""
     return sorted(
-        field
-        for field in (
-            "max_new_tokens",
-            "temperature",
-            "top_p",
-            "top_k",
-            "repetition_penalty",
-            "seed",
+        request.model_dump(
+            include={
+                "max_new_tokens",
+                "temperature",
+                "top_p",
+                "top_k",
+                "repetition_penalty",
+                "seed",
+            },
+            exclude_unset=True,
+            exclude_none=True,
         )
-        if field in request.model_fields_set
     )
 
 

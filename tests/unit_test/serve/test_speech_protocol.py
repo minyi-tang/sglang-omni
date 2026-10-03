@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from sglang_omni.client import audio as client_audio
+from sglang_omni.client.client import build_params
 from sglang_omni.config import CustomVoiceConfig
 from sglang_omni.preprocessing import resource_connector
 from sglang_omni.serve import speech_service
@@ -419,6 +420,51 @@ def test_speech_service_normalizes_tts_extension_fields_into_tts_params() -> Non
     assert gen_req.extra_params == {"initial_codec_chunk_frames": 8}
     assert gen_req.sampling.max_new_tokens == 128
     assert tts_params["explicit_generation_params"] == ["max_new_tokens"]
+
+
+GENERATION_FIELD_VALUES: dict[str, int | float] = {
+    "max_new_tokens": 1,
+    "temperature": 0.8,
+    "top_p": 0.8,
+    "top_k": 30,
+    "repetition_penalty": 1.1,
+    "seed": 0,
+}
+
+
+def lowered_speech_request(
+    payload: dict[str, object],
+) -> tuple[list[str], dict[str, object]]:
+    """The explicit generation fields and pipeline params a raw payload lowers to."""
+    service = SpeechRequestValidator(default_model="tts")
+    generate_request = service.build_generate_request(
+        service.parse_raw_request({"input": "hello", **payload})
+    )
+    tts_params = generate_request.metadata["tts_params"]
+    assert isinstance(tts_params, dict)
+    explicit_fields = tts_params.get("explicit_generation_params", [])
+    assert isinstance(explicit_fields, list)
+    return explicit_fields, build_params(generate_request)
+
+
+@pytest.mark.parametrize("field_name", sorted(GENERATION_FIELD_VALUES))
+def test_null_generation_field_lowers_like_an_omitted_one(field_name: str) -> None:
+    omitted = lowered_speech_request({})
+
+    assert lowered_speech_request({field_name: None}) == omitted
+    assert omitted[0] == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"), sorted(GENERATION_FIELD_VALUES.items())
+)
+def test_generation_field_given_a_value_is_explicit(
+    field_name: str, value: int | float
+) -> None:
+    explicit_fields, params = lowered_speech_request({field_name: value})
+
+    assert explicit_fields == [field_name]
+    assert params[field_name] == value
 
 
 def test_file_reference_requires_allowlist() -> None:
