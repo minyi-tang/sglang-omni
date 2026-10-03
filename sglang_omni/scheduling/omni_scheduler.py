@@ -3056,32 +3056,38 @@ class OmniScheduler(Generic[RequestDataT]):
         _Upstream._add_request_to_queue(self, req, is_retracted=is_retracted)
 
     def retract_running_requests(self) -> int:
-        batch = self.running_batch
-        if batch is None or batch.is_empty():
-            return 0
+        """Retract and requeue each unfinished request holding KV, including one cut
+        between chunked extends, which sits only in last_batch and chunked_req."""
+        candidate_requests = list(self.running_batch.reqs)
+        last_batch = self.last_batch
+        if last_batch is not None and last_batch.forward_mode.is_extend():
+            candidate_requests.extend(last_batch.reqs)
         else:
             pass
-        batch.filter_batch()
-        if len(batch.reqs) == 0:
-            return 0
+        if self.chunked_req is not None:
+            candidate_requests.append(self.chunked_req)
         else:
             pass
-        # ScheduleBatch has no retract_all; the module-level function leaves
-        # batch.reqs in place, so snapshot the requests and clear the batch here.
-        retracted_reqs = list(batch.reqs)
+        requests_by_identity = {id(request): request for request in candidate_requests}
+        retracted_requests = [
+            request
+            for request in requests_by_identity.values()
+            if not request.finished()
+        ]
         retract_all(
-            reqs=batch.reqs,
-            req_to_token_pool=batch.req_to_token_pool,
-            token_to_kv_pool_allocator=batch.token_to_kv_pool_allocator,
-            tree_cache=batch.tree_cache,
-            hisparse_coordinator=batch.hisparse_coordinator,
+            reqs=retracted_requests,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
         )
-        batch.reqs = []
-        for req in retracted_reqs:
-            self._add_request_to_queue(req)
-        batch.batch_is_full = False
+        self.running_batch.reqs = []
+        self.running_batch.batch_is_full = False
+        self.last_batch = None
         self.chunked_req = None
-        return len(retracted_reqs)
+        for request in retracted_requests:
+            self._add_request_to_queue(request)
+        return len(retracted_requests)
 
     def flush_cache(self, empty_cache: bool = True) -> bool:
         if self.session_bridge is not None and self.session_bridge.sessions:
