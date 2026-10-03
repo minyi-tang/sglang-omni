@@ -467,6 +467,77 @@ def test_generation_field_given_a_value_is_explicit(
     assert params[field_name] == value
 
 
+SUPPORTED_SPEECH_FIELDS = frozenset(
+    {"input", "voice", "response_format", "references", "temperature"}
+)
+REFUSED_SPEECH_FIELDS: dict[str, tuple[dict[str, object], str]] = {
+    "unknown-empty-dict": ({"stage_sampling": {}}, "stage_sampling"),
+    "unknown-null": ({"stage_sampling": None}, "stage_sampling"),
+    "unknown-false": ({"infill": False}, "infill"),
+    "unknown-zero": ({"prefix_audio_codes": 0}, "prefix_audio_codes"),
+    "unsupported-empty-dict": ({"stage_params": {}}, "stage_params"),
+    "unsupported-empty-string": ({"instructions": ""}, "instructions"),
+    "unsupported-false": ({"x_vector_only_mode": False}, "x_vector_only_mode"),
+    "unsupported-zero": ({"seed": 0}, "seed"),
+    "unknown-reference-field": (
+        {"references": [{"text": "hi", "vq_codes": [[1]], "speaker": 0}]},
+        "references.0.speaker",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("fields", "path"), list(REFUSED_SPEECH_FIELDS.values()), ids=REFUSED_SPEECH_FIELDS
+)
+def test_supported_speech_fields_refuse_dropped_and_unsupported_fields(
+    fields: dict[str, object], path: str
+) -> None:
+    service = SpeechRequestValidator(
+        default_model="tts", supported_speech_fields=SUPPORTED_SPEECH_FIELDS
+    )
+
+    with pytest.raises(SpeechAPIError) as exc_info:
+        service.parse_raw_request({"input": "hello", **fields})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.param == path
+    assert path in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [fields for fields, _ in REFUSED_SPEECH_FIELDS.values()],
+    ids=REFUSED_SPEECH_FIELDS,
+)
+def test_speech_fields_without_a_supported_set_keep_ignoring_extras(
+    fields: dict[str, object],
+) -> None:
+    service = SpeechRequestValidator(default_model="tts")
+
+    assert service.parse_raw_request({"input": "hello", **fields}).input == "hello"
+
+
+def test_supported_speech_fields_treat_null_protocol_fields_as_unset() -> None:
+    service = SpeechRequestValidator(
+        default_model="tts", supported_speech_fields=SUPPORTED_SPEECH_FIELDS
+    )
+
+    request = service.parse_raw_request(
+        {
+            "input": "hello",
+            "speaker": "default",
+            "seed": None,
+            "stage_params": None,
+            "instructions": None,
+            "references": [{"text": "hi", "vq_codes": [[1]]}],
+        }
+    )
+
+    assert request.voice == "default"
+    assert request.seed is None
+    assert request.references is not None
+
+
 def test_file_reference_requires_allowlist() -> None:
     service = SpeechRequestValidator(default_model="tts")
 
