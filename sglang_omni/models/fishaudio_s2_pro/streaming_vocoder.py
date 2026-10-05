@@ -477,6 +477,20 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
         else:
             pass
 
+        messages.append(
+            OutgoingMessage(
+                request_id=request_id,
+                type="result",
+                data=StagePayload(
+                    request_id=payload.request_id,
+                    request=payload.request,
+                    data=self.final_result_data(payload),
+                ),
+            )
+        )
+        return messages
+
+    def final_result_data(self, payload: StagePayload) -> S2ProFinalAudioData:
         final_state = S2ProState.from_dict(payload.data)
         final_data: S2ProFinalAudioData = {
             "modality": "audio",
@@ -491,18 +505,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             final_data["finish_reason"] = final_state.finish_reason
         else:
             pass
-        messages.append(
-            OutgoingMessage(
-                request_id=request_id,
-                type="result",
-                data=StagePayload(
-                    request_id=payload.request_id,
-                    request=payload.request,
-                    data=final_data,
-                ),
-            )
-        )
-        return messages
+        return final_data
 
     def clear_stream_state(self, request_id: str) -> None:
         self.stream_states.pop(request_id, None)
@@ -524,9 +527,10 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             pass
         return state
 
-    def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        states = [self.validate_payload_state(payload) for payload in payloads]
-        code_batches = [state.output_codes[1:].to(self.device) for state in states]
+    def decode_codebook_codes(
+        self, codebook_codes: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        code_batches = [codes.to(self.device) for codes in codebook_codes]
         lengths = [int(codes.shape[-1]) for codes in code_batches]
         max_len = max(lengths)
         padded = [
@@ -539,13 +543,20 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             audio = self.codec.from_indices(batch_codes)
 
         samples_per_token = int(self.codec.frame_length)
+        return [
+            audio[idx, 0, : int(length * samples_per_token)].float().cpu()
+            for idx, length in enumerate(lengths)
+        ]
 
-        results: list[StagePayload] = []
-        for idx, (payload, state, length) in enumerate(zip(payloads, states, lengths)):
-            sample_len = int(length * samples_per_token)
-            audio_np = audio[idx, 0, :sample_len].float().cpu()
-            results.append(self.store_audio(payload, state, audio_np))
-        return results
+    def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
+        states = [self.validate_payload_state(payload) for payload in payloads]
+        audios = self.decode_codebook_codes(
+            [state.output_codes[1:] for state in states]
+        )
+        return [
+            self.store_audio(payload, state, audio_np)
+            for payload, state, audio_np in zip(payloads, states, audios)
+        ]
 
     def store_audio(
         self,
