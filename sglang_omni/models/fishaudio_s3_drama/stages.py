@@ -6,7 +6,9 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Mapping
+from typing import Literal
 
+import torch
 from huggingface_hub import hf_hub_download
 from tokenizers import Tokenizer
 
@@ -34,6 +36,7 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_concrete_device
 
 CODEC_FILE_NAME = "codec.pth"
+REFERENCE_ENCODE_WARMUP_SECONDS = 1.0
 # A hub codec names a full commit, so preprocessing and the vocoder load one file.
 HUB_CODEC_PATTERN = re.compile(
     r"(?P<repo_id>[^@\s]+/[^@\s]+)@(?P<revision>[0-9a-f]{40})"
@@ -63,21 +66,53 @@ def resolve_codec_directory(codec_path: str) -> str:
 
 
 def create_preprocessing_executor(
-    model_path: str, *, max_concurrency: int, max_prompt_rows: int, codec_path: str
+    model_path: str,
+    *,
+    device: str | None = None,
+    gpu_id: int | None = None,
+    max_concurrency: int,
+    max_prompt_rows: int,
+    codec_path: str,
+    reference_encode_dtype: Literal["float32", "bfloat16"],
+    max_reference_audio_seconds: float,
 ) -> ThreadedSimpleScheduler:
     """Speech requests to prompt rows; reference audio encodes with the vocoder's codec."""
+    resolved_device = str(resolve_concrete_device(device, gpu_id))
+    is_on_cpu = torch.device(resolved_device).type == "cpu"
+    if is_on_cpu and reference_encode_dtype == "bfloat16":
+        raise ValueError(
+            "S3-drama preprocessing encodes references in bfloat16 only on an "
+            "accelerator; on the CPU set "
+            "stages.preprocessing.factory.reference_encode_dtype to float32"
+        )
+    else:
+        pass
     checkpoint_dir = resolve_checkpoint(model_path)
     codec_directory = resolve_codec_directory(codec_path)
+    codec = load_codec(codec_directory, resolved_device)
+    reference_encode_hook = FishReferenceEncodeHook(
+        codec=codec,
+        checkpoint_id=os.path.join(codec_directory, CODEC_FILE_NAME),
+        device=resolved_device,
+        autocast_dtype=torch.bfloat16 if reference_encode_dtype == "bfloat16" else None,
+        max_reference_audio_seconds=max_reference_audio_seconds,
+    )
+    if not is_on_cpu:
+        warmup_seconds = min(
+            REFERENCE_ENCODE_WARMUP_SECONDS, max_reference_audio_seconds
+        )
+        reference_encode_hook.encode_reference_waveform(
+            torch.zeros((1, int(codec.sample_rate * warmup_seconds))),
+            int(codec.sample_rate),
+        )
+    else:
+        pass
     preprocessor = S3DramaSpeechPreprocessor(
         tokenizer=Tokenizer.from_file(os.path.join(checkpoint_dir, "tokenizer.json")),
         config=FishOmniConfig.from_pretrained(checkpoint_dir),
         max_prompt_rows=max_prompt_rows,
         reference_encoder=ReferenceEncodeService(
-            FishReferenceEncodeHook(
-                codec=load_codec(codec_directory, "cpu"),
-                checkpoint_id=os.path.join(codec_directory, CODEC_FILE_NAME),
-            ),
-            log_prefix="FishAudio S3-drama",
+            reference_encode_hook, log_prefix="FishAudio S3-drama"
         ),
     )
     return ThreadedSimpleScheduler(preprocessor, max_concurrency=max_concurrency)
@@ -88,6 +123,8 @@ def create_tts_engine_executor(
     *,
     device: str | None = None,
     gpu_id: int | None = None,
+    total_gpu_memory_fraction: float | None = None,
+    process_total_gpu_memory_fraction: float | None = None,
     context_length: int = DEFAULT_CONTEXT_LENGTH,
     max_running_requests: int = DEFAULT_MAX_RUNNING_REQUESTS,
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS_CAP,
@@ -95,6 +132,21 @@ def create_tts_engine_executor(
     server_args_overrides: Mapping[str, object] | None = None,
 ) -> OmniScheduler[S3DramaRequestData]:
     """The engine; max_new_tokens caps a request that sets none."""
+    overrides = dict(server_args_overrides or {})
+    mem_fraction_static = overrides.get("mem_fraction_static")
+    if total_gpu_memory_fraction is None:
+        pass
+    elif mem_fraction_static is None:
+        overrides["mem_fraction_static"] = total_gpu_memory_fraction
+    elif mem_fraction_static != total_gpu_memory_fraction:
+        raise ValueError(
+            f"S3-drama sizes its engine from the tts_engine stage's "
+            f"gpu_memory_fraction ({total_gpu_memory_fraction:g}), so "
+            f"mem_fraction_static={mem_fraction_static} would be ignored; set "
+            f"--tts_engine.gpu_memory_fraction instead of mem_fraction_static"
+        )
+    else:
+        pass
     return S3DramaEngineBuilder(
         context_length=context_length,
         max_running_requests=max_running_requests,
@@ -104,7 +156,12 @@ def create_tts_engine_executor(
         model_path,
         device=device,
         gpu_id=gpu_id,
-        server_args_overrides=server_args_overrides,
+        server_args_overrides=overrides or None,
+        total_gpu_memory_fraction=(
+            process_total_gpu_memory_fraction
+            if process_total_gpu_memory_fraction is not None
+            else total_gpu_memory_fraction
+        ),
     )
 
 

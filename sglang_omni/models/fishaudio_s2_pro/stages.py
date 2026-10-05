@@ -9,8 +9,10 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import threading
 import time
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -225,8 +227,20 @@ class FishReferenceEncodeHook(TensorReferenceEncodeHook[FishReferenceInput]):
     storage_dtype = torch.long
     output_dtype = torch.long
 
-    def __init__(self, *, codec: "DAC", checkpoint_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        codec: "DAC",
+        checkpoint_id: str,
+        device: str = "cpu",
+        autocast_dtype: torch.dtype | None = None,
+        max_reference_audio_seconds: float | None = None,
+    ) -> None:
         self.codec = codec
+        self.device = torch.device(device)
+        self.autocast_dtype = autocast_dtype
+        self.max_reference_audio_seconds = max_reference_audio_seconds
+        self.encode_lock = threading.Lock()
         self.model_revision = str(checkpoint_id)
         config = f"sample_rate:{int(codec.sample_rate)}"
         self.encoder_config_hash = _hash_bytes(config.encode("utf-8"))
@@ -308,15 +322,40 @@ class FishReferenceEncodeHook(TensorReferenceEncodeHook[FishReferenceInput]):
     def encode_reference_waveform(self, audio: torch.Tensor, sr: int) -> torch.Tensor:
         import torchaudio
 
+        if (
+            self.max_reference_audio_seconds is not None
+            and audio.shape[-1] > self.max_reference_audio_seconds * sr
+        ):
+            raise ValueError(
+                f"reference audio lasts {audio.shape[-1] / sr:.1f} s, longer than "
+                f"the {self.max_reference_audio_seconds:g} s limit; shorten it or "
+                f"raise max_reference_audio_seconds"
+            )
+        else:
+            pass
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
         else:
             pass
         audio = torchaudio.functional.resample(audio, sr, self.codec.sample_rate)
         audios = audio.squeeze(0).unsqueeze(0)
+        if self.autocast_dtype is not None:
+            audios = audios.clamp(-1.0, 1.0)
+        else:
+            pass
         audio_lengths = torch.tensor([audios.shape[1]], dtype=torch.long)
-        with torch.no_grad():
-            indices, _ = self.codec.encode(audios, audio_lengths)
+        with (
+            torch.no_grad(),
+            torch.autocast(
+                self.device.type,
+                dtype=self.autocast_dtype,
+                enabled=self.autocast_dtype is not None,
+            ),
+            self.encode_lock if self.device.type != "cpu" else nullcontext(),
+        ):
+            indices, _ = self.codec.encode(
+                audios.to(self.device), audio_lengths.to(self.device)
+            )
             if indices.ndim == 3:
                 indices = indices[0]
             else:

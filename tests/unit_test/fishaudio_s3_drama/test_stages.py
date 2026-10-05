@@ -5,10 +5,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal
 
 import pytest
 import torch
+from tokenizers import Tokenizer
 
+from sglang_omni.models.fishaudio_s2_pro.stages import FishReferenceEncodeHook
 from sglang_omni.models.fishaudio_s3_drama import stages
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_CODEC_PATH,
@@ -131,31 +134,45 @@ def codec_loads(monkeypatch: pytest.MonkeyPatch) -> CodecLoads:
     return loads
 
 
-def test_preprocessing_reads_the_checkpoint_and_loads_the_codec_on_cpu(
-    codec_loads: CodecLoads, tmp_path: Path
-) -> None:
+def write_toy_checkpoint(tmp_path: Path) -> Tokenizer:
     tokenizer = build_toy_tokenizer()
     checkpoint_dir = tmp_path / "checkpoint"
     checkpoint_dir.mkdir()
     tokenizer.save(str(checkpoint_dir / "tokenizer.json"))
     toy_config(tokenizer).save_pretrained(str(checkpoint_dir))
-    codec_file = tmp_path / "codec.pth"
-    codec_file.write_bytes(b"")
+    (tmp_path / "codec.pth").write_bytes(b"")
+    return tokenizer
+
+
+def test_preprocessing_reads_the_checkpoint_and_loads_the_codec_on_cpu(
+    codec_loads: CodecLoads, tmp_path: Path
+) -> None:
+    tokenizer = write_toy_checkpoint(tmp_path)
     rows = expected_rows(
         tokenizer, DEFAULT_SYSTEM_TURN + [USER, "<|speaker:0|> hello", END, VOICE_TURN]
     )
 
     scheduler = stages.create_preprocessing_executor(
-        str(checkpoint_dir),
+        str(tmp_path / "checkpoint"),
+        device="cpu",
         max_concurrency=2,
         max_prompt_rows=rows.shape[0],
-        codec_path=str(codec_file),
+        codec_path=str(tmp_path / "codec.pth"),
+        reference_encode_dtype="float32",
+        max_reference_audio_seconds=30.0,
     )
 
     preprocessor = scheduler.fn
     assert isinstance(preprocessor, S3DramaSpeechPreprocessor)
     assert scheduler.max_concurrency == 2
     assert codec_loads.calls == [(str(tmp_path), "cpu")]
+    hook = preprocessor.reference_encoder.hook
+    assert isinstance(hook, FishReferenceEncodeHook)
+    assert (hook.device, hook.autocast_dtype, hook.max_reference_audio_seconds) == (
+        torch.device("cpu"),
+        None,
+        30.0,
+    )
     assert torch.equal(
         generation_input_of(preprocessor(lowered({"input": "hello"}))).prompt_rows,
         rows,
@@ -163,6 +180,79 @@ def test_preprocessing_reads_the_checkpoint_and_loads_the_codec_on_cpu(
     assert "maximum allowed length" in refused(
         preprocessor, lowered({"input": "hello there"})
     )
+
+
+def test_a_bfloat16_reference_encode_on_the_cpu_is_refused(
+    codec_loads: CodecLoads, tmp_path: Path
+) -> None:
+    write_toy_checkpoint(tmp_path)
+
+    with pytest.raises(ValueError, match="reference_encode_dtype to float32"):
+        stages.create_preprocessing_executor(
+            str(tmp_path / "checkpoint"),
+            device="cpu",
+            max_concurrency=1,
+            max_prompt_rows=64,
+            codec_path=str(tmp_path / "codec.pth"),
+            reference_encode_dtype="bfloat16",
+            max_reference_audio_seconds=60.0,
+        )
+
+    assert codec_loads.calls == []
+
+
+class EncodeRecordingCodec:
+    sample_rate: int = 44100
+
+    def __init__(self) -> None:
+        self.encoded_shapes: list[tuple[int, ...]] = []
+
+    def encode(
+        self, audios: torch.Tensor, audio_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.encoded_shapes.append(tuple(audios.shape))
+        return torch.zeros((1, 10, 1), dtype=torch.long), audio_lengths
+
+
+@pytest.mark.parametrize(
+    ("device", "reference_encode_dtype", "expected_encoded_shapes"),
+    [
+        pytest.param("cpu", "float32", [], id="cpu"),
+        pytest.param(
+            "cuda",
+            "bfloat16",
+            [(1, EncodeRecordingCodec.sample_rate)],
+            id="cuda",
+            marks=pytest.mark.accelerator,
+        ),
+    ],
+)
+def test_preprocessing_warms_the_encoder_up_once_on_an_accelerator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    device: str,
+    reference_encode_dtype: Literal["float32", "bfloat16"],
+    expected_encoded_shapes: list[tuple[int, ...]],
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    write_toy_checkpoint(tmp_path)
+    codec = EncodeRecordingCodec()
+    monkeypatch.setattr(stages, "load_codec", lambda checkpoint_dir, device: codec)
+
+    stages.create_preprocessing_executor(
+        str(tmp_path / "checkpoint"),
+        device=device,
+        max_concurrency=1,
+        max_prompt_rows=64,
+        codec_path=str(tmp_path / "codec.pth"),
+        reference_encode_dtype=reference_encode_dtype,
+        max_reference_audio_seconds=60.0,
+    )
+
+    assert codec.encoded_shapes == expected_encoded_shapes
 
 
 def test_the_engine_factory_hands_its_knobs_to_the_builder(
@@ -175,13 +265,15 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
         device: str | None,
         gpu_id: int | None,
         server_args_overrides: Mapping[str, object] | None,
+        total_gpu_memory_fraction: float | None,
     ) -> str:
-        assert (model_path, device, gpu_id, server_args_overrides) == (
-            "checkpoint",
-            None,
-            1,
-            {"mem_fraction_static": 0.5},
-        )
+        assert (
+            model_path,
+            device,
+            gpu_id,
+            server_args_overrides,
+            total_gpu_memory_fraction,
+        ) == ("checkpoint", None, 1, {"mem_fraction_static": 0.5}, None)
         assert (
             builder.context_length,
             builder.max_running_requests,
@@ -203,6 +295,86 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
     )
 
     assert engine == "engine"
+
+
+@pytest.mark.parametrize(
+    (
+        "process_total_gpu_memory_fraction",
+        "server_args_overrides",
+        "kv_cache_budget",
+        "expected_overrides",
+    ),
+    [
+        pytest.param(None, None, 0.7, {"mem_fraction_static": 0.7}, id="own-share"),
+        pytest.param(0.8, None, 0.8, {"mem_fraction_static": 0.7}, id="process-share"),
+        pytest.param(
+            None,
+            {"mem_fraction_static": 0.7},
+            0.7,
+            {"mem_fraction_static": 0.7},
+            id="equal-static-fraction",
+        ),
+    ],
+)
+def test_the_engine_sizes_its_kv_cache_from_its_declared_share(
+    monkeypatch: pytest.MonkeyPatch,
+    process_total_gpu_memory_fraction: float | None,
+    server_args_overrides: Mapping[str, object] | None,
+    kv_cache_budget: float,
+    expected_overrides: Mapping[str, object],
+) -> None:
+    def build(
+        builder: S3DramaEngineBuilder,
+        model_path: str,
+        *,
+        device: str | None,
+        gpu_id: int | None,
+        server_args_overrides: Mapping[str, object] | None,
+        total_gpu_memory_fraction: float | None,
+    ) -> tuple[float | None, Mapping[str, object] | None]:
+        return total_gpu_memory_fraction, server_args_overrides
+
+    monkeypatch.setattr(S3DramaEngineBuilder, "build", build)
+
+    engine = stages.create_tts_engine_executor(
+        "checkpoint",
+        gpu_id=0,
+        total_gpu_memory_fraction=0.7,
+        process_total_gpu_memory_fraction=process_total_gpu_memory_fraction,
+        server_args_overrides=server_args_overrides,
+    )
+
+    assert engine == (kv_cache_budget, expected_overrides)
+
+
+def test_a_static_fraction_other_than_the_stage_share_is_refused_before_building(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builds: list[str] = []
+
+    def build(
+        builder: S3DramaEngineBuilder,
+        model_path: str,
+        *,
+        device: str | None,
+        gpu_id: int | None,
+        server_args_overrides: Mapping[str, object] | None,
+        total_gpu_memory_fraction: float | None,
+    ) -> str:
+        builds.append(model_path)
+        return "engine"
+
+    monkeypatch.setattr(S3DramaEngineBuilder, "build", build)
+
+    with pytest.raises(ValueError, match="--tts_engine.gpu_memory_fraction"):
+        stages.create_tts_engine_executor(
+            "checkpoint",
+            gpu_id=0,
+            total_gpu_memory_fraction=0.7,
+            server_args_overrides={"mem_fraction_static": 0.5},
+        )
+
+    assert builds == []
 
 
 def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(

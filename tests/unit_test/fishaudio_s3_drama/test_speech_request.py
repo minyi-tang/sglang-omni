@@ -621,6 +621,32 @@ def test_undecodable_reference_audio_is_a_bad_request(tokenizer: Tokenizer) -> N
     assert message.startswith("S3-drama request: references.0:")
 
 
+def test_a_reference_longer_than_the_limit_is_a_bad_request(
+    tokenizer: Tokenizer,
+) -> None:
+    hook = FishReferenceEncodeHook(
+        codec=SimpleNamespace(sample_rate=DEFAULT_SAMPLE_RATE),
+        checkpoint_id="codec.pth",
+        max_reference_audio_seconds=1.0,
+    )
+    reference_data = base64.b64encode(REFERENCE_WAV).decode("ascii")
+
+    message = refused(
+        speech_preprocessor(tokenizer, encode_hook=hook),
+        lowered(
+            {
+                "input": "hello",
+                "references": [{"data": reference_data, "media_type": "audio/wav"}],
+            }
+        ),
+    )
+
+    assert message == (
+        "S3-drama request: references.0: reference audio lasts 1.2 s, longer than "
+        "the 1 s limit; shorten it or raise max_reference_audio_seconds"
+    )
+
+
 def test_a_codec_failure_while_encoding_stays_an_internal_error(
     tokenizer: Tokenizer,
 ) -> None:

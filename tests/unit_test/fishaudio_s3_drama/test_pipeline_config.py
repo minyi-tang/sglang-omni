@@ -14,10 +14,12 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_CODEC_PATH,
     S3DramaEngineStageConfig,
     S3DramaPipelineConfig,
+    S3DramaPreprocessingStageConfig,
     S3DramaVocoderStageConfig,
 )
 from sglang_omni.serve.speech_errors import SpeechAPIError
 from sglang_omni.serve.speech_service import SpeechRequestValidator
+from tests.unit_test.pipeline.helpers import build_compiled_process_topology
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VOCODER_WINDOWS = {
@@ -40,12 +42,13 @@ def test_frames_stream_from_the_engine_to_the_vocoder_on_one_gpu() -> None:
     config = S3DramaPipelineConfig(model_path="checkpoint")
     preprocessing, tts_engine, vocoder = config.stages
 
+    assert isinstance(preprocessing, S3DramaPreprocessingStageConfig)
     assert (
         preprocessing.name,
         preprocessing.process,
         preprocessing.gpu,
         preprocessing.next,
-    ) == ("preprocessing", "preprocessing", None, "tts_engine")
+    ) == ("preprocessing", "preprocessing", 0, "tts_engine")
     assert isinstance(tts_engine, S3DramaEngineStageConfig)
     assert (
         tts_engine.name,
@@ -65,18 +68,40 @@ def test_frames_stream_from_the_engine_to_the_vocoder_on_one_gpu() -> None:
     assert config.supports_uploaded_voice_references()
 
 
+def test_every_process_on_the_shared_gpu_declares_its_memory() -> None:
+    config = S3DramaPipelineConfig(model_path="checkpoint")
+    preprocessing, tts_engine, vocoder = config.stages
+
+    topology = build_compiled_process_topology(config)
+
+    assert topology.stage_to_process == {
+        "preprocessing": "preprocessing",
+        "tts_engine": "pipeline",
+        "vocoder": "pipeline",
+    }
+    assert (preprocessing.total_reserve_bytes, preprocessing.enforce_total_reserve) == (
+        6 * 1024**3,
+        True,
+    )
+    assert (tts_engine.gpu_memory_fraction, vocoder.gpu_memory_fraction) == (0.70, 0.10)
+
+
 def test_each_factory_gets_the_defaults_written_once() -> None:
     config = S3DramaPipelineConfig(model_path="checkpoint")
 
     assert launch_kwargs(config, "preprocessing") == {
         "model_path": "checkpoint",
+        "gpu_id": 0,
         "max_concurrency": 8,
+        "reference_encode_dtype": "bfloat16",
+        "max_reference_audio_seconds": 60.0,
         "max_prompt_rows": 8192,
         "codec_path": DEFAULT_CODEC_PATH,
     }
     assert launch_kwargs(config, "tts_engine") == {
         "model_path": "checkpoint",
         "gpu_id": 0,
+        "total_gpu_memory_fraction": 0.70,
         "context_length": 16384,
         "max_running_requests": 16,
         "max_new_tokens": 2048,
@@ -100,7 +125,10 @@ def test_preprocessing_follows_the_engine_cap_and_the_vocoder_codec() -> None:
 
     assert launch_kwargs(config, "preprocessing") == {
         "model_path": "checkpoint",
+        "gpu_id": 0,
         "max_concurrency": 8,
+        "reference_encode_dtype": "bfloat16",
+        "max_reference_audio_seconds": 60.0,
         "max_prompt_rows": 4096,
         "codec_path": "local/codec.pth",
     }

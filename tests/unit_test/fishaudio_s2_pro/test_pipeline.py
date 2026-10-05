@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -1838,3 +1839,103 @@ def test_an_uploaded_reference_in_a_compressed_format_encodes(
     assert by_bytes.shape[0] == 1
     assert by_bytes.shape[1] >= WaveformBitsCodec.sample_rate
     assert torch.equal(by_base64, by_bytes)
+
+
+class EncodeConditionsCodec:
+    sample_rate: int = 44100
+
+    def __init__(self) -> None:
+        self.conditions: list[tuple[float, bool, torch.dtype]] = []
+
+    def encode(
+        self, audios: torch.Tensor, audio_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.conditions.append(
+            (
+                float(audios.abs().max()),
+                torch.is_autocast_enabled(audios.device.type),
+                torch.get_autocast_dtype(audios.device.type),
+            )
+        )
+        return torch.zeros((1, 10, 1), dtype=torch.long), audio_lengths
+
+
+def test_a_default_encode_keeps_the_waveform_and_full_precision() -> None:
+    codec = EncodeConditionsCodec()
+    hook = FishReferenceEncodeHook(codec=codec, checkpoint_id="codec")
+
+    hook.encode_reference_waveform(torch.full((1, 4410), 1.5), 44100)
+
+    assert [condition[:2] for condition in codec.conditions] == [(1.5, False)]
+
+
+def test_a_bfloat16_encode_clamps_the_waveform_and_runs_under_autocast() -> None:
+    codec = EncodeConditionsCodec()
+    hook = FishReferenceEncodeHook(
+        codec=codec, checkpoint_id="codec", autocast_dtype=torch.bfloat16
+    )
+
+    hook.encode_reference_waveform(torch.full((1, 4410), 1.5), 44100)
+
+    assert codec.conditions == [(1.0, True, torch.bfloat16)]
+
+
+class OverlapCountingCodec:
+    sample_rate: int = 44100
+
+    def __init__(self, all_inside: threading.Barrier | None) -> None:
+        self.all_inside = all_inside
+        self.lock = threading.Lock()
+        self.inside = 0
+        self.most_inside = 0
+
+    def encode(
+        self, audios: torch.Tensor, audio_lengths: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with self.lock:
+            self.inside += 1
+            self.most_inside = max(self.most_inside, self.inside)
+        if self.all_inside is not None:
+            self.all_inside.wait(timeout=5)
+        else:
+            time.sleep(0.05)
+        with self.lock:
+            self.inside -= 1
+        return torch.zeros((1, 10, 1), dtype=torch.long), audio_lengths
+
+
+def encode_from_threads(hook: FishReferenceEncodeHook, thread_count: int) -> None:
+    threads = [
+        threading.Thread(
+            target=hook.encode_reference_waveform,
+            args=(torch.zeros((1, 441)), 44100),
+        )
+        for _ in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+
+def test_encodes_on_the_cpu_run_concurrently() -> None:
+    codec = OverlapCountingCodec(threading.Barrier(4))
+    hook = FishReferenceEncodeHook(codec=codec, checkpoint_id="codec")
+
+    encode_from_threads(hook, 4)
+
+    assert codec.most_inside == 4
+
+
+@pytest.mark.accelerator
+def test_encodes_on_a_gpu_run_one_at_a_time() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    codec = OverlapCountingCodec(None)
+    hook = FishReferenceEncodeHook(codec=codec, checkpoint_id="codec", device="cuda")
+
+    encode_from_threads(hook, 4)
+
+    assert codec.most_inside == 1

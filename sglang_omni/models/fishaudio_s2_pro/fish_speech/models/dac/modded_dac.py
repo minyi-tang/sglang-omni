@@ -123,9 +123,6 @@ class Transformer(nn.Module):
         else:
             self.register_buffer("freqs_cis", None)
 
-        causal_mask = torch.tril(torch.ones(32768, 32768, dtype=torch.bool))
-        self.register_buffer("causal_mask", causal_mask, persistent=False)
-
         self.max_batch_size = -1
         self.max_seq_length = -1
         self.use_kv_cache = False
@@ -155,8 +152,8 @@ class Transformer(nn.Module):
     def forward(
         self,
         x: Tensor,
-        input_pos: Optional[Tensor] = None,
-        mask: Optional[Tensor] = None,
+        input_pos: Tensor,
+        mask: Tensor,
     ) -> Tensor:
         if self.config.pos_embed_type == "rope":
             assert (
@@ -166,16 +163,6 @@ class Transformer(nn.Module):
             freqs_cis = self.freqs_cis[input_pos]
         else:
             freqs_cis = None
-
-        if mask is None:  # in case of non-causal model
-            if not self.training and self.use_kv_cache:
-                mask = self.causal_mask[None, None, input_pos]
-                mask = mask[..., : input_pos.max() + 1]
-            else:
-                mask = self.causal_mask[None, None, input_pos]
-                mask = mask[..., input_pos]
-        else:
-            pass
 
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)

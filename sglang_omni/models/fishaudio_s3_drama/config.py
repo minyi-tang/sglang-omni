@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from pydantic import Field, PositiveInt
 
@@ -23,6 +23,21 @@ DEFAULT_MAX_NEW_TOKENS_CAP = 2048
 DEFAULT_MAX_PROMPT_ROWS = 8192
 # The codec of the public S2-Pro release, pinned to an immutable commit.
 DEFAULT_CODEC_PATH = "fishaudio/s2-pro@1de9996b6be38b745688de084d87a5633f714e4e"
+PREPROCESSING_TOTAL_RESERVE_BYTES = "6GiB"
+TTS_ENGINE_GPU_MEMORY_FRACTION = 0.70
+VOCODER_GPU_MEMORY_FRACTION = 0.10
+
+
+class S3DramaPreprocessingFactoryArgs(FactoryArgs):
+    max_concurrency: int = Field(default=8, ge=1)
+    reference_encode_dtype: Literal["float32", "bfloat16"] = "bfloat16"
+    max_reference_audio_seconds: float = Field(default=60.0, gt=0)
+
+
+class S3DramaPreprocessingStageConfig(StageConfig):
+    factory: S3DramaPreprocessingFactoryArgs = Field(
+        default_factory=S3DramaPreprocessingFactoryArgs
+    )
 
 
 class S3DramaEngineFactoryArgs(FactoryArgs):
@@ -88,17 +103,19 @@ class S3DramaPipelineConfig(PipelineConfig):
         }
     )
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        "preprocessing": S3DramaPreprocessingStageConfig,
         "tts_engine": S3DramaEngineStageConfig,
         "vocoder": S3DramaVocoderStageConfig,
     }
 
     model_path: str
     stages: list[StageConfig] = [
-        StageConfig(
+        S3DramaPreprocessingStageConfig(
             name="preprocessing",
             process="preprocessing",
             factory_path=f"{PACKAGE}.stages.create_preprocessing_executor",
-            factory=FactoryArgs(max_concurrency=8),
+            gpu=0,
+            total_reserve_bytes=PREPROCESSING_TOTAL_RESERVE_BYTES,
             next="tts_engine",
         ),
         S3DramaEngineStageConfig(
@@ -106,6 +123,7 @@ class S3DramaPipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{PACKAGE}.stages.create_tts_engine_executor",
             gpu=0,
+            gpu_memory_fraction=TTS_ENGINE_GPU_MEMORY_FRACTION,
             next="vocoder",
             stream_to=["vocoder"],
         ),
@@ -114,6 +132,7 @@ class S3DramaPipelineConfig(PipelineConfig):
             process="pipeline",
             factory_path=f"{PACKAGE}.stages.create_vocoder_executor",
             gpu=0,
+            gpu_memory_fraction=VOCODER_GPU_MEMORY_FRACTION,
             terminal=True,
             can_accept_stream_before_payload=True,
         ),
