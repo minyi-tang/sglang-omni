@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import importlib
 import inspect
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,6 +38,12 @@ def iter_stages():
         for label, config_cls in topologies.items():
             for stage in config_cls(model_path="unused").stages:
                 yield model, label, stage
+
+
+def pipeline_wiring(model: str, label: str, stage_name: str) -> Mapping[str, object]:
+    module = importlib.import_module(f"sglang_omni.models.{model}.config")
+    config_cls = module.EntryClass if label == "default" else module.Variants[label]
+    return config_cls(model_path="unused").stage_factory_kwargs(stage_name)
 
 
 # note (lennox): only device/gpu_id are asserted on below, but a non-literal
@@ -197,7 +204,10 @@ def test_gpu_stage_factories_forward_gpu_id_into_device_spec_resolution(
     kwargs: dict[str, object] = {"device": None, "gpu_id": 2}
     if "model_path" in parameters:
         kwargs["model_path"] = "unused"
-    configured = stage.factory.model_dump()
+    configured = {
+        **stage.factory.model_dump(),
+        **pipeline_wiring(model, label, stage.name),
+    }
     for name, default in parameters.items():
         if default is ... and name not in kwargs and name in configured:
             kwargs[name] = configured[name]
