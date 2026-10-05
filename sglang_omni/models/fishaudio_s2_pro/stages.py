@@ -6,6 +6,7 @@ Each factory returns a callable (for SimpleScheduler) or an OmniScheduler.
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import time
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.payload_types import S2ProState
+from sglang_omni.preprocessing.audio import decode_audio_bytes_av, parse_wav_bytes
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
@@ -28,6 +30,7 @@ from sglang_omni.scheduling.reference_encoder import (
     ReferenceEncodeService,
     TensorReferenceEncodeHook,
 )
+from sglang_omni.utils.audio import load_audio
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 if TYPE_CHECKING:
@@ -254,8 +257,6 @@ class FishReferenceEncodeHook(TensorReferenceEncodeHook[FishReferenceInput]):
 
     def encode_one(self, item: FishReferenceInput) -> torch.Tensor:
         if item.source_kind == "path":
-            from sglang_omni.utils.audio import load_audio
-
             audio = load_audio(
                 str(item.source),
                 target_sample_rate=int(self.codec.sample_rate),
@@ -268,17 +269,18 @@ class FishReferenceEncodeHook(TensorReferenceEncodeHook[FishReferenceInput]):
         else:
             pass
         if item.source_kind in ("bytes", "base64"):
-            from sglang_omni.preprocessing.audio import AudioMediaIO
-
-            audio_io = AudioMediaIO(target_sr=self.codec.sample_rate)
             if item.source_kind == "bytes":
-                audio, sr = audio_io.load_bytes(item.source)
+                assert isinstance(item.source, bytes)
+                audio_bytes = item.source
             else:
-                audio, sr = audio_io.load_base64(
-                    item.media_type or "audio/wav", item.source
-                )
+                assert isinstance(item.source, str)
+                audio_bytes = base64.b64decode(item.source)
+            try:
+                audio, sample_rate = parse_wav_bytes(audio_bytes, source="bytes")
+            except ValueError:
+                audio, sample_rate = decode_audio_bytes_av(audio_bytes)
             audio_tensor = torch.from_numpy(audio).float().reshape(1, -1)
-            return self.encode_reference_waveform(audio_tensor, int(sr))
+            return self.encode_reference_waveform(audio_tensor, sample_rate)
         else:
             pass
         raise TypeError(f"unknown FishAudio reference source: {item.source_kind}")
