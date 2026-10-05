@@ -74,11 +74,16 @@ EXPERT_CHECKPOINT_PREFIX = "model.language_model.layers"
 ACTIVATION_AMAX_FLOOR = 1e-10
 DIVIDE_BLOCK_SIZE = 1024
 # Measured on this fixture (one calibration run), twice the maximum: per-row
-# relative error of the block-fp8 MoE kernel against this emulation, and of the
-# emulation against the dequantized weights, on the torch backbone's
-# routed-expert inputs.
-MOE_KERNEL_TOLERANCE = 1.65e-3
+# relative error of the emulation against the dequantized weights, on the torch
+# backbone's routed-expert inputs.
 MOE_ACTIVATION_TOLERANCE = 0.139
+# note (SunskyXH): Triton accumulates fp8 dot products inexactly on sm_90, so some
+# fp8 steps land off this emulation. Bounds are about twice the H200 maxima: 3.5e-2
+# for a row, 2.8e-3 for the median row of a layer over the run or of a call of at
+# least MEDIAN_MINIMUM_ROWS rows (fewer rows leave a median at hardware noise).
+MOE_KERNEL_TOLERANCE = 7.1e-2
+MOE_KERNEL_MEDIAN_TOLERANCE = 5.5e-3
+MEDIAN_MINIMUM_ROWS = 32
 # Same run, twice the torch backbone's fp8-emulated vs dequantized deviation on
 # shared greedy histories: prompt-row hidden mean, then the semantic band and
 # each head's logits over every decision row.
@@ -264,7 +269,8 @@ def quantized_activations(
     """e4m3 values and fp32 dequant multipliers per row and 128 columns, as the kernel.
 
     A row of exactly 128 columns goes to the per-token kernel, which divides the
-    other way round; the group kernel is built with --use_fast_math.
+    other way round (on sm_90 its scale is amax * (1 / 448), within the bounds);
+    the group kernel is built with --use_fast_math.
     """
     row_count, column_count = activations.shape
     groups = activations.float().reshape(
@@ -364,6 +370,8 @@ class MoeCallCheck:
     problems: list[str]
     checked_call_count: int
     largest_kernel_error: float
+    largest_layer_median_error: float
+    largest_call_median_error: float
     largest_activation_error: float
 
 
@@ -373,12 +381,16 @@ def moe_call_check(
     """Routed-expert calls against the fp8 emulation and the dequantized weights.
 
     A forward must hold one call per MoE layer over all of its rows; a missing,
-    repeated or misshapen call, or a non-finite value, is a problem.
+    repeated or misshapen call, a non-finite value, or too far a median row from
+    the emulation, for a layer over the run or a call of MEDIAN_MINIMUM_ROWS rows
+    or more, is a problem.
     """
     problems = []
     checked_call_count = 0
     largest_kernel_error = 0.0
+    largest_call_median_error = 0.0
     largest_activation_error = 0.0
+    layer_row_errors: dict[int, list[torch.Tensor]] = {}
     for forward in run.forwards:
         row_count = sum(len(step.positions) for step in forward.steps)
         layer_indices = sorted(call.layer_index for call in forward.moe_calls)
@@ -425,7 +437,26 @@ def moe_call_check(
                 reference = routed_expert_output(
                     call, weights, quantizes_activations=quantizes_activations
                 )
-                error = row_relative_errors(call.output, reference).max().item()
+                row_errors = row_relative_errors(call.output, reference)
+                error = row_errors.max().item()
+                if quantizes_activations:
+                    layer_row_errors.setdefault(call.layer_index, []).append(row_errors)
+                else:
+                    pass
+                if quantizes_activations and row_count >= MEDIAN_MINIMUM_ROWS:
+                    median_error = row_errors.median().item()
+                    largest_call_median_error = max(
+                        largest_call_median_error, median_error
+                    )
+                    if not median_error <= MOE_KERNEL_MEDIAN_TOLERANCE:
+                        problems.append(
+                            f"{location}: the median row is {median_error:.2e} off "
+                            f"{reference_name} (relative)"
+                        )
+                    else:
+                        pass
+                else:
+                    pass
                 # Written this way round, a NaN error fails too.
                 if not error <= tolerance:
                     problems.append(
@@ -437,10 +468,23 @@ def moe_call_check(
                 else:
                     largest_activation_error = max(largest_activation_error, error)
             checked_call_count += 1
+    largest_layer_median_error = 0.0
+    for layer_index, row_errors in sorted(layer_row_errors.items()):
+        median_error = torch.cat(row_errors).median().item()
+        largest_layer_median_error = max(largest_layer_median_error, median_error)
+        if not median_error <= MOE_KERNEL_MEDIAN_TOLERANCE:
+            problems.append(
+                f"layer {layer_index}: the median row over the run is "
+                f"{median_error:.2e} off the fp8 emulation (relative)"
+            )
+        else:
+            pass
     return MoeCallCheck(
         problems=problems,
         checked_call_count=checked_call_count,
         largest_kernel_error=largest_kernel_error,
+        largest_layer_median_error=largest_layer_median_error,
+        largest_call_median_error=largest_call_median_error,
         largest_activation_error=largest_activation_error,
     )
 
@@ -537,7 +581,10 @@ def test_every_routed_expert_call_matches_the_fp8_emulation(
     print(
         f"{check.checked_call_count} routed-expert calls; largest row error "
         f"{check.largest_kernel_error:.2e} off the fp8 emulation "
-        f"(tolerance {MOE_KERNEL_TOLERANCE:.2e}), "
+        f"(tolerance {MOE_KERNEL_TOLERANCE:.2e}), largest median row "
+        f"{check.largest_layer_median_error:.2e} per layer and "
+        f"{check.largest_call_median_error:.2e} per call of at least "
+        f"{MEDIAN_MINIMUM_ROWS} rows (tolerance {MOE_KERNEL_MEDIAN_TOLERANCE:.2e}), "
         f"{check.largest_activation_error:.2e} off the dequantized weights "
         f"(tolerance {MOE_ACTIVATION_TOLERANCE:.2e})"
     )
@@ -546,37 +593,98 @@ def test_every_routed_expert_call_matches_the_fp8_emulation(
     assert check.checked_call_count == len(run.forwards) * len(MOE_LAYER_INDICES)
 
 
-def test_moe_call_check_rejects_missing_repeated_or_non_finite_calls(
+def test_moe_call_check_rejects_missing_repeated_non_finite_or_unquantized_calls(
     fp8_engine_runs: Fp8EngineRuns, weights_by_layer: dict[int, ExpertWeights]
 ) -> None:
     run = fp8_engine_runs.fp8
-    forward = next(forward for forward in run.forwards if forward.is_extend)
-    first_call = forward.moe_calls[0]
+    # Its calls have enough rows for the per-call median check.
+    largest_prefill = max(
+        (forward for forward in run.forwards if forward.is_extend),
+        key=lambda forward: sum(len(step.positions) for step in forward.steps),
+    )
+    unquantized_layer_index = 1
+    first_call = largest_prefill.moe_calls[0]
     broken_output = first_call.output.clone()
     broken_output[0, 0] = float("nan")
 
-    def with_calls(calls: list[MoeCall]) -> EngineRun:
-        return replace(run, forwards=[replace(forward, moe_calls=calls)])
+    def unquantized(call: MoeCall) -> MoeCall:
+        return replace(
+            call,
+            output=routed_expert_output(
+                call, weights_by_layer[call.layer_index], quantizes_activations=False
+            ),
+        )
 
-    assert (
-        moe_call_check(with_calls(forward.moe_calls), weights_by_layer).problems == []
+    def with_calls(calls: list[MoeCall]) -> EngineRun:
+        return replace(run, forwards=[replace(largest_prefill, moe_calls=calls)])
+
+    one_layer_unquantized = replace(
+        run,
+        forwards=[
+            replace(
+                forward,
+                moe_calls=[
+                    (
+                        unquantized(call)
+                        if call.layer_index == unquantized_layer_index
+                        else call
+                    )
+                    for call in forward.moe_calls
+                ],
+            )
+            for forward in run.forwards
+        ],
     )
-    for calls, error in (
-        (forward.moe_calls[1:], "routed-expert calls for layers"),
-        ([*forward.moe_calls, first_call], "routed-expert calls for layers"),
+    largest_prefill_unquantized = replace(
+        run,
+        forwards=[
+            (
+                replace(
+                    forward,
+                    moe_calls=[unquantized(call) for call in forward.moe_calls],
+                )
+                if forward is largest_prefill
+                else forward
+            )
+            for forward in run.forwards
+        ],
+    )
+
+    assert moe_call_check(run, weights_by_layer).problems == []
+    for checked_run, error in (
+        (with_calls(largest_prefill.moe_calls[1:]), "routed-expert calls for layers"),
         (
-            [replace(first_call, output=broken_output), *forward.moe_calls[1:]],
+            with_calls([*largest_prefill.moe_calls, first_call]),
+            "routed-expert calls for layers",
+        ),
+        (
+            with_calls(
+                [
+                    replace(first_call, output=broken_output),
+                    *largest_prefill.moe_calls[1:],
+                ]
+            ),
             "non-finite",
         ),
         (
-            [
-                replace(first_call, output=first_call.output[:-1]),
-                *forward.moe_calls[1:],
-            ],
+            with_calls(
+                [
+                    replace(first_call, output=first_call.output[:-1]),
+                    *largest_prefill.moe_calls[1:],
+                ]
+            ),
             "shapes",
         ),
+        (
+            one_layer_unquantized,
+            f"layer {unquantized_layer_index}: the median row over the run",
+        ),
+        (
+            largest_prefill_unquantized,
+            f"forward {largest_prefill.forward_index} layer 0: the median row",
+        ),
     ):
-        problems = moe_call_check(with_calls(calls), weights_by_layer).problems
+        problems = moe_call_check(checked_run, weights_by_layer).problems
         assert any(error in problem for problem in problems), problems
 
 
