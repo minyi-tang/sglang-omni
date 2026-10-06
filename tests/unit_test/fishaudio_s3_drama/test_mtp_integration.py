@@ -1100,7 +1100,19 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     assert server_args.chunked_prefill_size == -1
     assert not server_args.disable_cuda_graph
     assert graph_config.decode.backend == CudaGraphBackend.FULL
+    assert graph_config.prefill.backend == CudaGraphBackend.BREAKABLE
+    assert max(graph_config.prefill.bs) == PREFILL_CUDA_GRAPH_MAX_TOKENS
+
+
+def test_engine_runs_its_prefill_eager_when_asked(tmp_path: Path) -> None:
+    builder, server_args = engine_server_args(
+        tmp_path, {"cuda_graph_backend_prefill": "disabled"}
+    )
+
+    builder.validate_before_infrastructure(server_args)
+    graph_config = resolved_view(server_args).cuda_graph_config
     assert graph_config.prefill.backend == CudaGraphBackend.DISABLED
+    assert graph_config.decode.backend == CudaGraphBackend.FULL
 
 
 @pytest.mark.parametrize(
@@ -1132,6 +1144,9 @@ def test_engine_also_runs_without_cuda_graphs(tmp_path: Path) -> None:
 
     builder.validate_before_infrastructure(server_args)
     assert resolved_view(server_args).cuda_graph_config.decode.backend == (
+        CudaGraphBackend.DISABLED
+    )
+    assert resolved_view(server_args).cuda_graph_config.prefill.backend == (
         CudaGraphBackend.DISABLED
     )
 

@@ -376,7 +376,9 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
     builder = GraphRecordingEngineBuilder(spec=spec)
     if spec.kind == "eager":
         scheduler = builder.build(
-            spec.model_dir, dtype="bfloat16", server_args_overrides={}
+            spec.model_dir,
+            dtype="bfloat16",
+            server_args_overrides={"cuda_graph_backend_prefill": "disabled"},
         )
     elif spec.kind == "graph":
         scheduler = builder.build(
@@ -385,6 +387,7 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
             server_args_overrides={
                 "cuda_graph_bs": CUDA_GRAPH_BATCH_SIZES,
                 "cuda_graph_max_bs": max(CUDA_GRAPH_BATCH_SIZES),
+                "cuda_graph_backend_prefill": "disabled",
             },
         )
     else:

@@ -51,8 +51,8 @@ PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
-    """Single-GPU engine replaying decode CUDA graphs over an eager prefill; no radix,
-    chunked prefill or overlap."""
+    """Single-GPU engine replaying decode CUDA graphs; no radix, chunked prefill or
+    overlap."""
 
     model_name = "FishAudio S3-drama"
     supports_breakable_prefill_cuda_graph = (
@@ -86,7 +86,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         return {
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": False,
-            "cuda_graph_backend_prefill": CudaGraphBackend.DISABLED,
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
             "cuda_graph_max_bs_prefill": PREFILL_CUDA_GRAPH_MAX_TOKENS,
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
