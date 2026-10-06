@@ -12,6 +12,10 @@ from sglang.srt.server_args import ServerArgs
 from transformers import AutoConfig
 
 from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.request_id_prefill_cuda_graph_runner import (
+    RequestIdPrefillCudaGraphRunner,
+)
+from sglang_omni.models.fishaudio_s3_drama import CAPABILITIES
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
@@ -43,6 +47,7 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint
 FISH_OMNI_ARCHITECTURE = "FishOmniModel"
 # The tower re-plans this backend's metadata for its first frame.
 ATTENTION_BACKEND = "triton"
+PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
@@ -50,6 +55,9 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     chunked prefill or overlap."""
 
     model_name = "FishAudio S3-drama"
+    supports_breakable_prefill_cuda_graph = (
+        CAPABILITIES.supports_breakable_prefill_cuda_graph
+    )
 
     def __init__(
         self,
@@ -79,6 +87,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": False,
             "cuda_graph_backend_prefill": CudaGraphBackend.DISABLED,
+            "cuda_graph_max_bs_prefill": PREFILL_CUDA_GRAPH_MAX_TOKENS,
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
             "enable_mixed_chunk": False,
@@ -110,9 +119,12 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             )
         elif not server_args.disable_overlap_schedule:
             raise ValueError("S3-drama runs without overlap scheduling")
-        elif graph_config.prefill.backend != CudaGraphBackend.DISABLED:
+        elif graph_config.prefill.backend not in (
+            CudaGraphBackend.BREAKABLE,
+            CudaGraphBackend.DISABLED,
+        ):
             raise ValueError(
-                f"S3-drama prefill runs eager; got the "
+                f"S3-drama prefill runs eager or as a breakable CUDA graph; got the "
                 f"{graph_config.prefill.backend!r} prefill CUDA graph backend"
             )
         elif graph_config.decode.backend not in (
@@ -165,6 +177,8 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             frame_width=1 + model.config.audio_decoder_config.num_codebooks,
             device=torch.device(device),
         )
+        sglang_runner.extra_prefill_graph_attention_layers = list(model.tower_attention)
+        sglang_runner.prefill_graph_runner_class = RequestIdPrefillCudaGraphRunner
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor

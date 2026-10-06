@@ -22,6 +22,8 @@ from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
 
 # Batch sizes 3, 5, 6 and 7 replay a graph padded to 4 or 8.
 CUDA_GRAPH_BATCH_SIZES = [1, 2, 4, 8]
+PREFILL_CUDA_GRAPH_TOKEN_COUNTS = [8, 32, 64, 128, 192]
+PREFILL_CUDA_GRAPH_PADDING_FACTOR = 2
 # Enough for every wave to prefill in one batch.
 MAX_PREFILL_TOKENS = 4096
 RANDOM_SEED = 20261003
@@ -31,7 +33,7 @@ INTEGER_DTYPES = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64
 # greedy: top_k 1 and every RAS window emptied before the model reads it, so a
 # padded batch samples like an unpadded one; random: the request's own knobs.
 SamplingMode = Literal["greedy", "random"]
-EngineKind = Literal["eager", "graph"]
+EngineKind = Literal["eager", "graph", "prefill_graph"]
 
 
 def bits(tensor: torch.Tensor) -> torch.Tensor:
@@ -108,8 +110,11 @@ class GraphForwardRecord:
     is_extend: bool
     is_graph_replay: bool
     graph_batch_size: int | None
+    token_count: int
+    prefill_replay_count: int
+    prefill_eager_count: int
+    prefill_replay_buckets: dict[int, int]
     steps: list[GraphRequestStep]
-    # Pool slots a decode forward changed outside its batch's own (and slot 0).
     stray_kv_slots: list[int]
     stray_mamba_slots: list[int]
 
@@ -126,6 +131,9 @@ class ExpertPath:
 class GraphEngineFacts:
     decode_graph_batch_sizes: list[int] | None
     prefill_runner: str
+    prefill_capture_token_counts: list[int] | None
+    recorded_kv_layer_ids: list[int]
+    tower_layer_ids: list[int]
     decode_buffer_rows: int
     request_pool_size: int
     kv_pool_size: int
@@ -247,6 +255,22 @@ GREEDY_RETRACT = GraphScenario(
         ]
     ],
 )
-MAIN_SCENARIOS = [RANDOM_WAVES, GREEDY_SINGLE, GREEDY_STAGGERED, GREEDY_ABORT_REUSE]
+GREEDY_LONG_WAVE = GraphScenario(
+    name="greedy_long_wave",
+    sampling_mode="greedy",
+    waves=[
+        [
+            GraphRequestSpec(prompt_name=prompt_name, max_new_tokens=8)
+            for prompt_name in ["a100", "b100"]
+        ]
+    ],
+)
+MAIN_SCENARIOS = [
+    RANDOM_WAVES,
+    GREEDY_SINGLE,
+    GREEDY_STAGGERED,
+    GREEDY_ABORT_REUSE,
+    GREEDY_LONG_WAVE,
+]
 FP8_SCENARIOS = [GREEDY_SINGLE, GREEDY_STAGGERED]
 RETRACT_SCENARIOS = [GREEDY_RETRACT]

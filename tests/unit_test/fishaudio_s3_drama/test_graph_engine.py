@@ -21,6 +21,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     finite_problems,
     history_problems,
     outcome_problems,
+    prefill_path_problems,
     prompt_row_counts,
     replay_problems,
     resampled_choice_count,
@@ -33,6 +34,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     FP8_SCENARIOS,
     GREEDY_ABORT_REUSE,
     MAIN_SCENARIOS,
+    PREFILL_CUDA_GRAPH_TOKEN_COUNTS,
     RANDOM_WAVES,
     RETRACT_INTERVAL,
     RETRACT_SCENARIOS,
@@ -76,6 +78,9 @@ class GraphEngineRuns:
     main: EnginePair
     fp8: EnginePair
     retract: EnginePair
+    prefill_main: EnginePair
+    prefill_fp8: EnginePair
+    prefill_retract: EnginePair
     workdir: Path
 
 
@@ -126,18 +131,23 @@ def run_engine(
     return run
 
 
-def engine_pair(
+def engine_pairs(
     name: str,
     model_dir: Path,
     scenarios: list[GraphScenario],
     workdir: Path,
     extra_environment: dict[str, str],
-) -> EnginePair:
+) -> tuple[EnginePair, EnginePair]:
     runs: dict[EngineKind, GraphEngineRun] = {}
-    for kind in ("eager", "graph"):
+    for kind in ("eager", "graph", "prefill_graph"):
         spec = GraphEngineSpec(model_dir=str(model_dir), kind=kind, scenarios=scenarios)
         runs[kind] = run_engine(f"{name}-{kind}", spec, workdir, extra_environment)
-    return EnginePair(eager=runs["eager"], graph=runs["graph"], scenarios=scenarios)
+    return (
+        EnginePair(eager=runs["eager"], graph=runs["graph"], scenarios=scenarios),
+        EnginePair(
+            eager=runs["eager"], graph=runs["prefill_graph"], scenarios=scenarios
+        ),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -150,12 +160,22 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
     fp8_checkpoint_dir = workdir / "checkpoint-fp8"
     write_expert_variant(checkpoint_dir, fp8_checkpoint_dir, "fp8")
     # Serial on purpose: each engine owns its process and its share of the GPU.
+    main, prefill_main = engine_pairs(
+        "main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}
+    )
+    fp8, prefill_fp8 = engine_pairs(
+        "fp8", fp8_checkpoint_dir, FP8_SCENARIOS, workdir, {}
+    )
+    retract, prefill_retract = engine_pairs(
+        "retract", checkpoint_dir, RETRACT_SCENARIOS, workdir, RETRACT_ENVIRONMENT
+    )
     runs = GraphEngineRuns(
-        main=engine_pair("main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}),
-        fp8=engine_pair("fp8", fp8_checkpoint_dir, FP8_SCENARIOS, workdir, {}),
-        retract=engine_pair(
-            "retract", checkpoint_dir, RETRACT_SCENARIOS, workdir, RETRACT_ENVIRONMENT
-        ),
+        main=main,
+        fp8=fp8,
+        retract=retract,
+        prefill_main=prefill_main,
+        prefill_fp8=prefill_fp8,
+        prefill_retract=prefill_retract,
         workdir=workdir,
     )
     print(f"Artifacts: {workdir}")
@@ -167,6 +187,9 @@ def all_pairs(engine_runs: GraphEngineRuns) -> dict[str, EnginePair]:
         "main": engine_runs.main,
         "fp8": engine_runs.fp8,
         "retract": engine_runs.retract,
+        "prefill main": engine_runs.prefill_main,
+        "prefill fp8": engine_runs.prefill_fp8,
+        "prefill retract": engine_runs.prefill_retract,
     }
 
 
@@ -180,8 +203,19 @@ def test_engines_start_as_specified(engine_runs: GraphEngineRuns) -> None:
         graph_facts = pair.graph.facts
         assert eager_facts.decode_graph_batch_sizes is None, name
         assert graph_facts.decode_graph_batch_sizes == CUDA_GRAPH_BATCH_SIZES, name
+        assert eager_facts.prefill_runner == "EagerRunner", name
+        assert eager_facts.prefill_capture_token_counts is None, name
+        if pair.graph.kind == "prefill_graph":
+            assert graph_facts.prefill_runner == "RequestIdPrefillCudaGraphRunner", name
+            assert (
+                graph_facts.prefill_capture_token_counts
+                == PREFILL_CUDA_GRAPH_TOKEN_COUNTS
+            ), name
+        else:
+            assert graph_facts.prefill_runner == "EagerRunner", name
+            assert graph_facts.prefill_capture_token_counts is None, name
         for facts in (eager_facts, graph_facts):
-            assert facts.prefill_runner == "EagerRunner", name
+            assert set(facts.tower_layer_ids) <= set(facts.recorded_kv_layer_ids), name
             assert facts.decode_buffer_rows >= facts.request_pool_size, name
             assert facts.decode_buffer_rows >= max(CUDA_GRAPH_BATCH_SIZES), name
         # The split count saturating at its cap keeps padding out of the split.
@@ -223,20 +257,134 @@ def test_graph_engine_replays_every_decode_padded_and_unpadded(
     replayed_sizes = {
         len(record.steps)
         for record in engine_runs.main.graph.forwards
-        if record.is_graph_replay
+        if record.is_graph_replay and not record.is_extend
     }
     assert replayed_sizes == set(range(1, 9))
     # Random sampling is compared only where both engines draw the same shapes.
     assert all(
         record.graph_batch_size == len(record.steps)
         for record in engine_runs.main.graph.forwards
-        if record.scenario_name == RANDOM_WAVES.name and record.is_graph_replay
+        if record.scenario_name == RANDOM_WAVES.name
+        and record.is_graph_replay
+        and not record.is_extend
     )
     assert PADDED_BATCH_SIZES <= {
         len(record.steps)
         for record in engine_runs.fp8.graph.forwards
-        if record.is_graph_replay
+        if record.is_graph_replay and not record.is_extend
     }
+
+
+def test_each_prefill_replays_its_bucket_or_runs_eager(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = prefill_path_problems(run)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+
+
+def test_prefill_graph_replays_every_admissible_shape(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    run = engine_runs.prefill_main.graph
+    extends = [record for record in run.forwards if record.is_extend]
+    replays = [record for record in extends if record.is_graph_replay]
+    replayed_buckets = [
+        bucket for record in replays for bucket in record.prefill_replay_buckets
+    ]
+    assert extends[0].is_graph_replay
+    assert any(
+        record.token_count in PREFILL_CUDA_GRAPH_TOKEN_COUNTS for record in replays
+    )
+    assert any(
+        record.token_count not in PREFILL_CUDA_GRAPH_TOKEN_COUNTS for record in replays
+    )
+    assert any(len(record.steps) > 1 for record in replays)
+    assert any(
+        later < earlier
+        for earlier, later in zip(replayed_buckets, replayed_buckets[1:])
+    )
+    assert any(
+        record.token_count > max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS)
+        for record in extends
+        if not record.is_graph_replay
+    )
+    assert any(
+        record.token_count <= max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS)
+        for record in extends
+        if not record.is_graph_replay
+    )
+
+
+def test_prefill_graph_replays_beside_live_requests(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    run = engine_runs.prefill_retract.graph
+    decode_forwards: dict[str, list[int]] = {}
+    for record in run.forwards:
+        for step in record.steps:
+            if not record.is_extend:
+                decode_forwards.setdefault(step.request_id, []).append(
+                    record.forward_index
+                )
+            else:
+                pass
+    replays_beside_live_requests = [
+        record
+        for record in run.forwards
+        if record.is_extend
+        and record.is_graph_replay
+        and any(
+            min(forward_indices) < record.forward_index < max(forward_indices)
+            for request_id, forward_indices in decode_forwards.items()
+            if request_id not in {step.request_id for step in record.steps}
+        )
+    ]
+    assert replays_beside_live_requests
+
+
+def with_record(run: GraphEngineRun, record: GraphForwardRecord) -> GraphEngineRun:
+    forwards = list(run.forwards)
+    forwards[record.forward_index] = record
+    return replace(run, forwards=forwards)
+
+
+def test_prefill_checks_catch_a_changed_record(engine_runs: GraphEngineRuns) -> None:
+    run = engine_runs.prefill_main.graph
+    replayed = next(
+        record for record in run.forwards if record.is_extend and record.is_graph_replay
+    )
+    fallen_back = next(
+        record
+        for record in run.forwards
+        if record.is_extend and not record.is_graph_replay
+    )
+    for changed in (
+        replace(
+            replayed,
+            prefill_replay_buckets={
+                2 * bucket: count
+                for bucket, count in replayed.prefill_replay_buckets.items()
+            },
+        ),
+        replace(
+            replayed,
+            prefill_replay_count=0,
+            prefill_eager_count=1,
+            prefill_replay_buckets={},
+        ),
+        replace(replayed, is_graph_replay=False),
+        replace(fallen_back, prefill_replay_count=1, prefill_eager_count=0),
+    ):
+        problems = prefill_path_problems(with_record(run, changed))
+        assert len(problems) == 1, problems
+    for changed in (
+        replace(replayed, stray_kv_slots=[0]),
+        replace(replayed, stray_mamba_slots=[replayed.steps[0].mamba_slot + 1]),
+    ):
+        problems = stray_write_problems(with_record(run, changed))
+        assert len(problems) == 1, problems
 
 
 def test_inputs_the_model_read_follow_each_history(
@@ -282,12 +430,13 @@ def test_every_request_finishes_once_and_pools_return(
             assert not problems, f"{name}:\n{first_problems(problems)}"
 
 
+@pytest.mark.parametrize("pair_name", ["main", "prefill main"])
 def test_rows_and_states_an_abort_freed_serve_the_next_wave(
-    engine_runs: GraphEngineRuns,
+    engine_runs: GraphEngineRuns, pair_name: str
 ) -> None:
     """The aborted request's row and state slot are reused by the next wave, whose
     key/value slots were written before; freed KV slots queue behind free ones."""
-    run = engine_runs.main.graph
+    run = all_pairs(engine_runs)[pair_name].graph
     aborted = [
         outcome for outcome in run.outcomes.values() if outcome.aborted_after_frames
     ]
@@ -326,6 +475,10 @@ def test_rows_and_states_an_abort_freed_serve_the_next_wave(
     }
     later_slots = {slot for step in later_steps for slot in step.written_slots}
     assert earlier_slots & later_slots
+    assert run.forwards[first_later_forward].is_extend
+    assert run.forwards[first_later_forward].is_graph_replay == (
+        run.kind == "prefill_graph"
+    )
 
 
 def test_retracted_requests_reprefill_their_history_between_replays(
@@ -346,6 +499,7 @@ def test_retracted_requests_reprefill_their_history_between_replays(
             record.forward_index < forward_index
             for record in run.forwards
             if record.is_graph_replay
+            and not record.is_extend
             and any(step.request_id == request_id for step in record.steps)
         ]
         assert True in steps_around and False in steps_around, request_id
@@ -371,7 +525,9 @@ def first_padded_decode(run: GraphEngineRun) -> GraphForwardRecord:
     return next(
         record
         for record in run.forwards
-        if record.is_graph_replay and len(record.steps) in PADDED_BATCH_SIZES
+        if record.is_graph_replay
+        and not record.is_extend
+        and len(record.steps) in PADDED_BATCH_SIZES
     )
 
 

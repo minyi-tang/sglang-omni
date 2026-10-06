@@ -293,13 +293,14 @@ class S3DramaForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
     ) -> LogitsProcessorOutput:
         """Fill the tower cache of every extend row, then sample each first frame."""
-        step_inputs = self.step_exchange.take_inputs(
-            forward_batch.rids, input_ids.shape[0]
-        )
+        row_count = forward_batch.extend_num_tokens
+        step_inputs = self.step_exchange.take_inputs(forward_batch.rids, row_count)
         frames = step_inputs.frames
         hidden_states, logits_output = self.backbone_logits(
             input_ids, positions, forward_batch, frames
         )
+        hidden_states = hidden_states[:row_count]
+        positions = positions[:row_count]
         last_rows = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
         self.audio_decoder.prefill(
             hidden_states,

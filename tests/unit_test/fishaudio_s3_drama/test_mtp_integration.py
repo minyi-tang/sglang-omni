@@ -29,7 +29,10 @@ from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
-from sglang_omni.models.fishaudio_s3_drama.engine_builder import S3DramaEngineBuilder
+from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
+    PREFILL_CUDA_GRAPH_MAX_TOKENS,
+    S3DramaEngineBuilder,
+)
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import (
     S3DramaModelRunner,
@@ -1100,6 +1103,30 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     assert graph_config.prefill.backend == CudaGraphBackend.DISABLED
 
 
+@pytest.mark.parametrize(
+    "is_nested",
+    [False, True],
+    ids=["breakable-prefill-graph", "nested-breakable-prefill-graph"],
+)
+def test_engine_accepts_a_breakable_prefill_graph(
+    tmp_path: Path, is_nested: bool
+) -> None:
+    if is_nested:
+        builder, server_args = engine_server_args(
+            tmp_path, {"cuda_graph_config": {"prefill": {"backend": "breakable"}}}
+        )
+    else:
+        builder, server_args = engine_server_args(
+            tmp_path, {"cuda_graph_backend_prefill": "breakable"}
+        )
+
+    builder.validate_before_infrastructure(server_args)
+    graph_config = resolved_view(server_args).cuda_graph_config
+    assert graph_config.prefill.backend == CudaGraphBackend.BREAKABLE
+    assert graph_config.decode.backend == CudaGraphBackend.FULL
+    assert max(graph_config.prefill.bs) == PREFILL_CUDA_GRAPH_MAX_TOKENS
+
+
 def test_engine_also_runs_without_cuda_graphs(tmp_path: Path) -> None:
     builder, server_args = engine_server_args(tmp_path, {"disable_cuda_graph": True})
 
@@ -1114,11 +1141,11 @@ def test_engine_also_runs_without_cuda_graphs(tmp_path: Path) -> None:
     [
         ({"disable_radix_cache": False}, "disable_radix_cache"),
         ({"chunked_prefill_size": 64}, "chunked_prefill_size"),
-        ({"cuda_graph_backend_prefill": "breakable"}, "prefill runs eager"),
-        ({"cuda_graph_backend_prefill": "full"}, "prefill runs eager"),
+        ({"cuda_graph_backend_prefill": "full"}, "breakable CUDA graph"),
+        ({"cuda_graph_backend_prefill": "tc_piecewise"}, "breakable CUDA graph"),
         (
-            {"cuda_graph_config": {"prefill": {"backend": "breakable"}}},
-            "prefill runs eager",
+            {"cuda_graph_config": {"prefill": {"backend": "full"}}},
+            "breakable CUDA graph",
         ),
         ({"cuda_graph_backend_decode": "breakable"}, "full decode CUDA graphs"),
         ({"cuda_graph_backend_decode": "tc_piecewise"}, "full decode CUDA graphs"),
@@ -1135,8 +1162,8 @@ def test_engine_also_runs_without_cuda_graphs(tmp_path: Path) -> None:
     ids=[
         "radix",
         "chunked-prefill",
-        "breakable-prefill-graph",
         "full-prefill-graph",
+        "piecewise-prefill-graph",
         "nested-prefill-graph",
         "breakable-decode-graph",
         "piecewise-decode-graph",

@@ -18,7 +18,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8 import Fp8MoEMethod
-from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.server_args import ServerArgs
 
@@ -42,6 +45,7 @@ from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     CUDA_GRAPH_BATCH_SIZES,
+    PREFILL_CUDA_GRAPH_TOKEN_COUNTS,
     ExpertPath,
     GraphEngineFacts,
     GraphEngineRun,
@@ -323,6 +327,9 @@ def engine_facts(
     decode_buffers = model.decode_buffers
     assert decode_buffers is not None
     graph_runner = sglang_runner.decode_cuda_graph_runner
+    prefill_graph_runner = sglang_runner.prefill_cuda_graph_runner
+    kv_pool = sglang_runner.token_to_kv_pool
+    assert isinstance(kv_pool, HybridLinearKVPool)
     expert_paths = []
     for module in model.modules():
         if isinstance(module, FusedMoE):
@@ -348,7 +355,14 @@ def engine_facts(
         decode_graph_batch_sizes=(
             None if graph_runner is None else list(graph_runner.capture_bs)
         ),
-        prefill_runner=type(sglang_runner.prefill_cuda_graph_runner).__name__,
+        prefill_runner=type(prefill_graph_runner).__name__,
+        prefill_capture_token_counts=(
+            list(prefill_graph_runner.capture_num_tokens)
+            if isinstance(prefill_graph_runner, PrefillCudaGraphRunner)
+            else None
+        ),
+        recorded_kv_layer_ids=sorted(kv_pool.full_attention_layer_id_mapping),
+        tower_layer_ids=[layer.layer_id for layer in model.tower_attention],
         decode_buffer_rows=decode_buffers.frames.shape[0],
         request_pool_size=sglang_runner.req_to_token_pool.size,
         kv_pool_size=sglang_runner.token_to_kv_pool.size,
@@ -360,18 +374,31 @@ def engine_facts(
 
 def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
     builder = GraphRecordingEngineBuilder(spec=spec)
-    scheduler = builder.build(
-        spec.model_dir,
-        dtype="bfloat16",
-        server_args_overrides=(
-            {
+    if spec.kind == "eager":
+        scheduler = builder.build(
+            spec.model_dir, dtype="bfloat16", server_args_overrides={}
+        )
+    elif spec.kind == "graph":
+        scheduler = builder.build(
+            spec.model_dir,
+            dtype="bfloat16",
+            server_args_overrides={
                 "cuda_graph_bs": CUDA_GRAPH_BATCH_SIZES,
                 "cuda_graph_max_bs": max(CUDA_GRAPH_BATCH_SIZES),
-            }
-            if spec.kind == "graph"
-            else {}
-        ),
-    )
+            },
+        )
+    else:
+        scheduler = builder.build(
+            spec.model_dir,
+            dtype="bfloat16",
+            server_args_overrides={
+                "cuda_graph_bs": CUDA_GRAPH_BATCH_SIZES,
+                "cuda_graph_max_bs": max(CUDA_GRAPH_BATCH_SIZES),
+                "cuda_graph_backend_prefill": "breakable",
+                "cuda_graph_bs_prefill": PREFILL_CUDA_GRAPH_TOKEN_COUNTS,
+                "cuda_graph_max_bs_prefill": max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS),
+            },
+        )
     model = scheduler.tp_worker.model_runner.model
     runner = scheduler.model_runner
     assert isinstance(model, GraphRecordingModel)

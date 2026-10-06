@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import hashlib
 import queue
+from collections import Counter
 from dataclasses import replace
 
 import torch
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
-from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.model_worker import ModelWorker, PrefillCudaGraphUsage
 from sglang_omni.models.fishaudio_s3_drama.model_runner import (
     S3DramaModelRunner,
     request_data_of,
@@ -47,6 +48,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self, tp_worker: ModelWorker, output_processor: SGLangOutputProcessor
     ) -> None:
         super().__init__(tp_worker, output_processor)
+        self.model_worker = tp_worker
         sglang_runner = tp_worker.model_runner
         kv_pool = sglang_runner.token_to_kv_pool
         request_pool = sglang_runner.req_to_token_pool
@@ -66,6 +68,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.staged_prefill_inputs: S3DramaStepInputs | None = None
         self.kv_snapshot: list[torch.Tensor] = []
         self.state_snapshot: list[torch.Tensor] = []
+        self.usage_snapshot = PrefillCudaGraphUsage()
 
     def kv_buffers(self) -> list[torch.Tensor]:
         """Every full-attention layer's key and value buffer, slot-major."""
@@ -103,6 +106,14 @@ class GraphRecordingRunner(S3DramaModelRunner):
             torch.tensor(end_of_speech_logits)
         )
 
+    def take_snapshots(self) -> None:
+        self.kv_snapshot = [buffer.clone() for buffer in self.kv_buffers()]
+        self.state_snapshot = [buffer.clone() for buffer in self.state_buffers()]
+        usage = self.model_worker.prefill_cuda_graph_usage
+        self.usage_snapshot = replace(
+            usage, replay_buckets=Counter(usage.replay_buckets)
+        )
+
     def before_prefill(
         self,
         forward_batch: ForwardBatch | None,
@@ -123,6 +134,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
             pass
         self.staged_prefill_inputs = staged_inputs
         self.stage_end_of_speech(requests)
+        self.take_snapshots()
 
     def before_decode(
         self,
@@ -142,8 +154,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         else:
             pass
         self.stage_end_of_speech(requests)
-        self.kv_snapshot = [buffer.clone() for buffer in self.kv_buffers()]
-        self.state_snapshot = [buffer.clone() for buffer in self.state_buffers()]
+        self.take_snapshots()
 
     def post_prefill(
         self,
@@ -210,8 +221,10 @@ class GraphRecordingRunner(S3DramaModelRunner):
             temperature = staged_inputs.temperature.tolist()
             top_k = staged_inputs.top_k.tolist()
             top_p = staged_inputs.top_p.tolist()
-            stray_kv_slots: list[int] = []
-            stray_mamba_slots: list[int] = []
+            stray_kv_slots = sorted(
+                self.changed_slots(self.kv_snapshot, self.kv_buffers(), 0)
+                - set(written_slots)
+            )
         else:
             input_frames = recording_buffers.frames[:request_count].tolist()
             model_ras_windows = recording_buffers.ras_windows[:request_count].tolist()
@@ -224,11 +237,12 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 - set(written_slots)
                 - {0}
             )
-            stray_mamba_slots = sorted(
-                self.changed_slots(self.state_snapshot, self.state_buffers(), 1)
-                - set(mamba_slots)
-            )
-        is_graph_replay = bool(result.can_run_cuda_graph) and not is_extend
+        stray_mamba_slots = sorted(
+            self.changed_slots(self.state_snapshot, self.state_buffers(), 1)
+            - set(mamba_slots)
+        )
+        usage = self.model_worker.prefill_cuda_graph_usage
+        is_graph_replay = bool(result.can_run_cuda_graph)
         steps = []
         for index, request in enumerate(requests):
             request_data = request_data_of(request)
@@ -279,8 +293,18 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 is_graph_replay=is_graph_replay,
                 graph_batch_size=(
                     self.decode_graph_runner.bs
-                    if is_graph_replay and self.decode_graph_runner is not None
+                    if is_graph_replay
+                    and not is_extend
+                    and self.decode_graph_runner is not None
                     else None
+                ),
+                token_count=len(written_slots),
+                prefill_replay_count=usage.replay_count
+                - self.usage_snapshot.replay_count,
+                prefill_eager_count=usage.standard_eager_count
+                - self.usage_snapshot.standard_eager_count,
+                prefill_replay_buckets=dict(
+                    usage.replay_buckets - self.usage_snapshot.replay_buckets
                 ),
                 steps=steps,
                 stray_kv_slots=stray_kv_slots,

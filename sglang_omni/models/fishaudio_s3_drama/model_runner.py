@@ -21,6 +21,9 @@ from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 
 from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.request_id_prefill_cuda_graph_runner import (
+    RequestIdPrefillCudaGraphRunner,
+)
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     MINIMUM_PROMPT_ROWS,
     S3DramaRequestData,
@@ -188,10 +191,13 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
             or isinstance(decode_graph_runner, DecodeCudaGraphRunner)
         ) or not (
             prefill_graph_runner is None
-            or isinstance(prefill_graph_runner, EagerRunner)
+            or isinstance(
+                prefill_graph_runner, (EagerRunner, RequestIdPrefillCudaGraphRunner)
+            )
         ):
             raise RuntimeError(
-                "S3-drama replays decode CUDA graphs only; its prefill runs eager"
+                "S3-drama replays full decode CUDA graphs and runs its prefill eager "
+                "or as a breakable CUDA graph"
             )
         elif decode_buffers is None or decode_buffers.frames.shape[0] < max(
             request_pool.size,

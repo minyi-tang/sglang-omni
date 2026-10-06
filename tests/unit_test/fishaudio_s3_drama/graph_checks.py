@@ -14,6 +14,8 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
 )
 from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     CUDA_GRAPH_BATCH_SIZES,
+    PREFILL_CUDA_GRAPH_PADDING_FACTOR,
+    PREFILL_CUDA_GRAPH_TOKEN_COUNTS,
     GraphEngineRun,
     GraphForwardRecord,
     GraphRequestStep,
@@ -40,7 +42,10 @@ def same_bits(left: torch.Tensor, right: torch.Tensor) -> bool:
 
 def forward_name(record: GraphForwardRecord) -> str:
     if record.is_extend:
-        return f"forward {record.forward_index} ({record.scenario_name}, extend)"
+        return (
+            f"forward {record.forward_index} ({record.scenario_name}, extend of "
+            f"{record.token_count} tokens)"
+        )
     else:
         return (
             f"forward {record.forward_index} ({record.scenario_name}, decode of "
@@ -304,6 +309,54 @@ def replay_problems(pair: EnginePair) -> list[str]:
             and record.graph_batch_size == padded_graph_batch_size(len(record.steps))
         )
     ]
+
+
+def expected_prefill_bucket(token_count: int) -> int | None:
+    fitting_buckets = [
+        bucket for bucket in PREFILL_CUDA_GRAPH_TOKEN_COUNTS if bucket >= token_count
+    ]
+    if not fitting_buckets:
+        return None
+    elif min(fitting_buckets) > PREFILL_CUDA_GRAPH_PADDING_FACTOR * token_count:
+        return None
+    else:
+        return min(fitting_buckets)
+
+
+def prefill_path_problems(run: GraphEngineRun) -> list[str]:
+    problems = []
+    for record in run.forwards:
+        expected_bucket = (
+            expected_prefill_bucket(record.token_count)
+            if record.is_extend and run.kind == "prefill_graph"
+            else None
+        )
+        if not record.is_extend:
+            expected = (0, 0, {})
+        elif expected_bucket is None:
+            expected = (0, 1, {})
+        else:
+            expected = (1, 0, {expected_bucket: 1})
+        actual = (
+            record.prefill_replay_count,
+            record.prefill_eager_count,
+            record.prefill_replay_buckets,
+        )
+        if actual != expected:
+            problems.append(
+                f"{run.kind} {forward_name(record)}: prefill replays, eager prefills "
+                f"and replayed buckets {actual}, not {expected}"
+            )
+        elif record.is_extend and record.is_graph_replay != (
+            expected_bucket is not None
+        ):
+            problems.append(
+                f"{run.kind} {forward_name(record)}: graph replay "
+                f"{record.is_graph_replay} disagrees with the prefill counters"
+            )
+        else:
+            pass
+    return problems
 
 
 def stray_write_problems(run: GraphEngineRun) -> list[str]:
