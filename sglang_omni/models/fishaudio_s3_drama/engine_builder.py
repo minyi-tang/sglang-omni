@@ -123,6 +123,9 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         parallel_sizes = (server_args.tp_size, server_args.pp_size, server_args.dp_size)
         chunked_prefill_size = server_args.chunked_prefill_size or 0
         graph_config = resolved_view(server_args).cuda_graph_config
+        max_position_embeddings = FishOmniConfig.from_pretrained(
+            server_args.model_path
+        ).text_config.max_position_embeddings
         if not server_args.disable_radix_cache:
             raise ValueError("S3-drama needs disable_radix_cache=True")
         elif chunked_prefill_size > 0 or server_args.enable_mixed_chunk:
@@ -166,6 +169,12 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
                 f"S3-drama runs on one rank without speculative decoding; got "
                 f"tp/pp/dp={parallel_sizes} and "
                 f"speculative_algorithm={server_args.speculative_algorithm}"
+            )
+        elif self.context_length > max_position_embeddings:
+            raise ValueError(
+                f"S3-drama context_length ({self.context_length}) exceeds the model's "
+                f"max_position_embeddings ({max_position_embeddings}); lower "
+                f"--tts_engine.factory.context_length"
             )
         else:
             pass

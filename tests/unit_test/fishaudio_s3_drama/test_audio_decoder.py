@@ -6,11 +6,16 @@ from __future__ import annotations
 import json
 import math
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Literal
 
 import pytest
 import torch
+from sglang.kernels.fused_op import get_fused_op_backend, set_fused_op_backend
+from sglang.kernels.spec import KernelBackend
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
@@ -143,9 +148,20 @@ def random_checkpoint(seed: int) -> dict[str, torch.Tensor]:
 def loaded_decoder(
     checkpoint: dict[str, torch.Tensor], dtype: torch.dtype, device: DeviceType
 ) -> AudioDecoder:
-    decoder = AudioDecoder(small_config())
+    with set_default_torch_dtype(dtype):
+        decoder = AudioDecoder(small_config())
     load_audio_decoder_weights(decoder, checkpoint.items())
-    return decoder.to(dtype=dtype, device=device)
+    return decoder.to(device=device)
+
+
+@contextmanager
+def torch_fused_op_backend() -> Iterator[None]:
+    previous_backend = get_fused_op_backend()
+    set_fused_op_backend(KernelBackend.TORCH)
+    try:
+        yield
+    finally:
+        set_fused_op_backend(previous_backend)
 
 
 def reference_norm(values: torch.Tensor, gain_minus_one: torch.Tensor) -> torch.Tensor:
@@ -482,6 +498,7 @@ def random_inputs(seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     )
 
 
+@torch_fused_op_backend()
 def test_tower_matches_the_hand_written_formulas() -> None:
     """Grouped heads, a partial rotary width and every frame transition, in fp32.
 
@@ -539,13 +556,14 @@ def test_bfloat16_tower_tracks_the_fp32_formulas(device: DeviceType) -> None:
         head_count=HEAD_COUNT, kv_head_count=KV_HEAD_COUNT, head_dim=HEAD_DIM
     )
 
-    _, frames = run_decoder(
-        decoder,
-        attention,
-        prefill_hidden.to(device=device, dtype=torch.bfloat16),
-        decode_hidden.to(device=device, dtype=torch.bfloat16),
-        semantic_logits.to(device),
-    )
+    with torch_fused_op_backend() if device == "cpu" else nullcontext():
+        _, frames = run_decoder(
+            decoder,
+            attention,
+            prefill_hidden.to(device=device, dtype=torch.bfloat16),
+            decode_hidden.to(device=device, dtype=torch.bfloat16),
+            semantic_logits.to(device),
+        )
     reference, reference_frames = run_reference(
         checkpoint, prefill_hidden, decode_hidden, semantic_logits
     )
@@ -591,6 +609,47 @@ def test_frame_embeddings() -> None:
     torch.testing.assert_close(
         shared_input[1], reference_codebook_sum(checkpoint, frames[1], range(2, 4))
     )
+    torch.testing.assert_close(shared_input[2], torch.zeros(DIM))
+
+
+@pytest.mark.parametrize(
+    ("placement", "backbone_codebook_count"),
+    [("backbone_partial", NUM_CODEBOOKS - 1), ("mtp_shared_pre", 0)],
+)
+def test_frame_embeddings_of_an_empty_codebook_range_are_zero(
+    placement: Literal["backbone_partial", "mtp_shared_pre"],
+    backbone_codebook_count: int,
+) -> None:
+    config_dict = fish_config_dict()
+    decoder_config = config_dict["audio_decoder_config"]
+    assert isinstance(decoder_config, dict)
+    decoder_config["vq_feature_placement"] = placement
+    decoder_config["vq_backbone_codebooks"] = backbone_codebook_count
+    checkpoint = random_checkpoint(seed=2)
+    decoder = AudioDecoder(FishOmniConfig(**config_dict))
+    load_audio_decoder_weights(decoder, checkpoint.items())
+    frames = [REQUEST_FRAMES["a"][0], REQUEST_FRAMES["a"][1], REQUEST_FRAMES["a"][3]]
+    text_embeddings = torch.randn(3, DIM, generator=torch.Generator().manual_seed(3))
+
+    backbone_input = decoder.embed_backbone(torch.tensor(frames), text_embeddings)
+    shared_input = decoder.shared_input(torch.tensor(frames))
+
+    mixed = (
+        text_embeddings[1]
+        + reference_codebook_sum(
+            checkpoint, frames[1], range(1, 1 + backbone_codebook_count)
+        )
+    ) / math.sqrt(1.0 + backbone_codebook_count)
+    torch.testing.assert_close(backbone_input[0], text_embeddings[0])
+    torch.testing.assert_close(backbone_input[1], mixed)
+    torch.testing.assert_close(backbone_input[2], text_embeddings[2])
+    torch.testing.assert_close(
+        shared_input[1],
+        reference_codebook_sum(
+            checkpoint, frames[1], range(1 + backbone_codebook_count, NUM_CODEBOOKS)
+        ),
+    )
+    torch.testing.assert_close(shared_input[0], torch.zeros(DIM))
     torch.testing.assert_close(shared_input[2], torch.zeros(DIM))
 
 

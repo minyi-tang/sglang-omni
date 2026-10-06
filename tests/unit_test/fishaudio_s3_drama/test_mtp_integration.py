@@ -91,6 +91,7 @@ from tests.unit_test.fishaudio_s3_drama.test_audio_decoder import (
     TEXT_VOCAB_SIZE,
     loaded_decoder,
     random_checkpoint,
+    torch_fused_op_backend,
 )
 from tests.unit_test.fishaudio_s3_drama.test_hf_config import fish_config_dict
 
@@ -1055,6 +1056,7 @@ def tower_cache(attention: DenseAttention) -> dict[tuple[int, str, int], torch.T
     }
 
 
+@torch_fused_op_backend()
 def test_placeholder_rows_end_like_first_writes_and_a_dense_recompute() -> None:
     """The integration's labels, then the decode step's rewrite of each last slot,
     leave the cache of N-1-row prefills and of a whole dense recompute, in fp32."""
@@ -1157,12 +1159,14 @@ def test_model_rejects_a_tower_that_cannot_share_the_backbone_pool() -> None:
 
 
 def engine_server_args(
-    checkpoint_dir: Path, overrides: dict[str, object]
+    checkpoint_dir: Path,
+    overrides: dict[str, object],
+    context_length: int = CONTEXT_LENGTH,
 ) -> tuple[S3DramaEngineBuilder, ServerArgs]:
     """The server args the builder resolves for a checkpoint and caller overrides."""
     (checkpoint_dir / "config.json").write_text(json.dumps(fish_config_dict()))
     builder = S3DramaEngineBuilder(
-        context_length=CONTEXT_LENGTH, max_running_requests=2
+        context_length=context_length, max_running_requests=2
     )
     builder.pre_infra_setup(str(checkpoint_dir))
     generation_overrides = build_generation_batch_overrides(
@@ -1171,7 +1175,7 @@ def engine_server_args(
     )
     builder.adjust_overrides(generation_overrides)
     return builder, sglang_backend.build_sglang_server_args(
-        str(checkpoint_dir), context_length=CONTEXT_LENGTH, **generation_overrides
+        str(checkpoint_dir), context_length=context_length, **generation_overrides
     )
 
 
@@ -1187,6 +1191,25 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     assert graph_config.prefill.backend == CudaGraphBackend.BREAKABLE
     assert max(graph_config.prefill.bs) == PREFILL_CUDA_GRAPH_MAX_TOKENS
     assert server_args.prefill_decode_interval == DECODE_STEPS_BETWEEN_PREFILLS
+
+
+def test_engine_context_must_fit_the_tower_rope_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "1")
+    max_position_embeddings = FishOmniConfig(
+        **fish_config_dict()
+    ).text_config.max_position_embeddings
+    builder, server_args = engine_server_args(
+        tmp_path, {}, context_length=max_position_embeddings
+    )
+    builder.validate_before_infrastructure(server_args)
+
+    builder, server_args = engine_server_args(
+        tmp_path, {}, context_length=max_position_embeddings + 1
+    )
+    with pytest.raises(ValueError, match="exceeds the model's max_position_embeddings"):
+        builder.validate_before_infrastructure(server_args)
 
 
 def test_engine_prefills_without_an_interval_when_asked(tmp_path: Path) -> None:

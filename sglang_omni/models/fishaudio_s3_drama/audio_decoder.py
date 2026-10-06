@@ -13,6 +13,8 @@ from typing import Protocol
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.hf_config import (
@@ -23,6 +25,8 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
     sample_semantic_with_ras,
     sample_top_k_top_p,
 )
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.interface import JointRopeInplaceKernel
 
 
 class DecoderAttention(Protocol):
@@ -46,53 +50,61 @@ class DecoderAttention(Protocol):
         """
 
 
-class ZeroCenteredRmsNorm(nn.Module):
-    """RMSNorm with the gain stored as gain - 1, computed in fp32."""
-
-    def __init__(self, size: int, eps: float) -> None:
+class InterleavedRotaryEmbedding(nn.Module):
+    def __init__(self, config: FishOmniAudioDecoderConfig, max_position: int) -> None:
         super().__init__()
-        self.weight = nn.Parameter(torch.zeros(size))
-        self.eps = eps
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        values = hidden_states.float()
-        values = values * torch.rsqrt(
-            values.pow(2).mean(dim=-1, keepdim=True) + self.eps
+        self.head_dim = config.head_dim
+        self.rotary_dim = config.rotary_dim
+        inverse_frequencies = 1.0 / config.rope_base ** (
+            torch.arange(0, config.rotary_dim, 2, dtype=torch.float32)
+            / config.rotary_dim
         )
-        return (values * (1.0 + self.weight.float())).to(hidden_states.dtype)
+        angles = (
+            torch.arange(max_position, dtype=torch.float32).unsqueeze(-1)
+            * inverse_frequencies
+        )
+        self.register_buffer(
+            "cos_sin_cache",
+            torch.cat((angles.cos(), angles.sin()), dim=-1),
+            persistent=False,
+        )
+        self.kernel: JointRopeInplaceKernel | None = (
+            current_platform.get_joint_rope_inplace_kernel()
+        )
 
-
-def rotate_interleaved(
-    head_states: torch.Tensor, positions: torch.Tensor, rotary_dim: int, base: float
-) -> torch.Tensor:
-    """GPT-J rope over the first rotary_dim channels of [rows, heads, head_dim]."""
-    channel_pairs = torch.arange(
-        0, rotary_dim, 2, dtype=torch.float32, device=head_states.device
-    )
-    inverse_frequencies = 1.0 / base ** (channel_pairs / rotary_dim)
-    angles = positions.float().unsqueeze(-1) * inverse_frequencies
-    cosine = angles.cos().unsqueeze(1)
-    sine = angles.sin().unsqueeze(1)
-    rotary_states = head_states[..., :rotary_dim].float()
-    even = rotary_states[..., 0::2]
-    odd = rotary_states[..., 1::2]
-    rotated = torch.stack(
-        (even * cosine - odd * sine, odd * cosine + even * sine), dim=-1
-    )
-    return torch.cat(
-        (rotated.flatten(-2).to(head_states.dtype), head_states[..., rotary_dim:]),
-        dim=-1,
-    )
+    def forward(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        row_count = positions.shape[0]
+        rotary_query = query.view(row_count, -1, self.head_dim)[..., : self.rotary_dim]
+        rotary_key = key.view(row_count, -1, self.head_dim)[..., : self.rotary_dim]
+        if self.kernel is not None and query.is_cuda:
+            self.kernel(
+                rotary_query, rotary_key, self.cos_sin_cache, positions, is_neox=False
+            )
+        else:
+            cosine, sine = self.cos_sin_cache[positions].unsqueeze(1).chunk(2, dim=-1)
+            for rotary_states in (rotary_query, rotary_key):
+                even = rotary_states[..., 0::2].float()
+                odd = rotary_states[..., 1::2].float()
+                rotary_states.copy_(
+                    torch.stack(
+                        (even * cosine - odd * sine, odd * cosine + even * sine), dim=-1
+                    ).flatten(-2)
+                )
+        return query, key
 
 
 class DecoderSelfAttention(nn.Module):
-    def __init__(self, config: FishOmniAudioDecoderConfig) -> None:
+    def __init__(
+        self,
+        config: FishOmniAudioDecoderConfig,
+        rotary_embedding: InterleavedRotaryEmbedding,
+    ) -> None:
         super().__init__()
         self.head_count = config.n_head
         self.kv_head_count = config.n_local_heads
         self.head_dim = config.head_dim
-        self.rotary_dim = config.rotary_dim
-        self.rope_base = config.rope_base
         query_width = config.n_head * config.head_dim
         kv_width = config.n_local_heads * config.head_dim
         # Output rows: each head's [query, gate] pair, then key, then value.
@@ -100,8 +112,9 @@ class DecoderSelfAttention(nn.Module):
             config.dim, 2 * query_width + 2 * kv_width, bias=False
         )
         self.o_proj = nn.Linear(query_width, config.dim, bias=False)
-        self.q_norm = ZeroCenteredRmsNorm(config.head_dim, config.norm_eps)
-        self.k_norm = ZeroCenteredRmsNorm(config.head_dim, config.norm_eps)
+        self.q_norm = GemmaRMSNorm(config.head_dim, config.norm_eps)
+        self.k_norm = GemmaRMSNorm(config.head_dim, config.norm_eps)
+        self.rotary_embedding = rotary_embedding
 
     def forward(
         self,
@@ -119,21 +132,12 @@ class DecoderSelfAttention(nn.Module):
         query, gate = query_and_gate.view(
             row_count, self.head_count, 2 * self.head_dim
         ).chunk(2, dim=-1)
-        query = rotate_interleaved(
-            self.q_norm(query), positions, self.rotary_dim, self.rope_base
-        )
-        key = rotate_interleaved(
-            self.k_norm(key.view(row_count, self.kv_head_count, self.head_dim)),
+        query, key = self.rotary_embedding(
             positions,
-            self.rotary_dim,
-            self.rope_base,
+            self.q_norm(query.reshape(-1, self.head_dim)).view(row_count, query_width),
+            self.k_norm(key.reshape(-1, self.head_dim)).view(row_count, kv_width),
         )
-        attended = attention(
-            layer_index,
-            query.reshape(row_count, query_width),
-            key.reshape(row_count, kv_width),
-            value,
-        )
+        attended = attention(layer_index, query, key, value)
         return self.o_proj(
             attended * torch.sigmoid(gate.reshape(row_count, query_width))
         )
@@ -144,27 +148,31 @@ class DecoderMlp(nn.Module):
         super().__init__()
         # Output rows: gate, then up.
         self.gate_up_proj = nn.Linear(dim, 2 * intermediate_size, bias=False)
+        self.silu_and_mul = SiluAndMul()
         self.down_proj = nn.Linear(intermediate_size, dim, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate, up = self.gate_up_proj(hidden_states).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        return self.down_proj(self.silu_and_mul(self.gate_up_proj(hidden_states)))
 
 
 class DecoderLayer(nn.Module):
     """One tower layer: mix a code embedding into the hidden, then a pre-norm block."""
 
-    def __init__(self, config: FishOmniAudioDecoderConfig) -> None:
+    def __init__(
+        self,
+        config: FishOmniAudioDecoderConfig,
+        rotary_embedding: InterleavedRotaryEmbedding,
+    ) -> None:
         super().__init__()
         self.token_embedding = nn.Embedding(config.vocab_size, config.dim)
-        self.enorm = ZeroCenteredRmsNorm(config.dim, config.norm_eps)
-        self.hnorm = ZeroCenteredRmsNorm(config.dim, config.norm_eps)
+        self.enorm = GemmaRMSNorm(config.dim, config.norm_eps)
+        self.hnorm = GemmaRMSNorm(config.dim, config.norm_eps)
         self.eh_proj = nn.Linear(2 * config.dim, config.dim, bias=False)
-        self.self_attn = DecoderSelfAttention(config)
+        self.self_attn = DecoderSelfAttention(config, rotary_embedding)
         self.mlp = DecoderMlp(config.dim, config.intermediate_size)
-        self.input_layernorm = ZeroCenteredRmsNorm(config.dim, config.norm_eps)
-        self.post_attention_layernorm = ZeroCenteredRmsNorm(config.dim, config.norm_eps)
-        self.final_layernorm = ZeroCenteredRmsNorm(config.dim, config.norm_eps)
+        self.input_layernorm = GemmaRMSNorm(config.dim, config.norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.dim, config.norm_eps)
+        self.final_layernorm = GemmaRMSNorm(config.dim, config.norm_eps)
 
     def forward(
         self,
@@ -178,10 +186,13 @@ class DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         # Clamping keeps placeholder codes of non-semantic labels inside the
         # table; the label mask then zeroes those rows.
-        embeddings = self.token_embedding(
-            code_ids.clamp(0, self.token_embedding.num_embeddings - 1)
+        embeddings = torch.where(
+            label_is_semantic.unsqueeze(-1),
+            self.token_embedding(
+                code_ids.clamp(0, self.token_embedding.num_embeddings - 1)
+            ),
+            0.0,
         )
-        embeddings = embeddings * label_is_semantic.to(embeddings.dtype).unsqueeze(-1)
         if shared_input is not None:
             embeddings = embeddings + shared_input.to(embeddings.dtype)
         else:
@@ -189,12 +200,14 @@ class DecoderLayer(nn.Module):
         mixed = self.eh_proj(
             torch.cat((self.enorm(embeddings), self.hnorm(hidden_states)), dim=-1)
         )
-        residual = mixed + self.self_attn(
-            self.input_layernorm(mixed), positions, attention, layer_index
+        mlp_input, residual = self.post_attention_layernorm(
+            self.self_attn(
+                self.input_layernorm(mixed), positions, attention, layer_index
+            ),
+            mixed,
         )
-        return self.final_layernorm(
-            residual + self.mlp(self.post_attention_layernorm(residual))
-        )
+        normed, _ = self.final_layernorm(self.mlp(mlp_input), residual)
+        return normed
 
 
 class AudioDecoder(nn.Module):
@@ -212,15 +225,24 @@ class AudioDecoder(nn.Module):
         self.codebook_size = decoder_config.vocab_size
         self.num_codebooks = decoder_config.num_codebooks
         self.backbone_codebook_count = decoder_config.vq_backbone_codebooks
+        rotary_embedding = InterleavedRotaryEmbedding(
+            decoder_config, config.text_config.max_position_embeddings
+        )
         self.codebook_embeddings = nn.Embedding(
             self.codebook_size * self.num_codebooks, decoder_config.dim
         )
+        self.register_buffer(
+            "codebook_row_offsets",
+            torch.arange(self.num_codebooks) * self.codebook_size,
+            persistent=False,
+        )
         self.shared_layers = nn.ModuleList(
-            DecoderLayer(decoder_config)
+            DecoderLayer(decoder_config, rotary_embedding)
             for _ in range(decoder_config.shared_enrichment_layers)
         )
         self.residual_layers = nn.ModuleList(
-            DecoderLayer(decoder_config) for _ in range(self.num_codebooks - 1)
+            DecoderLayer(decoder_config, rotary_embedding)
+            for _ in range(self.num_codebooks - 1)
         )
         self.codebook_heads = nn.ModuleList(
             nn.Linear(decoder_config.dim, self.codebook_size, bias=False)
@@ -248,14 +270,20 @@ class AudioDecoder(nn.Module):
         self, frames: torch.Tensor, first_codebook: int, end_codebook: int
     ) -> torch.Tensor:
         """Summed embeddings of codes first_codebook..end_codebook - 1 per frame."""
-        codebook_ids = torch.arange(first_codebook, end_codebook, device=frames.device)
-        table_rows = (
-            frames[:, 1 + first_codebook : 1 + end_codebook].clamp(
-                0, self.codebook_size - 1
+        if first_codebook == end_codebook:
+            return self.codebook_embeddings.weight.new_zeros(
+                frames.shape[0], self.codebook_embeddings.embedding_dim
             )
-            + codebook_ids * self.codebook_size
-        )
-        return self.codebook_embeddings(table_rows).sum(dim=-2)
+        else:
+            table_rows = (
+                frames[:, 1 + first_codebook : 1 + end_codebook].clamp(
+                    0, self.codebook_size - 1
+                )
+                + self.codebook_row_offsets[first_codebook:end_codebook]
+            )
+            return F.embedding_bag(
+                table_rows, self.codebook_embeddings.weight, mode="sum"
+            )
 
     def embed_backbone(
         self, frames: torch.Tensor, text_embeddings: torch.Tensor
@@ -273,10 +301,13 @@ class AudioDecoder(nn.Module):
 
     def shared_input(self, frames: torch.Tensor) -> torch.Tensor:
         """Extra input of the first shared layer: codes N+1.. of semantic frames."""
-        summed = self.codebook_embedding_sum(
-            frames, 1 + self.backbone_codebook_count, self.num_codebooks
+        return torch.where(
+            self.is_semantic(frames[:, 0]).unsqueeze(-1),
+            self.codebook_embedding_sum(
+                frames, 1 + self.backbone_codebook_count, self.num_codebooks
+            ),
+            0.0,
         )
-        return summed * self.is_semantic(frames[:, 0]).to(summed.dtype).unsqueeze(-1)
 
     def run_shared_layers(
         self,

@@ -48,6 +48,7 @@ from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
     decoder_checkpoint,
     write_synthetic_checkpoint,
 )
+from tests.unit_test.fishaudio_s3_drama.test_audio_decoder import torch_fused_op_backend
 from tests.unit_test.fixtures.accelerator import require_cuda
 from tests.unit_test.scheduling.test_hybrid_gdn import (
     kill_process_group,
@@ -207,6 +208,7 @@ class DenseTower:
 
 
 @torch.no_grad()
+@torch_fused_op_backend()
 def dense_tower(
     decoder: AudioDecoder, hidden_states: torch.Tensor, frame_history: torch.Tensor
 ) -> DenseTower:
