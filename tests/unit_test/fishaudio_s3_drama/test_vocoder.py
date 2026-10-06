@@ -16,16 +16,22 @@ from sglang_omni.models.fishaudio_s3_drama.channels_last_decoder import (
 )
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
+    S3DramaFrameStreamer,
     S3DramaGenerationResult,
+    S3DramaRequestData,
+)
+from sglang_omni.models.fishaudio_s3_drama.stream_windows import (
+    frames_in_complete_windows,
+    stream_window_lengths,
 )
 from sglang_omni.models.fishaudio_s3_drama.vocoder import (
     S3DramaVocoderScheduler,
     WindowGraphDecoder,
-    stream_window_lengths,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.types import RequestOutput
 from tests.unit_test.fishaudio_s2_pro.test_vocoder import tiny_codec
 
 SAMPLES_PER_FRAME = 4
@@ -75,10 +81,13 @@ def numbered_frames(frame_count: int) -> torch.Tensor:
 
 
 def vocoder_with(
-    codec: FrameNumberCodec, decode_window: WindowDecoder | None = None
+    codec: FrameNumberCodec,
+    decode_window: WindowDecoder | None = None,
+    *,
+    factory_args: S3DramaVocoderFactoryArgs | None = None,
 ) -> S3DramaVocoderScheduler:
     """The vocoder with the configured windows."""
-    window_kwargs = S3DramaVocoderFactoryArgs().model_dump(
+    window_kwargs = (factory_args or S3DramaVocoderFactoryArgs()).model_dump(
         include={
             "stream_stride",
             "stream_followup_stride_ramp",
@@ -553,3 +562,142 @@ def test_a_ramp_with_a_non_positive_stride_is_refused(ramp: tuple[int, ...]) -> 
             max_batch_size=8,
             max_batch_wait_ms=2,
         )
+
+
+STREAMER_EOS_TOKEN_ID = 4999
+
+
+@pytest.mark.parametrize(
+    "stream_crossfade_samples",
+    [
+        pytest.param(
+            S3DramaVocoderFactoryArgs().stream_crossfade_samples, id="default-crossfade"
+        ),
+        pytest.param(10 * SAMPLES_PER_FRAME, id="crossfade-holds-back-a-whole-window"),
+    ],
+)
+def test_the_frame_streamer_has_sent_every_window_when_the_vocoder_decodes_it(
+    stream_crossfade_samples: int,
+) -> None:
+    factory_args = S3DramaVocoderFactoryArgs(
+        stream_crossfade_samples=stream_crossfade_samples
+    )
+    frame_streamer = S3DramaFrameStreamer(
+        eos_token_id=STREAMER_EOS_TOKEN_ID,
+        stream_stride=factory_args.stream_stride,
+        stream_followup_stride_ramp=factory_args.stream_followup_stride_ramp,
+        stream_followup_stride=factory_args.stream_followup_stride,
+    )
+    codec = FrameNumberCodec()
+    vocoder = vocoder_with(codec, factory_args=factory_args)
+    frame_count = 200
+    frames = numbered_frames(frame_count)
+    request_data = S3DramaRequestData(
+        stage_payload=final_payload(frames, is_streaming=True),
+        frame_rows=[[0] * (1 + NUM_CODEBOOKS)] * PROMPT_ROW_COUNT,
+        prompt_row_count=PROMPT_ROW_COUNT,
+    )
+    streamed_counts: list[int] = []
+    for chunk_id, frame_row in enumerate(frames.tolist()):
+        request_data.frame_rows.append(frame_row)
+        for message in frame_streamer(
+            "request-a", request_data, RequestOutput(request_id="request-a")
+        ):
+            vocoder.handle_stream_chunk(
+                "request-a",
+                StreamItem(
+                    chunk_id=chunk_id, data=message.data, from_stage="tts_engine"
+                ),
+            )
+        streamed_counts.append(request_data.streamed_frame_count)
+
+    window_ends = sorted(
+        {
+            frames_in_complete_windows(
+                sampled_count,
+                stream_stride=factory_args.stream_stride,
+                stream_followup_stride_ramp=factory_args.stream_followup_stride_ramp,
+                stream_followup_stride=factory_args.stream_followup_stride,
+            )
+            for sampled_count in range(1, frame_count + 1)
+        }
+        - {0}
+    )
+    assert [end for _, end in codec.decoded_frame_ranges()] == window_ends
+    assert [streamed_counts[end - 1] for end in window_ends] == window_ends
+
+
+def vocoded_through_the_engine(
+    frames: torch.Tensor, *, ends_with_eos: bool, is_window_batched: bool
+) -> list[OutgoingMessage]:
+    factory_args = S3DramaVocoderFactoryArgs()
+    frame_streamer = S3DramaFrameStreamer(
+        eos_token_id=STREAMER_EOS_TOKEN_ID,
+        stream_stride=factory_args.stream_stride,
+        stream_followup_stride_ramp=factory_args.stream_followup_stride_ramp,
+        stream_followup_stride=factory_args.stream_followup_stride,
+    )
+    vocoder = vocoder_with(FrameNumberCodec(), factory_args=factory_args)
+    payload = final_payload(
+        frames,
+        is_streaming=True,
+        finish_reason="stop" if ends_with_eos else "length",
+    )
+    request_data = S3DramaRequestData(
+        stage_payload=payload,
+        frame_rows=[[0] * (1 + NUM_CODEBOOKS)] * PROMPT_ROW_COUNT,
+        prompt_row_count=PROMPT_ROW_COUNT,
+    )
+    eos_rows = [[STREAMER_EOS_TOKEN_ID] + [0] * NUM_CODEBOOKS] if ends_with_eos else []
+    chunk_id = 0
+    for frame_row in frames.tolist() + eos_rows:
+        request_data.frame_rows.append(frame_row)
+        if is_window_batched:
+            chunks = [
+                message.data
+                for message in frame_streamer(
+                    "request-a", request_data, RequestOutput(request_id="request-a")
+                )
+            ]
+        elif frame_row[0] == STREAMER_EOS_TOKEN_ID:
+            chunks = []
+        else:
+            chunks = [torch.tensor([frame_row], dtype=torch.int64).T]
+        for chunk in chunks:
+            vocoder.handle_stream_chunk(
+                "request-a",
+                StreamItem(chunk_id=chunk_id, data=chunk, from_stage="tts_engine"),
+            )
+            chunk_id += 1
+    vocoder.handle_streaming_new_request("request-a", payload)
+    vocoder.handle_stream_done("request-a")
+    return drained(vocoder)
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "ends_with_eos"),
+    [
+        pytest.param(15, True, id="eos-inside-a-window"),
+        pytest.param(15, False, id="max-new-tokens-inside-a-window"),
+        pytest.param(20, False, id="max-new-tokens-on-a-window-end"),
+        pytest.param(19, True, id="eos-on-the-window-end-step"),
+        pytest.param(9, True, id="eos-before-the-first-window"),
+    ],
+)
+def test_window_batched_frames_vocode_to_the_bytes_of_one_frame_per_message(
+    frame_count: int, ends_with_eos: bool
+) -> None:
+    frames = numbered_frames(frame_count)
+
+    batched = vocoded_through_the_engine(
+        frames, ends_with_eos=ends_with_eos, is_window_batched=True
+    )
+    one_per_frame = vocoded_through_the_engine(
+        frames, ends_with_eos=ends_with_eos, is_window_batched=False
+    )
+
+    assert [(message.type, message.data) for message in batched] == [
+        (message.type, message.data) for message in one_per_frame
+    ]
+    assert [message.type for message in batched][-1] == "result"
+    assert chunk_frame_ranges(batched)[-1][1] == frame_count

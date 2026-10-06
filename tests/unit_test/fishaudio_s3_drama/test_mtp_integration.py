@@ -29,6 +29,7 @@ from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
+from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
     DECODE_STEPS_BETWEEN_PREFILLS,
     PREFILL_CUDA_GRAPH_MAX_TOKENS,
@@ -68,6 +69,7 @@ from sglang_omni.scheduling import sglang_backend
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
 )
+from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
@@ -416,9 +418,19 @@ def test_engine_builder_wires_the_default_cap_and_a_frame_streamer() -> None:
     request_data = request_builder(unset_max_new_tokens_payload(4))
     frame_streamer = engine_builder.extra_scheduler_kwargs()["stream_output_builder"]
 
+    window = S3DramaVocoderFactoryArgs()
     assert request_data.max_new_tokens == SERVING_MAX_NEW_TOKENS_CAP
     assert isinstance(frame_streamer, S3DramaFrameStreamer)
     assert frame_streamer.eos_token_id == EOS_TOKEN_ID
+    assert (
+        frame_streamer.stream_stride,
+        frame_streamer.stream_followup_stride_ramp,
+        frame_streamer.stream_followup_stride,
+    ) == (
+        window.stream_stride,
+        window.stream_followup_stride_ramp,
+        window.stream_followup_stride,
+    )
 
 
 def test_engine_builder_resolves_a_hub_id_to_a_local_snapshot(
@@ -489,41 +501,110 @@ def test_result_holds_the_sampled_frames_without_eos(
     assert (result.prompt_row_count, result.finish_reason) == (3, finish_reason)
 
 
-def test_frame_streamer_sends_each_new_audio_frame_only_when_streaming() -> None:
+def window_frame_streamer() -> S3DramaFrameStreamer:
+    window = S3DramaVocoderFactoryArgs()
+    return S3DramaFrameStreamer(
+        eos_token_id=EOS_TOKEN_ID,
+        stream_stride=window.stream_stride,
+        stream_followup_stride_ramp=window.stream_followup_stride_ramp,
+        stream_followup_stride=window.stream_followup_stride,
+    )
+
+
+def sampled_row(frame_index: int) -> list[int]:
+    return [81, frame_index, 2, 3, 0]
+
+
+def streaming_request() -> S3DramaRequestData:
     request_data = built_request(frame_rows_of([3], seed=6)[0])
     payload = request_data.stage_payload
     assert payload is not None
-    frame_streamer = S3DramaFrameStreamer(eos_token_id=EOS_TOKEN_ID)
+    payload.request.params["stream"] = True
+    return request_data
+
+
+def test_frame_streamer_sends_the_first_window_by_frame_then_whole_windows() -> None:
+    request_data = built_request(frame_rows_of([3], seed=6)[0])
+    payload = request_data.stage_payload
+    assert payload is not None
+    frame_streamer = window_frame_streamer()
     request_output = RequestOutput(request_id="request-a")
-    request_data.frame_rows.append([81, 1, 2, 3, 0])
+    request_data.frame_rows.append(sampled_row(0))
 
     assert frame_streamer("request-a", request_data, request_output) == []
     payload.request.params["stream"] = True
-    [message] = frame_streamer("request-a", request_data, request_output)
-    request_data.frame_rows.append([EOS_TOKEN_ID, 0, 0, 0, 0])
+    sent: list[tuple[int, OutgoingMessage]] = []
+    for frame_index in range(1, 130):
+        request_data.frame_rows.append(sampled_row(frame_index))
+        for message in frame_streamer("request-a", request_data, request_output):
+            sent.append((frame_index + 1, message))
 
-    assert (message.request_id, message.type, message.target, message.metadata) == (
-        "request-a",
-        "stream",
-        "vocoder",
-        {"modality": "audio_codes"},
-    )
-    assert isinstance(message.data, torch.Tensor)
-    assert message.data.dtype == torch.int64
-    assert message.data.tolist() == [[81], [1], [2], [3], [0]]
-    assert frame_streamer("request-a", request_data, request_output) == []
+    first_window = [(frame_index, frame_index + 1) for frame_index in range(10)]
+    assert request_data.prompt_row_count == 3
+    assert [frame_count for frame_count, _ in sent] == [
+        *range(2, 11),
+        20,
+        32,
+        64,
+        128,
+    ]
+    for (start, end), (_, message) in zip(
+        [(0, 2), *first_window[2:], (10, 20), (20, 32), (32, 64), (64, 128)], sent
+    ):
+        assert (message.request_id, message.type, message.target) == (
+            "request-a",
+            "stream",
+            "vocoder",
+        )
+        assert message.metadata == {"modality": "audio_codes"}
+        assert isinstance(message.data, torch.Tensor)
+        assert message.data.dtype == torch.int64
+        assert message.data.T.tolist() == [
+            sampled_row(frame_index) for frame_index in range(start, end)
+        ]
+
+
+def test_frame_streamer_sends_the_window_a_multi_frame_step_completes() -> None:
+    request_data = streaming_request()
+    frame_streamer = window_frame_streamer()
+    request_output = RequestOutput(request_id="request-a")
+    sent: list[list[list[int]]] = []
+    for frame_indices in (range(0, 9), range(9, 11), range(11, 20), range(20, 21)):
+        request_data.frame_rows.extend(map(sampled_row, frame_indices))
+        for message in frame_streamer("request-a", request_data, request_output):
+            assert isinstance(message.data, torch.Tensor)
+            sent.append(message.data.T.tolist())
+
+    assert sent == [
+        [sampled_row(frame_index) for frame_index in range(0, 9)],
+        [sampled_row(9)],
+        [sampled_row(frame_index) for frame_index in range(10, 20)],
+    ]
+
+
+def test_frame_streamer_leaves_an_eos_on_a_window_end_to_the_result() -> None:
+    request_data = streaming_request()
+    frame_streamer = window_frame_streamer()
+    request_output = RequestOutput(request_id="request-a")
+    sent: list[OutgoingMessage] = []
+    for frame_index in range(19):
+        request_data.frame_rows.append(sampled_row(frame_index))
+        sent += frame_streamer("request-a", request_data, request_output)
+    request_data.frame_rows.append([EOS_TOKEN_ID, 0, 0, 0, 0])
+    eos_step_messages = frame_streamer("request-a", request_data, request_output)
+
+    assert len(sent) == 10
+    assert eos_step_messages == []
+    assert request_data.streamed_frame_count == 10
 
 
 def test_streamed_and_result_frames_stay_on_cpu_under_another_default_device() -> None:
-    request_data = built_request(frame_rows_of([3], seed=7)[0])
-    payload = request_data.stage_payload
-    assert payload is not None
-    payload.request.params["stream"] = True
-    request_data.frame_rows.append([81, 1, 2, 3, 0])
+    request_data = streaming_request()
+    request_data.frame_rows.extend(map(sampled_row, range(10)))
     request_data.finish_reason = "length"
 
     with torch.device("meta"):
-        [message] = S3DramaFrameStreamer(eos_token_id=EOS_TOKEN_ID)(
+        [message] = window_frame_streamer()(
             "request-a", request_data, RequestOutput(request_id="request-a")
         )
         result = S3DramaResultAdapter(eos_token_id=EOS_TOKEN_ID)(request_data).data
@@ -532,7 +613,9 @@ def test_streamed_and_result_frames_stay_on_cpu_under_another_default_device() -
     assert isinstance(result, S3DramaGenerationResult)
     for frames in (message.data.T, result.frames):
         assert (frames.device.type, frames.dtype) == ("cpu", torch.int64)
-        assert frames.tolist() == [[81, 1, 2, 3, 0]]
+        assert frames.tolist() == [
+            sampled_row(frame_index) for frame_index in range(10)
+        ]
 
 
 def admitted_for_prefill(data: S3DramaRequestData, start: int, end: int) -> None:

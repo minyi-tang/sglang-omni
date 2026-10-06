@@ -27,6 +27,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     resampled_choice_count,
     schedule_problems,
     stray_write_problems,
+    stream_problems,
     wave_admission_problems,
 )
 from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
@@ -421,6 +422,15 @@ def test_decode_steps_write_only_their_own_slots(engine_runs: GraphEngineRuns) -
             assert not problems, f"{name}:\n{first_problems(problems)}"
 
 
+def test_streaming_requests_send_each_frame_once_a_whole_window_at_a_time(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = stream_problems(run)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+
+
 def test_every_request_finishes_once_and_pools_return(
     engine_runs: GraphEngineRuns,
 ) -> None:
@@ -440,7 +450,7 @@ def test_rows_and_states_an_abort_freed_serve_the_next_wave(
     aborted = [
         outcome for outcome in run.outcomes.values() if outcome.aborted_after_frames
     ]
-    assert [outcome.aborted_after_frames for outcome in aborted] == [8]
+    assert [outcome.aborted_after_frames for outcome in aborted] == [15]
     aborted_id = aborted[0].request_id
     scenario_records = [
         record

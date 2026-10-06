@@ -50,6 +50,7 @@ class GraphRequestSpec(BaseModel):
     end_at_frame: int | None = None
     # The runner aborts the request once it has sampled this many frames.
     abort_after_frames: int | None = None
+    is_streaming: bool = False
 
 
 class GraphScenario(BaseModel):
@@ -148,6 +149,7 @@ class GraphRequestOutcome:
     request_spec: GraphRequestSpec
     aborted_after_frames: int | None = None
     result_frames: list[list[list[int]]] = field(default_factory=list)
+    streamed_frame_chunks: list[list[list[int]]] = field(default_factory=list)
     error_messages: list[str] = field(default_factory=list)
 
 
@@ -217,6 +219,7 @@ GREEDY_STAGGERED = GraphScenario(
                 prompt_name=prompt_name,
                 max_new_tokens=6 + 2 * index,
                 end_at_frame=4 if prompt_name == "p13" else None,
+                is_streaming=True,
             )
             for index, prompt_name in enumerate(WAVE_PROMPTS)
         ]
@@ -234,7 +237,10 @@ GREEDY_ABORT_REUSE = GraphScenario(
             GraphRequestSpec(prompt_name="p13", max_new_tokens=16),
             GraphRequestSpec(prompt_name="p23", max_new_tokens=18),
             GraphRequestSpec(
-                prompt_name="p31", max_new_tokens=24, abort_after_frames=8
+                prompt_name="p31",
+                max_new_tokens=24,
+                abort_after_frames=15,
+                is_streaming=True,
             ),
         ],
         [
@@ -250,7 +256,9 @@ GREEDY_RETRACT = GraphScenario(
     sampling_mode="greedy",
     waves=[
         [
-            GraphRequestSpec(prompt_name=prompt_name, max_new_tokens=40)
+            GraphRequestSpec(
+                prompt_name=prompt_name, max_new_tokens=40, is_streaming=True
+            )
             for prompt_name in ["p9", "p23", "p31"]
         ]
     ],

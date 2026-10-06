@@ -21,11 +21,19 @@ DEFAULT_MAX_RUNNING_REQUESTS = 16
 DEFAULT_MAX_NEW_TOKENS_CAP = 2048
 # A prompt with more rows is refused before admission (HTTP 400).
 DEFAULT_MAX_PROMPT_ROWS = 8192
+DEFAULT_STREAM_STRIDE = 10
+DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP = (10, 12, 32)
+DEFAULT_STREAM_FOLLOWUP_STRIDE = 64
 # The codec of the public S2-Pro release, pinned to an immutable commit.
 DEFAULT_CODEC_PATH = "fishaudio/s2-pro@1de9996b6be38b745688de084d87a5633f714e4e"
 PREPROCESSING_TOTAL_RESERVE_BYTES = "6GiB"
 TTS_ENGINE_GPU_MEMORY_FRACTION = 0.70
 VOCODER_GPU_MEMORY_FRACTION = 0.10
+VOCODER_WINDOW_FIELDS = (
+    "stream_stride",
+    "stream_followup_stride_ramp",
+    "stream_followup_stride",
+)
 
 
 class S3DramaPreprocessingFactoryArgs(FactoryArgs):
@@ -60,9 +68,11 @@ class S3DramaVocoderFactoryArgs(FactoryArgs):
     emitted frames of left context and no crossfade."""
 
     codec_path: str = DEFAULT_CODEC_PATH
-    stream_stride: int = Field(default=10, ge=1)
-    stream_followup_stride_ramp: tuple[PositiveInt, ...] = (10, 12, 32)
-    stream_followup_stride: int = Field(default=64, ge=1)
+    stream_stride: int = Field(default=DEFAULT_STREAM_STRIDE, ge=1)
+    stream_followup_stride_ramp: tuple[PositiveInt, ...] = (
+        DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP
+    )
+    stream_followup_stride: int = Field(default=DEFAULT_STREAM_FOLLOWUP_STRIDE, ge=1)
     stream_overlap_tokens: int = Field(default=32, ge=0)
     stream_crossfade_samples: int = Field(default=0, ge=0)
     max_batch_size: int = Field(default=8, ge=1)
@@ -78,7 +88,7 @@ class S3DramaVocoderStageConfig(StageConfig):
 
 
 class S3DramaPipelineConfig(PipelineConfig):
-    """preprocessing → tts_engine → vocoder, streaming audio frame by frame."""
+    """preprocessing → tts_engine → vocoder."""
 
     architecture: ClassVar[str] = "FishOmniModel"
     requires_model_capabilities: ClassVar[bool] = True
@@ -156,16 +166,33 @@ class S3DramaPipelineConfig(PipelineConfig):
                 )
             else:
                 pass
+        engine_extra = self.stage_named("tts_engine").factory.model_extra or {}
+        for field_name in VOCODER_WINDOW_FIELDS:
+            if field_name in engine_extra:
+                raise ValueError(
+                    f"S3-drama's tts_engine takes {field_name} from the vocoder "
+                    f"stage; set stages.vocoder.factory.{field_name} instead"
+                )
+            else:
+                pass
 
-    def stage_factory_kwargs(self, stage_name: str) -> dict[str, int | str]:
+    def stage_factory_kwargs(
+        self, stage_name: str
+    ) -> dict[str, int | str | tuple[int, ...]]:
+        engine_factory = self.stage_named("tts_engine").factory
+        vocoder_factory = self.stage_named("vocoder").factory
+        assert isinstance(engine_factory, S3DramaEngineFactoryArgs)
+        assert isinstance(vocoder_factory, S3DramaVocoderFactoryArgs)
         if stage_name == "preprocessing":
-            engine_factory = self.stage_named("tts_engine").factory
-            vocoder_factory = self.stage_named("vocoder").factory
-            assert isinstance(engine_factory, S3DramaEngineFactoryArgs)
-            assert isinstance(vocoder_factory, S3DramaVocoderFactoryArgs)
             return {
                 "max_prompt_rows": engine_factory.max_prompt_rows,
                 "codec_path": vocoder_factory.codec_path,
+            }
+        elif stage_name == "tts_engine":
+            return {
+                "stream_stride": vocoder_factory.stream_stride,
+                "stream_followup_stride_ramp": vocoder_factory.stream_followup_stride_ramp,
+                "stream_followup_stride": vocoder_factory.stream_followup_stride,
             }
         else:
             return {}

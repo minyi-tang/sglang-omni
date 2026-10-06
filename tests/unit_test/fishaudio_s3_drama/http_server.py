@@ -22,6 +22,9 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
     DEFAULT_MAX_RUNNING_REQUESTS,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+    DEFAULT_STREAM_STRIDE,
     S3DramaPipelineConfig,
 )
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
@@ -89,10 +92,16 @@ def create_eos_masked_tts_engine_executor(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS_CAP,
     max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
     server_args_overrides: Mapping[str, object] | None = None,
+    stream_stride: int = DEFAULT_STREAM_STRIDE,
+    stream_followup_stride_ramp: tuple[int, ...] = DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+    stream_followup_stride: int = DEFAULT_STREAM_FOLLOWUP_STRIDE,
 ) -> OmniScheduler[S3DramaRequestData]:
     return EosMaskedEngineBuilder(
         context_length=context_length,
         max_running_requests=max_running_requests,
+        stream_stride=stream_stride,
+        stream_followup_stride_ramp=stream_followup_stride_ramp,
+        stream_followup_stride=stream_followup_stride,
         max_prompt_rows=max_prompt_rows,
         max_new_tokens_cap=max_new_tokens,
     ).build(

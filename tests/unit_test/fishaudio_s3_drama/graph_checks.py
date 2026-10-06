@@ -8,9 +8,13 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.sampling import (
     EMPTY_RAS_SLOT,
     RAS_WINDOW_FRAMES,
+)
+from sglang_omni.models.fishaudio_s3_drama.stream_windows import (
+    frames_in_complete_windows,
 )
 from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     CUDA_GRAPH_BATCH_SIZES,
@@ -400,6 +404,64 @@ def outcome_problems(run: GraphEngineRun) -> list[str]:
             )
         elif outcome.result_frames and outcome.result_frames[0] != returned_frames:
             problems.append(f"{run.kind} {request_id}: result is not its frames")
+        else:
+            pass
+    return problems
+
+
+def stream_problems(run: GraphEngineRun) -> list[str]:
+    window = S3DramaVocoderFactoryArgs()
+    sampled_frames: dict[str, list[list[int]]] = {}
+    for record in run.forwards:
+        for step in record.steps:
+            sampled_frames.setdefault(step.request_id, []).append(step.sampled_frame)
+    problems = []
+    for request_id, outcome in run.outcomes.items():
+        request_frames = sampled_frames.get(request_id, [])
+        audio_frames = (
+            request_frames[:-1]
+            if request_frames and request_frames[-1][0] == EOS_TOKEN_ID
+            else request_frames
+        )
+        if outcome.aborted_after_frames is None:
+            frame_count = len(audio_frames)
+        else:
+            frame_count = outcome.aborted_after_frames
+        expected_chunk_ends = sorted(
+            {
+                (
+                    sampled_count
+                    if sampled_count <= window.stream_stride
+                    else frames_in_complete_windows(
+                        sampled_count,
+                        stream_stride=window.stream_stride,
+                        stream_followup_stride_ramp=window.stream_followup_stride_ramp,
+                        stream_followup_stride=window.stream_followup_stride,
+                    )
+                )
+                for sampled_count in range(1, frame_count + 1)
+            }
+        )
+        chunk_ends = [
+            sum(len(chunk) for chunk in outcome.streamed_frame_chunks[: index + 1])
+            for index in range(len(outcome.streamed_frame_chunks))
+        ]
+        streamed = [frame for chunk in outcome.streamed_frame_chunks for frame in chunk]
+        if not outcome.request_spec.is_streaming:
+            if streamed:
+                problems.append(f"{run.kind} {request_id}: streamed without stream")
+            else:
+                pass
+        elif chunk_ends != expected_chunk_ends:
+            problems.append(
+                f"{run.kind} {request_id}: chunks end at {chunk_ends}, not at "
+                f"{expected_chunk_ends} of {frame_count} frames"
+            )
+        elif streamed != audio_frames[: len(streamed)]:
+            problems.append(
+                f"{run.kind} {request_id}: streamed frames are not its first "
+                f"{len(streamed)} sampled frames"
+            )
         else:
             pass
     return problems

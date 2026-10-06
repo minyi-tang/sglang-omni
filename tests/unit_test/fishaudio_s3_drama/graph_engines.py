@@ -177,6 +177,10 @@ class GraphSchedulerDriver:
             result = payload.data
             assert isinstance(result, S3DramaGenerationResult)
             outcome.result_frames.append(result.frames.tolist())
+        elif message.type == "stream":
+            frames = message.data
+            assert isinstance(frames, torch.Tensor)
+            outcome.streamed_frame_chunks.append(frames.T.tolist())
         elif message.type == "error":
             outcome.error_messages.append(repr(message.data))
         else:
@@ -203,7 +207,10 @@ class GraphSchedulerDriver:
         )
         payload = StagePayload(
             request_id=request_id,
-            request=OmniRequest(inputs=request_spec.prompt_name),
+            request=OmniRequest(
+                inputs=request_spec.prompt_name,
+                params={"stream": request_spec.is_streaming},
+            ),
             data=S3DramaGenerationInput(
                 prompt_rows=torch.tensor(
                     self.prompts[request_spec.prompt_name], dtype=torch.int64

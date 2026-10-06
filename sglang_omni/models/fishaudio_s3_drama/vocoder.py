@@ -41,33 +41,6 @@ def generation_result_of(payload: StagePayload) -> S3DramaGenerationResult:
         return result
 
 
-def stream_window_lengths(
-    *,
-    stream_stride: int,
-    stream_followup_stride_ramp: tuple[int, ...],
-    stream_followup_stride: int,
-    stream_overlap_tokens: int,
-) -> tuple[int, ...]:
-    strides = (stream_stride, *stream_followup_stride_ramp)
-    lengths: set[int] = set()
-    emitted_frames = 0
-    window_index = 0
-    while True:
-        stride = (
-            strides[window_index]
-            if window_index < len(strides)
-            else stream_followup_stride
-        )
-        window_end = emitted_frames + stride
-        lengths.add(window_end - max(0, emitted_frames - stream_overlap_tokens))
-        if window_index >= len(strides) and emitted_frames >= stream_overlap_tokens:
-            return tuple(sorted(lengths))
-        else:
-            pass
-        emitted_frames = window_end
-        window_index += 1
-
-
 class WindowGraphDecoder:
     def __init__(
         self,

@@ -12,6 +12,9 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig, checked_int
+from sglang_omni.models.fishaudio_s3_drama.stream_windows import (
+    frames_in_complete_windows,
+)
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend.request_data import SGLangARRequestData
@@ -55,6 +58,7 @@ class S3DramaRequestData(SGLangARRequestData):
 
     frame_rows: list[list[int]] = field(default_factory=list)
     prompt_row_count: int = 0
+    streamed_frame_count: int = 0
 
 
 class S3DramaRequestBuilder:
@@ -240,13 +244,18 @@ class S3DramaResultAdapter:
 
 
 class S3DramaFrameStreamer:
-    """Sends each newly sampled audio frame to the vocoder when the caller streams.
-
-    A frame goes as int64 [1 + num_codebooks, 1]; the end-of-speech frame never does.
-    """
-
-    def __init__(self, *, eos_token_id: int) -> None:
+    def __init__(
+        self,
+        *,
+        eos_token_id: int,
+        stream_stride: int,
+        stream_followup_stride_ramp: tuple[int, ...],
+        stream_followup_stride: int,
+    ) -> None:
         self.eos_token_id = eos_token_id
+        self.stream_stride = stream_stride
+        self.stream_followup_stride_ramp = stream_followup_stride_ramp
+        self.stream_followup_stride = stream_followup_stride
 
     def __call__(
         self,
@@ -259,19 +268,38 @@ class S3DramaFrameStreamer:
         the request's history."""
         payload = request_data.stage_payload
         assert payload is not None
-        newest_frame = request_data.frame_rows[-1]
         if not payload.request.params.get("stream"):
             return []
-        elif newest_frame[0] == self.eos_token_id:
+        elif request_data.frame_rows[-1][0] == self.eos_token_id:
             return []
         else:
+            pass
+        sampled_frame_count = (
+            len(request_data.frame_rows) - request_data.prompt_row_count
+        )
+        if sampled_frame_count <= self.stream_stride:
+            window_end = sampled_frame_count
+        else:
+            window_end = frames_in_complete_windows(
+                sampled_frame_count,
+                stream_stride=self.stream_stride,
+                stream_followup_stride_ramp=self.stream_followup_stride_ramp,
+                stream_followup_stride=self.stream_followup_stride,
+            )
+        if window_end <= request_data.streamed_frame_count:
+            return []
+        else:
+            window_start_row = (
+                request_data.prompt_row_count + request_data.streamed_frame_count
+            )
+            window_end_row = request_data.prompt_row_count + window_end
+            window_rows = request_data.frame_rows[window_start_row:window_end_row]
+            request_data.streamed_frame_count = window_end
             return [
                 OutgoingMessage(
                     request_id=request_id,
                     type="stream",
-                    data=torch.tensor(
-                        [newest_frame], dtype=torch.int64, device="cpu"
-                    ).T,
+                    data=torch.tensor(window_rows, dtype=torch.int64, device="cpu").T,
                     target=VOCODER_STAGE,
                     metadata={"modality": "audio_codes"},
                 )

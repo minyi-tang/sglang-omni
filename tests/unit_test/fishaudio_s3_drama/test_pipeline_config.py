@@ -106,6 +106,9 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "max_running_requests": 16,
         "max_new_tokens": 2048,
         "max_prompt_rows": 8192,
+        "stream_stride": 10,
+        "stream_followup_stride_ramp": (10, 12, 32),
+        "stream_followup_stride": 64,
     }
     assert launch_kwargs(config, "vocoder") == {
         "gpu_id": 0,
@@ -154,6 +157,43 @@ def test_preprocessing_cannot_set_what_it_derives(
         manager.merge_config([(f"preprocessing.factory.{field_name}", value)])
 
     assert f"set stages.{owner}.factory.{field_name} instead" in str(rejection.value)
+
+
+def test_the_engine_streams_by_the_vocoder_windows() -> None:
+    config = ConfigManager(S3DramaPipelineConfig(model_path="checkpoint")).merge_config(
+        [
+            ("vocoder.factory.stream_stride", "8"),
+            ("vocoder.factory.stream_followup_stride_ramp", "[8, 16]"),
+            ("vocoder.factory.stream_followup_stride", "48"),
+        ]
+    )
+    assert isinstance(config, S3DramaPipelineConfig)
+
+    engine_kwargs = launch_kwargs(config, "tts_engine")
+    vocoder_kwargs = launch_kwargs(config, "vocoder")
+    for field_name, value in (
+        ("stream_stride", 8),
+        ("stream_followup_stride_ramp", (8, 16)),
+        ("stream_followup_stride", 48),
+    ):
+        assert engine_kwargs[field_name] == vocoder_kwargs[field_name] == value
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        pytest.param("stream_stride", "8", id="stride"),
+        pytest.param("stream_followup_stride_ramp", "[8, 16]", id="ramp"),
+        pytest.param("stream_followup_stride", "48", id="followup-stride"),
+    ],
+)
+def test_the_engine_cannot_set_the_vocoder_windows(field_name: str, value: str) -> None:
+    manager = ConfigManager(S3DramaPipelineConfig(model_path="checkpoint"))
+
+    with pytest.raises(ValidationError) as rejection:
+        manager.merge_config([(f"tts_engine.factory.{field_name}", value)])
+
+    assert f"set stages.vocoder.factory.{field_name} instead" in str(rejection.value)
 
 
 def test_the_example_config_loads_with_a_local_checkpoint_placeholder() -> None:

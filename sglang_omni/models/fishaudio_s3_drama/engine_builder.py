@@ -19,6 +19,9 @@ from sglang_omni.models.fishaudio_s3_drama import CAPABILITIES
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+    DEFAULT_STREAM_STRIDE,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import S3DramaModelRunner
@@ -65,11 +68,19 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         *,
         context_length: int,
         max_running_requests: int,
+        stream_stride: int = DEFAULT_STREAM_STRIDE,
+        stream_followup_stride_ramp: tuple[
+            int, ...
+        ] = DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+        stream_followup_stride: int = DEFAULT_STREAM_FOLLOWUP_STRIDE,
         max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
         max_new_tokens_cap: int = DEFAULT_MAX_NEW_TOKENS_CAP,
     ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
+        self.stream_stride = stream_stride
+        self.stream_followup_stride_ramp = stream_followup_stride_ramp
+        self.stream_followup_stride = stream_followup_stride
         self.max_prompt_rows = max_prompt_rows
         self.max_new_tokens_cap = max_new_tokens_cap
         self.frame_streamer: S3DramaFrameStreamer | None = None
@@ -191,7 +202,10 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         self, model: S3DramaForCausalLM
     ) -> tuple[S3DramaRequestBuilder, S3DramaResultAdapter]:
         self.frame_streamer = S3DramaFrameStreamer(
-            eos_token_id=model.config.eos_token_id
+            eos_token_id=model.config.eos_token_id,
+            stream_stride=self.stream_stride,
+            stream_followup_stride_ramp=self.stream_followup_stride_ramp,
+            stream_followup_stride=self.stream_followup_stride,
         )
         return (
             S3DramaRequestBuilder(

@@ -25,6 +25,9 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
     DEFAULT_MAX_RUNNING_REQUESTS,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE,
+    DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+    DEFAULT_STREAM_STRIDE,
 )
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import S3DramaEngineBuilder
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
@@ -32,10 +35,10 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import S3DramaReques
 from sglang_omni.models.fishaudio_s3_drama.speech_request import (
     S3DramaSpeechPreprocessor,
 )
+from sglang_omni.models.fishaudio_s3_drama.stream_windows import stream_window_lengths
 from sglang_omni.models.fishaudio_s3_drama.vocoder import (
     S3DramaVocoderScheduler,
     WindowGraphDecoder,
-    stream_window_lengths,
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.reference_encoder import ReferenceEncodeService
@@ -138,6 +141,9 @@ def create_tts_engine_executor(
     max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS_CAP,
     max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
     server_args_overrides: Mapping[str, object] | None = None,
+    stream_stride: int = DEFAULT_STREAM_STRIDE,
+    stream_followup_stride_ramp: tuple[int, ...] = DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
+    stream_followup_stride: int = DEFAULT_STREAM_FOLLOWUP_STRIDE,
 ) -> OmniScheduler[S3DramaRequestData]:
     """The engine; max_new_tokens caps a request that sets none."""
     overrides = dict(server_args_overrides or {})
@@ -158,6 +164,9 @@ def create_tts_engine_executor(
     return S3DramaEngineBuilder(
         context_length=context_length,
         max_running_requests=max_running_requests,
+        stream_stride=stream_stride,
+        stream_followup_stride_ramp=stream_followup_stride_ramp,
+        stream_followup_stride=stream_followup_stride,
         max_prompt_rows=max_prompt_rows,
         max_new_tokens_cap=max_new_tokens,
     ).build(
