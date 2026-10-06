@@ -555,7 +555,11 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
         batch_codes = torch.stack(padded, dim=0)
 
         with torch.no_grad():
-            audio = self.codec.from_indices(batch_codes)
+            audio = (
+                self.codec.from_indices
+                if self.decode_window is None
+                else self.decode_window
+            )(batch_codes)
 
         samples_per_token = int(self.codec.frame_length)
         return [

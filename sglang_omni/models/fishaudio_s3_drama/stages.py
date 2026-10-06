@@ -16,6 +16,10 @@ from sglang_omni.models.fishaudio_s2_pro.stages import (
     FishReferenceEncodeHook,
     load_codec,
 )
+from sglang_omni.models.fishaudio_s2_pro.streaming_vocoder import WindowDecoder
+from sglang_omni.models.fishaudio_s3_drama.channels_last_decoder import (
+    ChannelsLastDecoder,
+)
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_CONTEXT_LENGTH,
     DEFAULT_MAX_NEW_TOKENS_CAP,
@@ -182,13 +186,18 @@ def create_vocoder_executor(
     max_batch_size: int,
     max_batch_wait_ms: int,
     window_cuda_graphs: bool,
+    decode_dtype: Literal["float32", "float16"],
 ) -> S3DramaVocoderScheduler:
     resolved_device = str(resolve_concrete_device(device, gpu_id))
     codec = load_codec(resolve_codec_directory(codec_path), resolved_device)
     codec.fold_weight_norm()
+    if decode_dtype == "float16":
+        decode: WindowDecoder = ChannelsLastDecoder(codec, dtype=torch.float16)
+    else:
+        decode = codec.from_indices
     if window_cuda_graphs:
-        decode_window = WindowGraphDecoder(
-            codec.from_indices,
+        decode_window: WindowDecoder = WindowGraphDecoder(
+            decode,
             num_codebooks=codec.quantizer.semantic_quantizer.n_codebooks
             + codec.quantizer.quantizer.n_codebooks,
             frame_length=int(codec.frame_length),
@@ -201,7 +210,7 @@ def create_vocoder_executor(
             ),
         )
     else:
-        decode_window = None
+        decode_window = decode
     return S3DramaVocoderScheduler(
         codec,
         device=resolved_device,

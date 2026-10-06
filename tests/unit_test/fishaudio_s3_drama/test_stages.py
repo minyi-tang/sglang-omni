@@ -389,6 +389,7 @@ def cpu_vocoder(factory_args: S3DramaVocoderFactoryArgs) -> S3DramaVocoderSchedu
         max_batch_size=factory_args.max_batch_size,
         max_batch_wait_ms=factory_args.max_batch_wait_ms,
         window_cuda_graphs=factory_args.window_cuda_graphs,
+        decode_dtype=factory_args.decode_dtype,
     )
 
 
@@ -400,7 +401,7 @@ def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(
 
     vocoder = cpu_vocoder(
         S3DramaVocoderFactoryArgs(codec_path=str(codec_file)).model_copy(
-            update={"window_cuda_graphs": False}
+            update={"window_cuda_graphs": False, "decode_dtype": "float32"}
         )
     )
 
@@ -408,7 +409,7 @@ def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(
     assert codec_loads.calls == [(str(tmp_path), "cpu")]
     assert isinstance(vocoder.codec, FrameNumberCodec)
     assert vocoder.codec.is_weight_norm_folded
-    assert vocoder.decode_window is None
+    assert vocoder.decode_window == vocoder.codec.from_indices
     assert (
         vocoder.stream_stride,
         vocoder.stream_followup_stride_ramp,
@@ -426,4 +427,8 @@ def test_window_cuda_graphs_on_a_cpu_device_are_refused(
     codec_file.write_bytes(b"")
 
     with pytest.raises(RuntimeError, match="window_cuda_graphs to false"):
-        cpu_vocoder(S3DramaVocoderFactoryArgs(codec_path=str(codec_file)))
+        cpu_vocoder(
+            S3DramaVocoderFactoryArgs(codec_path=str(codec_file)).model_copy(
+                update={"decode_dtype": "float32"}
+            )
+        )

@@ -112,6 +112,7 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "codec_path": DEFAULT_CODEC_PATH,
         **VOCODER_WINDOWS,
         "window_cuda_graphs": True,
+        "decode_dtype": "float16",
     }
 
 

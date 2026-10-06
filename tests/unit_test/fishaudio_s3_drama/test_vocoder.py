@@ -10,6 +10,10 @@ import pytest
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.streaming_vocoder import WindowDecoder
+from sglang_omni.models.fishaudio_s3_drama.channels_last_decoder import (
+    ChannelsLastDecoder,
+    snake_channels_last_kernel,
+)
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationResult,
@@ -22,6 +26,7 @@ from sglang_omni.models.fishaudio_s3_drama.vocoder import (
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
+from tests.unit_test.fishaudio_s2_pro.test_vocoder import tiny_codec
 
 SAMPLES_PER_FRAME = 4
 SAMPLE_RATE = 44100
@@ -394,6 +399,101 @@ def test_a_non_streaming_batch_decodes_once() -> None:
             "total_tokens": PROMPT_ROW_COUNT + frame_count,
         }
         assert result.data["finish_reason"] == finish_reason
+
+
+def test_a_non_streaming_batch_decodes_through_the_given_window_decoder() -> None:
+    codec = FrameNumberCodec()
+    decoded_shapes: list[tuple[int, ...]] = []
+
+    def decode_window(indices: torch.Tensor) -> torch.Tensor:
+        decoded_shapes.append(tuple(indices.shape))
+        return codec.from_indices(indices)
+
+    vocoder = vocoder_with(codec, decode_window)
+
+    results = vocoder.vocode_payloads(
+        [
+            final_payload(numbered_frames(5), is_streaming=False),
+            final_payload(numbered_frames(7), is_streaming=False),
+        ]
+    )
+
+    assert decoded_shapes == [(2, NUM_CODEBOOKS, 7)]
+    assert [len(result.data["audio_data"]) for result in results] == [
+        5 * SAMPLES_PER_FRAME,
+        7 * SAMPLES_PER_FRAME,
+    ]
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_the_snake_kernel_follows_the_formula_on_a_trimmed_activation(
+    dtype: torch.dtype,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    channel_count = 96
+    alpha = torch.rand(channel_count, generator=generator, device="cuda") * 4 + 0.05
+    inverse_alpha = (alpha + 1e-9).reciprocal()
+    untrimmed = torch.randn(
+        (3, 130, channel_count), generator=generator, device="cuda"
+    ).to(dtype)
+    activation = untrimmed[:, :125]
+    output = torch.empty(activation.shape, dtype=dtype, device="cuda")
+
+    snake_channels_last_kernel[(12, 2)](
+        activation,
+        alpha,
+        inverse_alpha,
+        output,
+        3 * 125,
+        125,
+        channel_count,
+        activation.stride(0) // channel_count,
+        BLOCK_ROWS=32,
+        BLOCK_CHANNELS=64,
+    )
+
+    exact = activation.double() + (alpha.double() + 1e-9).reciprocal() * torch.sin(
+        alpha.double() * activation.double()
+    ).pow(2)
+    torch.testing.assert_close(output, exact.to(dtype))
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.float32, 1e-4), (torch.float16, 2e-2)],
+    ids=["float32", "float16"],
+)
+def test_the_channels_last_decoder_decodes_like_the_codec(
+    monkeypatch: pytest.MonkeyPatch, dtype: torch.dtype, tolerance: float
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    reference = tiny_codec().cuda()
+    reference.fold_weight_norm()
+    channels_last = tiny_codec().cuda()
+    channels_last.fold_weight_norm()
+    decoder = ChannelsLastDecoder(channels_last, dtype=dtype)
+    codes = torch.randint(0, 16, (2, 10, 24), device="cuda")
+
+    with torch.no_grad():
+        expected = reference.from_indices(codes.clone())
+        decoded = decoder(codes.clone())
+
+    assert decoded.dtype == dtype
+    assert decoded.shape == expected.shape
+    torch.testing.assert_close(
+        decoded.float(), expected, rtol=tolerance, atol=tolerance
+    )
 
 
 def test_the_ramp_advances_when_a_crossfade_holds_back_a_whole_window() -> None:

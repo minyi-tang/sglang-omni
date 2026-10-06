@@ -68,6 +68,7 @@ class S3DramaVocoderFactoryArgs(FactoryArgs):
     max_batch_size: int = Field(default=8, ge=1)
     max_batch_wait_ms: int = Field(default=2, ge=0)
     window_cuda_graphs: bool = True
+    decode_dtype: Literal["float32", "float16"] = "float16"
 
 
 class S3DramaVocoderStageConfig(StageConfig):
