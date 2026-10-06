@@ -46,6 +46,15 @@ def semantic_bias() -> torch.Tensor:
     return bias
 
 
+def candidate_token_ids() -> torch.Tensor:
+    return torch.cat(
+        (
+            torch.tensor([EOS_TOKEN_ID]),
+            torch.arange(SEMANTIC_BEGIN_ID, SEMANTIC_BEGIN_ID + CODEBOOK_SIZE),
+        )
+    )
+
+
 def test_top_k_one_takes_the_argmax() -> None:
     torch.manual_seed(0)
     logits = torch.randn(64, 32)
@@ -108,12 +117,18 @@ def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
     rows = 8
     logits = ras_logits(rows)
     temperature, top_k, top_p = request_parameters(rows, 1.0, 1, 1.0)
-    biased_logits = logits + semantic_bias()
+    candidates = candidate_token_ids()
+    candidate_logits = logits[:, candidates]
     torch.manual_seed(3)
-    first_draw = sample_top_k_top_p(biased_logits, temperature, top_k, top_p)
-    second_draw = sample_top_k_top_p(
-        biased_logits, *request_parameters(rows, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P)
-    )
+    first_draw = candidates[
+        sample_top_k_top_p(candidate_logits, temperature, top_k, top_p)
+    ]
+    second_draw = candidates[
+        sample_top_k_top_p(
+            candidate_logits,
+            *request_parameters(rows, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P),
+        )
+    ]
     window = torch.full((rows, 16), EMPTY_WINDOW_TOKEN)
     window[::2, 7] = first_draw[::2]
     is_repeat = torch.tensor([True, False] * (rows // 2))
@@ -121,7 +136,7 @@ def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
     torch.manual_seed(3)
     main_tokens, codebook_zero = sample_semantic_with_ras(
         logits,
-        semantic_bias(),
+        candidate_token_ids(),
         window,
         temperature,
         top_k,
@@ -147,7 +162,7 @@ def test_ras_draws_the_same_random_numbers_with_or_without_a_hit() -> None:
         torch.manual_seed(5)
         sample_semantic_with_ras(
             logits,
-            semantic_bias(),
+            candidate_token_ids(),
             window,
             *parameters,
             SEMANTIC_BEGIN_ID,
@@ -158,7 +173,7 @@ def test_ras_draws_the_same_random_numbers_with_or_without_a_hit() -> None:
     assert torch.equal(next_numbers[0], next_numbers[1])
 
 
-def test_semantic_bias_allows_only_the_band_and_eos() -> None:
+def test_semantic_sampling_allows_only_the_band_and_eos() -> None:
     torch.manual_seed(0)
     rows = DRAW_COUNT
     logits = torch.zeros(rows, TEXT_VOCAB_SIZE)
@@ -167,7 +182,7 @@ def test_semantic_bias_allows_only_the_band_and_eos() -> None:
 
     main_tokens, codebook_zero = sample_semantic_with_ras(
         logits,
-        semantic_bias(),
+        candidate_token_ids(),
         window,
         *request_parameters(rows, 1.0, TEXT_VOCAB_SIZE, 1.0),
         SEMANTIC_BEGIN_ID,
@@ -176,7 +191,7 @@ def test_semantic_bias_allows_only_the_band_and_eos() -> None:
     logits[:, EOS_TOKEN_ID] = 9.0
     eos_tokens, eos_codebook_zero = sample_semantic_with_ras(
         logits,
-        semantic_bias(),
+        candidate_token_ids(),
         window,
         *request_parameters(rows, 1.0, 1, 1.0),
         SEMANTIC_BEGIN_ID,
@@ -198,9 +213,134 @@ def test_ras_window_must_hold_sixteen_frames() -> None:
     with pytest.raises(ValueError, match="16"):
         sample_semantic_with_ras(
             logits,
-            semantic_bias(),
+            candidate_token_ids(),
             torch.full((1, 8), EMPTY_WINDOW_TOKEN),
             *request_parameters(1, 1.0, 1, 1.0),
             SEMANTIC_BEGIN_ID,
             CODEBOOK_SIZE,
         )
+
+
+def test_top_k_one_takes_the_token_the_biased_full_row_takes() -> None:
+    torch.manual_seed(0)
+    rows = 256
+    logits = torch.randn(rows, TEXT_VOCAB_SIZE)
+    parameters = request_parameters(rows, 1.0, 1, 1.0)
+
+    main_tokens, _ = sample_semantic_with_ras(
+        logits,
+        candidate_token_ids(),
+        torch.full((rows, 16), EMPTY_WINDOW_TOKEN),
+        *parameters,
+        SEMANTIC_BEGIN_ID,
+        CODEBOOK_SIZE,
+    )
+
+    assert torch.equal(
+        main_tokens, sample_top_k_top_p(logits + semantic_bias(), *parameters)
+    )
+
+
+@pytest.mark.accelerator
+def test_tied_top_tokens_resolve_as_in_the_biased_full_row_on_the_device() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    torch.manual_seed(0)
+    rows = 64
+    vocab_size, semantic_begin_id, codebook_size, eos_token_id = (
+        150000,
+        120000,
+        4096,
+        100000,
+    )
+    candidates = torch.cat(
+        (
+            torch.tensor([eos_token_id]),
+            torch.arange(semantic_begin_id, semantic_begin_id + codebook_size),
+        )
+    ).cuda()
+    bias = torch.full((vocab_size,), float("-inf"), device="cuda")
+    bias[candidates] = 0.0
+    logits = torch.randn(rows, vocab_size, device="cuda").to(torch.bfloat16)
+    top_logits = logits[:, candidates].amax(dim=-1)
+    for token_id in (eos_token_id, semantic_begin_id + 5, semantic_begin_id + 900):
+        logits[:, token_id] = top_logits
+    parameters = tuple(
+        tensor.cuda() for tensor in request_parameters(rows, 1.0, 1, 1.0)
+    )
+
+    main_tokens, _ = sample_semantic_with_ras(
+        logits,
+        candidates,
+        torch.full((rows, 16), EMPTY_WINDOW_TOKEN, device="cuda"),
+        *parameters,
+        semantic_begin_id,
+        codebook_size,
+    )
+
+    assert torch.equal(
+        main_tokens, sample_top_k_top_p(logits.float() + bias, *parameters)
+    )
+    assert set(main_tokens.tolist()) == {eos_token_id}
+
+
+def rule_probabilities(
+    logits: torch.Tensor, temperature: float, top_k: int, top_p: float
+) -> torch.Tensor:
+    probabilities = torch.softmax(logits.double() / temperature, dim=-1)
+    order = torch.argsort(probabilities, descending=True)
+    kept = torch.zeros_like(probabilities, dtype=torch.bool)
+    cumulative_probability = 0.0
+    for rank, column in enumerate(order.tolist()):
+        cumulative_probability += float(probabilities[column])
+        if rank > 0 and (rank >= top_k or cumulative_probability > top_p):
+            break
+        else:
+            kept[column] = True
+    kept_probabilities = probabilities * kept
+    return kept_probabilities / kept_probabilities.sum()
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_k", "top_p", "is_ras_draw"),
+    [
+        pytest.param(1.0, 30, 0.9, False, id="request-1.0-30-0.9"),
+        pytest.param(0.7, 8, 1.0, False, id="request-0.7-8-1.0"),
+        pytest.param(1.0, 1, 1.0, True, id="ras-draw"),
+    ],
+)
+def test_semantic_draws_follow_the_top_k_top_p_rule(
+    temperature: float, top_k: int, top_p: float, is_ras_draw: bool
+) -> None:
+    torch.manual_seed(0)
+    draw_count = 40000
+    logits = torch.full((TEXT_VOCAB_SIZE,), 30.0)
+    candidates = candidate_token_ids()
+    logits[candidates] = torch.randn(candidates.numel()) * 1.5
+    window = torch.full((draw_count, 16), EMPTY_WINDOW_TOKEN)
+    if is_ras_draw:
+        window[:, 0] = int(candidates[logits[candidates].argmax()])
+        expected = rule_probabilities(
+            logits[candidates], RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P
+        )
+    else:
+        expected = rule_probabilities(logits[candidates], temperature, top_k, top_p)
+
+    main_tokens, _ = sample_semantic_with_ras(
+        logits.repeat(draw_count, 1),
+        candidates,
+        window,
+        *request_parameters(draw_count, temperature, top_k, top_p),
+        SEMANTIC_BEGIN_ID,
+        CODEBOOK_SIZE,
+    )
+
+    columns = torch.searchsorted(candidates, main_tokens)
+    assert torch.equal(candidates[columns], main_tokens)
+    frequencies = torch.bincount(columns, minlength=candidates.numel()).double()
+    frequencies /= draw_count
+    standard_errors = (expected * (1 - expected) / draw_count).sqrt()
+    assert bool(((frequencies - expected).abs() <= 5 * standard_errors + 1e-9).all())
+    assert bool((frequencies[expected == 0] == 0).all())

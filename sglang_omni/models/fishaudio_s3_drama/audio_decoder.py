@@ -226,13 +226,17 @@ class AudioDecoder(nn.Module):
             nn.Linear(decoder_config.dim, self.codebook_size, bias=False)
             for _ in range(self.num_codebooks - 1)
         )
-        semantic_logit_bias = torch.full(
-            (config.text_config.vocab_size,), float("-inf")
-        )
-        semantic_logit_bias[self.semantic_begin_id : self.semantic_end_id + 1] = 0.0
-        semantic_logit_bias[config.eos_token_id] = 0.0
         self.register_buffer(
-            "semantic_logit_bias", semantic_logit_bias, persistent=False
+            "main_token_candidate_ids",
+            torch.unique(
+                torch.cat(
+                    (
+                        torch.tensor([config.eos_token_id]),
+                        torch.arange(self.semantic_begin_id, self.semantic_end_id + 1),
+                    )
+                )
+            ),
+            persistent=False,
         )
 
     def is_semantic(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -348,7 +352,7 @@ class AudioDecoder(nn.Module):
         """
         main_tokens, codebook_zero = sample_semantic_with_ras(
             semantic_logits,
-            self.semantic_logit_bias,
+            self.main_token_candidate_ids,
             previous_main_tokens,
             temperature,
             top_k,

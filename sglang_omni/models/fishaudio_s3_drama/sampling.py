@@ -53,7 +53,7 @@ def sample_top_k_top_p(
 
 def sample_semantic_with_ras(
     semantic_logits: torch.Tensor,
-    logit_bias: torch.Tensor,
+    candidate_token_ids: torch.Tensor,
     previous_main_tokens: torch.Tensor,
     temperature: torch.Tensor,
     top_k: torch.Tensor,
@@ -63,7 +63,6 @@ def sample_semantic_with_ras(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample each frame's main token and its codebook-0 code.
 
-    logit_bias is 0 for the tokens a frame may hold and -inf elsewhere;
     previous_main_tokens [rows, 16] are the main tokens of the last 16 frames.
     Both draws always happen, so the random stream does not depend on the window.
     """
@@ -74,16 +73,22 @@ def sample_semantic_with_ras(
         )
     else:
         pass
-    biased_logits = semantic_logits.float() + logit_bias.float()
-    first_draw = sample_top_k_top_p(biased_logits, temperature, top_k, top_p)
-    row_count = biased_logits.shape[0]
-    device = biased_logits.device
-    ras_draw = sample_top_k_top_p(
-        biased_logits,
-        torch.full((row_count,), RAS_TEMPERATURE, dtype=torch.float32, device=device),
-        torch.full((row_count,), RAS_TOP_K, dtype=torch.int64, device=device),
-        torch.full((row_count,), RAS_TOP_P, dtype=torch.float32, device=device),
-    )
+    candidate_logits = semantic_logits.index_select(-1, candidate_token_ids).float()
+    first_draw = candidate_token_ids[
+        sample_top_k_top_p(candidate_logits, temperature, top_k, top_p)
+    ]
+    row_count = candidate_logits.shape[0]
+    device = candidate_logits.device
+    ras_draw = candidate_token_ids[
+        sample_top_k_top_p(
+            candidate_logits,
+            torch.full(
+                (row_count,), RAS_TEMPERATURE, dtype=torch.float32, device=device
+            ),
+            torch.full((row_count,), RAS_TOP_K, dtype=torch.int64, device=device),
+            torch.full((row_count,), RAS_TOP_P, dtype=torch.float32, device=device),
+        )
+    ]
     is_repeat = (previous_main_tokens == first_draw.unsqueeze(-1)).any(dim=-1)
     main_tokens = torch.where(is_repeat, ras_draw, first_draw)
     codebook_zero = (main_tokens - semantic_begin_id).clamp(0, codebook_size - 1)

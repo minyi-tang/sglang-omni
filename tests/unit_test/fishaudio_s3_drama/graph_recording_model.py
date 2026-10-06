@@ -181,10 +181,12 @@ class DrawRecorder:
         top_k: torch.Tensor,
         top_p: torch.Tensor,
     ) -> torch.Tensor:
-        token_ids = self.sample(logits, temperature, top_k, top_p)
+        candidate_columns = self.sample(logits, temperature, top_k, top_p)
         recording_buffers = self.model.recording_buffers
         column = self.model.draw_column
         assert recording_buffers is not None and column < 2
-        recording_buffers.draws[: token_ids.shape[0], column].copy_(token_ids)
+        recording_buffers.draws[: candidate_columns.shape[0], column].copy_(
+            self.model.audio_decoder.main_token_candidate_ids[candidate_columns]
+        )
         self.model.draw_column = column + 1
-        return token_ids
+        return candidate_columns

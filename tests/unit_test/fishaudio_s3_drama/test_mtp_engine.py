@@ -325,7 +325,7 @@ def scenario_outcome(run: EngineRun, name: str) -> ScenarioOutcome:
 def tower_problems(run: EngineRun, decoder: AudioDecoder) -> list[str]:
     """Every step's cache rows, head logits and frame against the dense tower."""
     problems = []
-    semantic_bias = decoder.semantic_logit_bias.float()
+    candidate_token_ids = decoder.main_token_candidate_ids
     codebook_size = int(DECODER_CONFIG["vocab_size"])
     for request_id, steps in request_steps(run).items():
         history = frame_history(steps)
@@ -382,7 +382,11 @@ def tower_problems(run: EngineRun, decoder: AudioDecoder) -> list[str]:
                 is_masked_eos = (
                     torch.arange(semantic_logits.numel()) == EOS_TOKEN_ID
                 ) & (semantic_logits == float("-inf"))
-                expected_main_token = int(torch.argmax(semantic_logits + semantic_bias))
+                expected_main_token = int(
+                    candidate_token_ids[
+                        torch.argmax(semantic_logits[candidate_token_ids])
+                    ]
+                )
                 expected_codebook_zero = min(
                     max(main_token - SEMANTIC_START_TOKEN_ID, 0), codebook_size - 1
                 )
