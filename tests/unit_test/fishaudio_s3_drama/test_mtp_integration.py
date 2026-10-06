@@ -30,6 +30,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
+    DECODE_STEPS_BETWEEN_PREFILLS,
     PREFILL_CUDA_GRAPH_MAX_TOKENS,
     S3DramaEngineBuilder,
 )
@@ -1102,6 +1103,14 @@ def test_engine_defaults_pass_its_own_validation(tmp_path: Path) -> None:
     assert graph_config.decode.backend == CudaGraphBackend.FULL
     assert graph_config.prefill.backend == CudaGraphBackend.BREAKABLE
     assert max(graph_config.prefill.bs) == PREFILL_CUDA_GRAPH_MAX_TOKENS
+    assert server_args.prefill_decode_interval == DECODE_STEPS_BETWEEN_PREFILLS
+
+
+def test_engine_prefills_without_an_interval_when_asked(tmp_path: Path) -> None:
+    builder, server_args = engine_server_args(tmp_path, {"prefill_decode_interval": 0})
+
+    builder.validate_before_infrastructure(server_args)
+    assert server_args.prefill_decode_interval == 0
 
 
 def test_engine_runs_its_prefill_eager_when_asked(tmp_path: Path) -> None:

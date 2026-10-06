@@ -48,6 +48,7 @@ FISH_OMNI_ARCHITECTURE = "FishOmniModel"
 # The tower re-plans this backend's metadata for its first frame.
 ATTENTION_BACKEND = "triton"
 PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
+DECODE_STEPS_BETWEEN_PREFILLS = 4
 
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
@@ -88,6 +89,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             "disable_cuda_graph": False,
             "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
             "cuda_graph_max_bs_prefill": PREFILL_CUDA_GRAPH_MAX_TOKENS,
+            "prefill_decode_interval": DECODE_STEPS_BETWEEN_PREFILLS,
             "disable_overlap_schedule": True,
             "disable_radix_cache": True,
             "enable_mixed_chunk": False,
