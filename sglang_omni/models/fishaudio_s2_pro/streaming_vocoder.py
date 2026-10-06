@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 from typing_extensions import NotRequired, TypedDict
@@ -36,6 +36,10 @@ S2ProFinalAudioData = TypedDict(
         "finish_reason": NotRequired[object],
     },
 )
+
+
+class WindowDecoder(Protocol):
+    def __call__(self, indices: torch.Tensor) -> torch.Tensor: ...
 
 
 @dataclass
@@ -79,6 +83,7 @@ def build_stream_vocoder_chunk(
     stream_followup_stride: int,
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
+    decode_window: WindowDecoder | None = None,
 ) -> dict[str, bytes | list[int] | str | int] | None:
     assert codes.ndim == 2
 
@@ -103,6 +108,7 @@ def build_stream_vocoder_chunk(
         stream_overlap_tokens=stream_overlap_tokens,
         stream_crossfade_samples=stream_crossfade_samples,
         is_final=False,
+        decode_window=decode_window,
     )
     state.next_vocode_tokens = total_tokens + stream_followup_stride
     return chunk
@@ -115,6 +121,7 @@ def flush_stream_vocoder_chunk(
     device: torch.device,
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
+    decode_window: WindowDecoder | None = None,
 ) -> dict[str, bytes | list[int] | str | int] | None:
     pending_tail = state.pending_tail
     has_codes = bool(state.codes)
@@ -145,6 +152,7 @@ def flush_stream_vocoder_chunk(
         stream_overlap_tokens=stream_overlap_tokens,
         stream_crossfade_samples=stream_crossfade_samples,
         is_final=True,
+        decode_window=decode_window,
     )
 
 
@@ -156,6 +164,7 @@ def _build_stream_vocoder_chunk(
     stream_overlap_tokens: int,
     stream_crossfade_samples: int,
     is_final: bool,
+    decode_window: WindowDecoder | None,
 ) -> dict[str, bytes | list[int] | str | int] | None:
     if not state.codes:
         return None
@@ -190,7 +199,9 @@ def _build_stream_vocoder_chunk(
     codebook_codes = window_codes[1:].to(device=device, dtype=torch.long)
 
     with torch.no_grad():
-        audio = codec.from_indices(codebook_codes[None])
+        audio = (codec.from_indices if decode_window is None else decode_window)(
+            codebook_codes[None]
+        )
 
     audio_tensor = audio[0, 0].float()
     overlap_token_count = emitted_tokens - window_start_token
@@ -354,6 +365,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
         stream_crossfade_samples: int = 512,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 2,
+        decode_window: WindowDecoder | None = None,
     ) -> None:
         if stream_stride <= 0 or stream_followup_stride <= 0 or max_batch_size <= 0:
             raise ValueError(
@@ -376,6 +388,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             codec, stream_overlap_tokens
         )
         self.stream_crossfade_samples = int(stream_crossfade_samples)
+        self.decode_window = decode_window
         self.stream_states: dict[str, StreamVocoderState] = {}
 
         super().__init__(
@@ -417,6 +430,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             stream_followup_stride=self.stream_followup_stride,
             stream_overlap_tokens=self.stream_overlap_tokens,
             stream_crossfade_samples=self.stream_crossfade_samples,
+            decode_window=self.decode_window,
         )
         if output is None:
             return []
@@ -445,6 +459,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
             device=self.device,
             stream_overlap_tokens=self.stream_overlap_tokens,
             stream_crossfade_samples=self.stream_crossfade_samples,
+            decode_window=self.decode_window,
         )
         messages: list[OutgoingMessage] = []
         if output is not None:

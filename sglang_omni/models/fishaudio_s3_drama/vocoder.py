@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import bisect
+
 import torch
 
 from sglang_omni.models.fishaudio_s2_pro.fish_speech.models.dac.modded_dac import DAC
@@ -10,12 +12,15 @@ from sglang_omni.models.fishaudio_s2_pro.streaming_vocoder import (
     S2ProFinalAudioData,
     S2ProVocoderScheduler,
     StreamVocoderState,
+    WindowDecoder,
     build_stream_vocoder_chunk,
 )
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationResult,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
+from sglang_omni.platforms import current_platform
+from sglang_omni.platforms.device_graph import ReplayableGraph
 from sglang_omni.proto.request import StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
 
@@ -36,6 +41,104 @@ def generation_result_of(payload: StagePayload) -> S3DramaGenerationResult:
         return result
 
 
+def stream_window_lengths(
+    *,
+    stream_stride: int,
+    stream_followup_stride_ramp: tuple[int, ...],
+    stream_followup_stride: int,
+    stream_overlap_tokens: int,
+) -> tuple[int, ...]:
+    strides = (stream_stride, *stream_followup_stride_ramp)
+    lengths: set[int] = set()
+    emitted_frames = 0
+    window_index = 0
+    while True:
+        stride = (
+            strides[window_index]
+            if window_index < len(strides)
+            else stream_followup_stride
+        )
+        window_end = emitted_frames + stride
+        lengths.add(window_end - max(0, emitted_frames - stream_overlap_tokens))
+        if window_index >= len(strides) and emitted_frames >= stream_overlap_tokens:
+            return tuple(sorted(lengths))
+        else:
+            pass
+        emitted_frames = window_end
+        window_index += 1
+
+
+class WindowGraphDecoder:
+    def __init__(
+        self,
+        decode: WindowDecoder,
+        *,
+        num_codebooks: int,
+        frame_length: int,
+        device: torch.device,
+        window_lengths: tuple[int, ...],
+    ) -> None:
+        graph_backend = current_platform.get_device_graph_backend(device)
+        if graph_backend is None:
+            raise RuntimeError(
+                f"no device graph backend for {device}; set "
+                f"stages.vocoder.factory.window_cuda_graphs to false to decode eagerly"
+            )
+        else:
+            pass
+        self.decode = decode
+        self.frame_length = frame_length
+        self.window_lengths = tuple(sorted(window_lengths))
+        self.static_indices: dict[int, torch.Tensor] = {}
+        self.static_audio: dict[int, torch.Tensor] = {}
+        self.graphs: dict[int, ReplayableGraph] = {}
+        device_module = torch.get_device_module(device)
+        current_stream = device_module.current_stream(device)
+        capture_stream = device_module.Stream(device=device)
+        capture_stream.wait_stream(current_stream)
+        with torch.no_grad(), device_module.device(device):
+            with device_module.stream(capture_stream):
+                for window_length in reversed(self.window_lengths):
+                    decode(
+                        torch.zeros(
+                            (1, num_codebooks, window_length),
+                            dtype=torch.long,
+                            device=device,
+                        )
+                    )
+            capture_stream.synchronize()
+            graph_pool = device_module.graph_pool_handle()
+            for window_length in reversed(self.window_lengths):
+                static_indices = torch.zeros(
+                    (1, num_codebooks, window_length), dtype=torch.long, device=device
+                )
+                with graph_backend.capture(
+                    pool=graph_pool, stream=capture_stream
+                ) as graph:
+                    self.static_audio[window_length] = decode(static_indices)
+                self.static_indices[window_length] = static_indices
+                self.graphs[window_length] = graph
+        current_stream.wait_stream(capture_stream)
+        device_module.synchronize(device)
+
+    def __call__(self, indices: torch.Tensor) -> torch.Tensor:
+        frame_count = int(indices.shape[-1])
+        if indices.shape[0] != 1 or frame_count > self.window_lengths[-1]:
+            return self.decode(indices)
+        else:
+            pass
+        window_length = self.window_lengths[
+            bisect.bisect_left(self.window_lengths, frame_count)
+        ]
+        static_indices = self.static_indices[window_length]
+        static_indices[..., :frame_count].copy_(indices)
+        static_indices[..., frame_count:].zero_()
+        self.graphs[window_length].replay()
+        return self.static_audio[window_length][
+            ..., : frame_count * self.frame_length
+        ].clone()
+
+
 class S3DramaVocoderScheduler(S2ProVocoderScheduler):
     """Feeds S2-Pro's windows one frame at a time, so chunk boundaries do not
     depend on how many frames a stream chunk or the final payload carries."""
@@ -52,6 +155,7 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
         stream_crossfade_samples: int,
         max_batch_size: int,
         max_batch_wait_ms: int,
+        decode_window: WindowDecoder | None = None,
     ) -> None:
         if not all(stride > 0 for stride in stream_followup_stride_ramp):
             raise ValueError(
@@ -69,6 +173,7 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
             stream_crossfade_samples=stream_crossfade_samples,
             max_batch_size=max_batch_size,
             max_batch_wait_ms=max_batch_wait_ms,
+            decode_window=decode_window,
         )
         self.stream_followup_stride_ramp = tuple(stream_followup_stride_ramp)
         self.stream_window_counts: dict[str, int] = {}
@@ -99,6 +204,7 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
                 stream_followup_stride=self.followup_stride(request_id),
                 stream_overlap_tokens=self.stream_overlap_tokens,
                 stream_crossfade_samples=self.stream_crossfade_samples,
+                decode_window=self.decode_window,
             )
             if is_window_end:
                 self.stream_window_counts[request_id] = (

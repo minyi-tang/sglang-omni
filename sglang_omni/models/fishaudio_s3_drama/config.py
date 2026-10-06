@@ -67,6 +67,7 @@ class S3DramaVocoderFactoryArgs(FactoryArgs):
     stream_crossfade_samples: int = Field(default=0, ge=0)
     max_batch_size: int = Field(default=8, ge=1)
     max_batch_wait_ms: int = Field(default=2, ge=0)
+    window_cuda_graphs: bool = True
 
 
 class S3DramaVocoderStageConfig(StageConfig):
@@ -129,7 +130,7 @@ class S3DramaPipelineConfig(PipelineConfig):
         ),
         S3DramaVocoderStageConfig(
             name="vocoder",
-            process="pipeline",
+            process="vocoder",
             factory_path=f"{PACKAGE}.stages.create_vocoder_executor",
             gpu=0,
             gpu_memory_fraction=VOCODER_GPU_MEMORY_FRACTION,

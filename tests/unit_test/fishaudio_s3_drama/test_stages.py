@@ -377,28 +377,38 @@ def test_a_static_fraction_other_than_the_stage_share_is_refused_before_building
     assert builds == []
 
 
+def cpu_vocoder(factory_args: S3DramaVocoderFactoryArgs) -> S3DramaVocoderScheduler:
+    return stages.create_vocoder_executor(
+        device="cpu",
+        codec_path=factory_args.codec_path,
+        stream_stride=factory_args.stream_stride,
+        stream_followup_stride_ramp=factory_args.stream_followup_stride_ramp,
+        stream_followup_stride=factory_args.stream_followup_stride,
+        stream_overlap_tokens=factory_args.stream_overlap_tokens,
+        stream_crossfade_samples=factory_args.stream_crossfade_samples,
+        max_batch_size=factory_args.max_batch_size,
+        max_batch_wait_ms=factory_args.max_batch_wait_ms,
+        window_cuda_graphs=factory_args.window_cuda_graphs,
+    )
+
+
 def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(
     codec_loads: CodecLoads, tmp_path: Path
 ) -> None:
     codec_file = tmp_path / "codec.pth"
     codec_file.write_bytes(b"")
-    window_kwargs = S3DramaVocoderFactoryArgs(codec_path=str(codec_file)).model_dump(
-        include={
-            "codec_path",
-            "stream_stride",
-            "stream_followup_stride_ramp",
-            "stream_followup_stride",
-            "stream_overlap_tokens",
-            "stream_crossfade_samples",
-            "max_batch_size",
-            "max_batch_wait_ms",
-        }
-    )
 
-    vocoder = stages.create_vocoder_executor(device="cpu", **window_kwargs)
+    vocoder = cpu_vocoder(
+        S3DramaVocoderFactoryArgs(codec_path=str(codec_file)).model_copy(
+            update={"window_cuda_graphs": False}
+        )
+    )
 
     assert isinstance(vocoder, S3DramaVocoderScheduler)
     assert codec_loads.calls == [(str(tmp_path), "cpu")]
+    assert isinstance(vocoder.codec, FrameNumberCodec)
+    assert vocoder.codec.is_weight_norm_folded
+    assert vocoder.decode_window is None
     assert (
         vocoder.stream_stride,
         vocoder.stream_followup_stride_ramp,
@@ -407,3 +417,13 @@ def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(
         vocoder.stream_crossfade_samples,
         vocoder.max_batch_size,
     ) == (10, (10, 12, 32), 64, 32, 0, 8)
+
+
+def test_window_cuda_graphs_on_a_cpu_device_are_refused(
+    codec_loads: CodecLoads, tmp_path: Path
+) -> None:
+    codec_file = tmp_path / "codec.pth"
+    codec_file.write_bytes(b"")
+
+    with pytest.raises(RuntimeError, match="window_cuda_graphs to false"):
+        cpu_vocoder(S3DramaVocoderFactoryArgs(codec_path=str(codec_file)))

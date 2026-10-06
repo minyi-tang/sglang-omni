@@ -28,7 +28,11 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import S3DramaReques
 from sglang_omni.models.fishaudio_s3_drama.speech_request import (
     S3DramaSpeechPreprocessor,
 )
-from sglang_omni.models.fishaudio_s3_drama.vocoder import S3DramaVocoderScheduler
+from sglang_omni.models.fishaudio_s3_drama.vocoder import (
+    S3DramaVocoderScheduler,
+    WindowGraphDecoder,
+    stream_window_lengths,
+)
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.reference_encoder import ReferenceEncodeService
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
@@ -177,10 +181,29 @@ def create_vocoder_executor(
     stream_crossfade_samples: int,
     max_batch_size: int,
     max_batch_wait_ms: int,
+    window_cuda_graphs: bool,
 ) -> S3DramaVocoderScheduler:
     resolved_device = str(resolve_concrete_device(device, gpu_id))
+    codec = load_codec(resolve_codec_directory(codec_path), resolved_device)
+    codec.fold_weight_norm()
+    if window_cuda_graphs:
+        decode_window = WindowGraphDecoder(
+            codec.from_indices,
+            num_codebooks=codec.quantizer.semantic_quantizer.n_codebooks
+            + codec.quantizer.quantizer.n_codebooks,
+            frame_length=int(codec.frame_length),
+            device=torch.device(resolved_device),
+            window_lengths=stream_window_lengths(
+                stream_stride=stream_stride,
+                stream_followup_stride_ramp=stream_followup_stride_ramp,
+                stream_followup_stride=stream_followup_stride,
+                stream_overlap_tokens=stream_overlap_tokens,
+            ),
+        )
+    else:
+        decode_window = None
     return S3DramaVocoderScheduler(
-        load_codec(resolve_codec_directory(codec_path), resolved_device),
+        codec,
         device=resolved_device,
         stream_stride=stream_stride,
         stream_followup_stride_ramp=stream_followup_stride_ramp,
@@ -189,4 +212,5 @@ def create_vocoder_executor(
         stream_crossfade_samples=stream_crossfade_samples,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        decode_window=decode_window,
     )

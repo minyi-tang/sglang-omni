@@ -3,15 +3,22 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
+from sglang_omni.models.fishaudio_s2_pro.streaming_vocoder import WindowDecoder
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationResult,
 )
-from sglang_omni.models.fishaudio_s3_drama.vocoder import S3DramaVocoderScheduler
+from sglang_omni.models.fishaudio_s3_drama.vocoder import (
+    S3DramaVocoderScheduler,
+    WindowGraphDecoder,
+    stream_window_lengths,
+)
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.message import OutgoingMessage
@@ -30,9 +37,17 @@ class FrameNumberCodec:
 
     sample_rate = SAMPLE_RATE
     frame_length = SAMPLES_PER_FRAME
+    quantizer = SimpleNamespace(
+        semantic_quantizer=SimpleNamespace(n_codebooks=1),
+        quantizer=SimpleNamespace(n_codebooks=NUM_CODEBOOKS - 1),
+    )
 
     def __init__(self) -> None:
         self.decoded_codes: list[torch.Tensor] = []
+        self.is_weight_norm_folded = False
+
+    def fold_weight_norm(self) -> None:
+        self.is_weight_norm_folded = True
 
     def from_indices(self, indices: torch.Tensor) -> torch.Tensor:
         self.decoded_codes.append(indices.clone())
@@ -54,7 +69,9 @@ def numbered_frames(frame_count: int) -> torch.Tensor:
     return frames
 
 
-def vocoder_with(codec: FrameNumberCodec) -> S3DramaVocoderScheduler:
+def vocoder_with(
+    codec: FrameNumberCodec, decode_window: WindowDecoder | None = None
+) -> S3DramaVocoderScheduler:
     """The vocoder with the configured windows."""
     window_kwargs = S3DramaVocoderFactoryArgs().model_dump(
         include={
@@ -67,7 +84,9 @@ def vocoder_with(codec: FrameNumberCodec) -> S3DramaVocoderScheduler:
             "max_batch_wait_ms",
         }
     )
-    return S3DramaVocoderScheduler(codec, device="cpu", **window_kwargs)
+    return S3DramaVocoderScheduler(
+        codec, device="cpu", decode_window=decode_window, **window_kwargs
+    )
 
 
 def final_payload(
@@ -116,12 +135,17 @@ def streamed_audio(messages: list[OutgoingMessage]) -> np.ndarray:
 
 
 def streamed(
-    total_frame_count: int, chunk_frame_counts: list[int], *, is_done_first: bool
+    total_frame_count: int,
+    chunk_frame_counts: list[int],
+    *,
+    is_done_first: bool,
+    codec: FrameNumberCodec | None = None,
+    decode_window: WindowDecoder | None = None,
 ) -> tuple[FrameNumberCodec, list[OutgoingMessage]]:
     """Stream chunks of the given sizes, then hand over the final payload with all
     total_frame_count frames and signal the end of the stream."""
-    codec = FrameNumberCodec()
-    vocoder = vocoder_with(codec)
+    codec = FrameNumberCodec() if codec is None else codec
+    vocoder = vocoder_with(codec, decode_window)
     frames = numbered_frames(total_frame_count)
     start = 0
     for chunk_id, frame_count in enumerate(chunk_frame_counts):
@@ -215,6 +239,84 @@ def test_streaming_emits_the_fixed_windows_however_frames_arrive(
         np.repeat(np.arange(total_frame_count, dtype=np.float32), SAMPLES_PER_FRAME),
     )
     assert [message.type for message in messages][-1] == "result"
+
+
+@pytest.mark.parametrize(
+    ("stride", "ramp", "followup_stride", "overlap", "window_lengths"),
+    [
+        pytest.param(10, (10, 12, 32), 64, 32, (10, 20, 32, 64, 96), id="defaults"),
+        pytest.param(40, (), 45, 20, (40, 65), id="no-ramp"),
+        pytest.param(10, (), 16, 40, (10, 26, 42, 56), id="context-fills-late"),
+        pytest.param(10, (), 10, 0, (10,), id="no-context"),
+    ],
+)
+def test_the_stream_window_lengths_follow_the_window_config(
+    stride: int,
+    ramp: tuple[int, ...],
+    followup_stride: int,
+    overlap: int,
+    window_lengths: tuple[int, ...],
+) -> None:
+    assert (
+        stream_window_lengths(
+            stream_stride=stride,
+            stream_followup_stride_ramp=ramp,
+            stream_followup_stride=followup_stride,
+            stream_overlap_tokens=overlap,
+        )
+        == window_lengths
+    )
+
+
+def test_every_streamed_window_decodes_through_the_given_window_decoder() -> None:
+    codec = FrameNumberCodec()
+    decoded_frame_counts: list[int] = []
+
+    def decode_window(indices: torch.Tensor) -> torch.Tensor:
+        decoded_frame_counts.append(int(indices.shape[-1]))
+        return codec.from_indices(indices)
+
+    _, messages = streamed(
+        214, [1] * 214, is_done_first=False, codec=codec, decode_window=decode_window
+    )
+
+    assert decoded_frame_counts == [10, 20, 32, 64, 96, 96, 54]
+    np.testing.assert_array_equal(
+        streamed_audio(messages),
+        np.repeat(np.arange(214, dtype=np.float32), SAMPLES_PER_FRAME),
+    )
+
+
+@pytest.mark.accelerator
+def test_window_graphs_decode_every_window_length_like_eager() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA device")
+    else:
+        pass
+    device = torch.device("cuda")
+    codebook_weights = torch.arange(
+        1, NUM_CODEBOOKS + 1, dtype=torch.float32, device=device
+    )
+
+    def causal_decode(indices: torch.Tensor) -> torch.Tensor:
+        frame_values = (indices.float() * codebook_weights[:, None]).sum(
+            dim=1, keepdim=True
+        )
+        return frame_values.cumsum(dim=-1).repeat_interleave(SAMPLES_PER_FRAME, dim=-1)
+
+    decoder = WindowGraphDecoder(
+        causal_decode,
+        num_codebooks=NUM_CODEBOOKS,
+        frame_length=SAMPLES_PER_FRAME,
+        device=device,
+        window_lengths=(10, 20, 32, 64, 96),
+    )
+    codes = torch.randint(0, 100, (2, NUM_CODEBOOKS, 100), device=device)
+
+    for frame_count in (96, 7, 10, 11, 64, 95, 97):
+        window = codes[:1, :, :frame_count]
+        assert torch.equal(decoder(window), causal_decode(window))
+    assert torch.equal(decoder(codes[:, :, :20]), causal_decode(codes[:, :, :20]))
 
 
 def test_the_final_result_counts_prompt_rows_and_audio_frames() -> None:

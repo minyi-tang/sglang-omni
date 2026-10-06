@@ -64,7 +64,7 @@ def test_frames_stream_from_the_engine_to_the_vocoder_on_one_gpu() -> None:
         vocoder.gpu,
         vocoder.terminal,
         vocoder.can_accept_stream_before_payload,
-    ) == ("vocoder", "pipeline", 0, True, True)
+    ) == ("vocoder", "vocoder", 0, True, True)
     assert config.supports_uploaded_voice_references()
 
 
@@ -77,7 +77,7 @@ def test_every_process_on_the_shared_gpu_declares_its_memory() -> None:
     assert topology.stage_to_process == {
         "preprocessing": "preprocessing",
         "tts_engine": "pipeline",
-        "vocoder": "pipeline",
+        "vocoder": "vocoder",
     }
     assert (preprocessing.total_reserve_bytes, preprocessing.enforce_total_reserve) == (
         6 * 1024**3,
@@ -111,6 +111,7 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "gpu_id": 0,
         "codec_path": DEFAULT_CODEC_PATH,
         **VOCODER_WINDOWS,
+        "window_cuda_graphs": True,
     }
 
 
