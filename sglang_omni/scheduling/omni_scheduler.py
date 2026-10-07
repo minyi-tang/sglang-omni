@@ -41,7 +41,11 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
     retract_all,
 )
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.scheduler import (
+    TEST_RETRACT,
+    TEST_RETRACT_NO_PREFILL_BS,
+    GenerationBatchResult,
+)
 from sglang.srt.managers.scheduler import Scheduler as _Upstream
 from sglang.srt.managers.scheduler import validate_input_length
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -267,6 +271,7 @@ class OmniSchedulerArguments(TypedDict, Generic[RequestDataT], total=False):
     enable_overlap: bool
     enable_async_decode: bool
     async_decode_min_batch_size: int
+    async_decode_resolve_before_prefill: bool
     prefill_coalesce_requests: int
     prefill_coalesce_wait_ms: float
     prefill_coalesce_when_idle: bool
@@ -295,6 +300,7 @@ class OmniScheduler(Generic[RequestDataT]):
     session_bridge: ARSessionBridge | None = None
     scheduler_thread_id: int | None = None
     previous_pending_decode: PendingDecode | None = None
+    async_decode_resolve_before_prefill: bool = False
 
     def __init__(
         self,
@@ -324,6 +330,7 @@ class OmniScheduler(Generic[RequestDataT]):
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 1,
+        async_decode_resolve_before_prefill: bool = False,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
         prefill_coalesce_when_idle: bool = False,
@@ -422,6 +429,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # instead of the lookahead. The default 1 sends every decode batch the
         # runner allows through the lookahead.
         self.async_decode_min_batch_size = int(async_decode_min_batch_size)
+        self.async_decode_resolve_before_prefill = async_decode_resolve_before_prefill
         if self.enable_overlap and self.enable_async_decode:
             raise ValueError(
                 "enable_overlap and enable_async_decode are mutually "
@@ -1902,19 +1910,58 @@ class OmniScheduler(Generic[RequestDataT]):
                 ),
             )
 
-    def get_new_batch_prefill(self, running_batch):
-        # Note: (maydomine) batch prefill admissions to amortize the fixed step
-        # cost; the oldest-request deadline survives partial admission and aborts.
-        #
-        # Upstream passes running_batch in and expects a NextBatchPlan back,
-        # so the coalesce hold-off returns an empty plan rather than None.
+    def is_prefill_expected(self) -> bool:
+        running_batch = self.running_batch
+        if self.is_mixed_chunk or self.dllm_config is not None:
+            return False
+        elif self._prefill_decode_interval_remaining > 0:  # noqa: leading-underscore
+            return False
+        elif self.chunked_req is not None:
+            return True
+        elif not self.waiting_queue:
+            return False
+        else:
+            pass
+        running_request_count = len(running_batch.reqs)
+        allocatable_request_count = self.get_num_allocatable_reqs(
+            running_request_count, running_batch=running_batch
+        )
+        is_batch_full = running_batch.batch_is_full and not (
+            self.enable_priority_preemption
+            or self.is_hybrid_swa
+            or self.enable_hisparse
+            or (
+                running_batch.is_empty()
+                and self.get_num_allocatable_reqs(0, running_batch=running_batch) > 0
+            )
+        )
+        if is_batch_full:
+            return False
+        elif allocatable_request_count <= 0 and not self.enable_priority_preemption:
+            return False
+        elif (
+            self.min_free_slots_delayer is not None
+            and self.min_free_slots_delayer.should_delay(
+                running_bs=running_request_count,
+                num_allocatable_reqs=allocatable_request_count,
+            )
+        ):
+            return False
+        elif TEST_RETRACT and running_request_count > TEST_RETRACT_NO_PREFILL_BS:
+            return False
+        else:
+            return not self.prefill_coalesce_holds(running_batch, time.perf_counter())
+
+    def prefill_coalesce_waiting_requests(
+        self, running_batch: ScheduleBatch | None
+    ) -> list[Req] | None:
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return None
         else:
             pass
         decode_is_idle = running_batch is None or running_batch.is_empty()
         if not self.prefill_coalesce_when_idle and decode_is_idle:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return None
         else:
             pass
         if self.prefill_coalesce_requires_pending_builds:
@@ -1927,13 +1974,44 @@ class OmniScheduler(Generic[RequestDataT]):
             if not build_work_pending and not (
                 self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
             ):
-                return _Upstream.get_new_batch_prefill(self, running_batch)
+                return None
             else:
                 pass
         else:
             pass
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:
+            return None
+        else:
+            return waiting
+
+    def prefill_coalesce_holds(
+        self, running_batch: ScheduleBatch | None, now_s: float
+    ) -> bool:
+        waiting = self.prefill_coalesce_waiting_requests(running_batch)
+        if waiting is None:
+            return False
+        else:
+            enqueue_times_s = [
+                getattr(
+                    req, "_coalesce_enqueue_t", None
+                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+                for req in waiting
+            ]
+            oldest_enqueue_s = min(
+                (enqueue_s for enqueue_s in enqueue_times_s if enqueue_s is not None),
+                default=now_s,
+            )
+            return now_s - oldest_enqueue_s < self.prefill_coalesce_wait_s
+
+    def get_new_batch_prefill(self, running_batch):
+        # Note: (maydomine) batch prefill admissions to amortize the fixed step
+        # cost; the oldest-request deadline survives partial admission and aborts.
+        #
+        # Upstream passes running_batch in and expects a NextBatchPlan back,
+        # so the coalesce hold-off returns an empty plan rather than None.
+        waiting = self.prefill_coalesce_waiting_requests(running_batch)
+        if waiting is None:
             return _Upstream.get_new_batch_prefill(self, running_batch)
         else:
             pass
@@ -3554,6 +3632,13 @@ class OmniScheduler(Generic[RequestDataT]):
                 )
             ):
                 self.resolve_pending_async()
+            elif (
+                self.async_decode_resolve_before_prefill
+                and self.async_pending is not None
+                and self.is_prefill_expected()
+            ):
+                self.resolve_pending_async()
+                continue
             else:
                 pass
 

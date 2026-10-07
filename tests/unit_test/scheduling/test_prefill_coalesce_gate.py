@@ -13,7 +13,7 @@ patched to a sentinel.
 from __future__ import annotations
 
 import threading
-from types import SimpleNamespace
+from types import SimpleNamespace, TracebackType
 from unittest import mock
 
 import pytest
@@ -60,6 +60,11 @@ class StubScheduler:
         self.pending_request_builds: dict = {}
         self.pending_request_admissions: dict = {}
         self.backlogged_request_build_payloads: list = []
+
+    def prefill_coalesce_waiting_requests(
+        self, running_batch: SimpleNamespace | None
+    ) -> list[SimpleNamespace] | None:
+        return OmniScheduler.prefill_coalesce_waiting_requests(self, running_batch)
 
     def get_new_batch_prefill(self):
         # Upstream takes running_batch in and hands back a NextBatchPlan;
@@ -355,3 +360,200 @@ def test_unstamped_request_is_stamped_and_eventually_released(upstream, clock):
 
     clock.return_value = 200.07  # past the deadline
     assert sched.get_new_batch_prefill() is UPSTREAM_BATCH
+
+
+class CountingLock:
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.acquire_count = 0
+
+    def __enter__(self) -> bool:
+        self.acquire_count += 1
+        return self.lock.__enter__()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.lock.__exit__(exc_type, exc, traceback)
+
+
+def gate_before_extraction(
+    sched: StubScheduler, running_batch: SimpleNamespace
+) -> NextBatchPlan:
+    if sched.prefill_coalesce_requests <= 1 or sched.chunked_req is not None:
+        return omni_scheduler._Upstream.get_new_batch_prefill(  # noqa: leading-underscore  # production name
+            sched, running_batch
+        )
+    else:
+        pass
+    decode_is_idle = running_batch is None or running_batch.is_empty()
+    if not sched.prefill_coalesce_when_idle and decode_is_idle:
+        return omni_scheduler._Upstream.get_new_batch_prefill(  # noqa: leading-underscore  # production name
+            sched, running_batch
+        )
+    else:
+        pass
+    if sched.prefill_coalesce_requires_pending_builds:
+        with sched.request_admission_lock:
+            build_work_pending = bool(
+                sched.pending_request_builds
+                or sched.pending_request_admissions
+                or sched.backlogged_request_build_payloads
+            )
+        if not build_work_pending and not (
+            sched.prefill_coalesce_after_builds_during_decode and not decode_is_idle
+        ):
+            return omni_scheduler._Upstream.get_new_batch_prefill(  # noqa: leading-underscore  # production name
+                sched, running_batch
+            )
+        else:
+            pass
+    else:
+        pass
+    waiting = sched.waiting_queue
+    if not waiting or len(waiting) >= sched.prefill_coalesce_requests:
+        return omni_scheduler._Upstream.get_new_batch_prefill(  # noqa: leading-underscore  # production name
+            sched, running_batch
+        )
+    else:
+        pass
+    now = omni_scheduler.time.perf_counter()
+    oldest = now
+    for req in waiting:
+        t = getattr(
+            req, "_coalesce_enqueue_t", None
+        )  # noqa: leading-underscore  # production name
+        if t is None:
+            t = req._coalesce_enqueue_t = (
+                now  # noqa: leading-underscore  # production name
+            )
+        else:
+            pass
+        oldest = min(oldest, t)
+    if now - oldest >= sched.prefill_coalesce_wait_s:
+        return omni_scheduler._Upstream.get_new_batch_prefill(  # noqa: leading-underscore  # production name
+            sched, running_batch
+        )
+    else:
+        pass
+    return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+
+
+def gate_state(
+    *,
+    coalesce_requests: int,
+    has_chunked_request: bool,
+    coalesce_when_idle: bool,
+    decode_is_idle: bool,
+    requires_pending_builds: bool,
+    has_build_work: bool,
+    coalesce_after_builds_during_decode: bool,
+    enqueue_times: tuple[float | None, ...],
+) -> StubScheduler:
+    sched = StubScheduler(
+        coalesce_requests=coalesce_requests,
+        wait_ms=60.0,
+        coalesce_when_idle=coalesce_when_idle,
+        requires_pending_builds=requires_pending_builds,
+        coalesce_after_builds_during_decode=coalesce_after_builds_during_decode,
+    )
+    sched.chunked_req = object() if has_chunked_request else None
+    sched.running_batch = SimpleNamespace(is_empty=lambda: decode_is_idle)
+    sched.request_admission_lock = CountingLock()
+    sched.pending_request_builds = {"build": object()} if has_build_work else {}
+    sched.waiting_queue = [make_req(enqueue_t) for enqueue_t in enqueue_times]
+    return sched
+
+
+def enqueue_stamps(sched: StubScheduler) -> list[float | None]:
+    return [
+        getattr(
+            req, "_coalesce_enqueue_t", None
+        )  # noqa: leading-underscore  # production name
+        for req in sched.waiting_queue
+    ]
+
+
+@pytest.mark.parametrize("coalesce_requests", [0, 1, 3])
+@pytest.mark.parametrize("has_chunked_request", [False, True])
+@pytest.mark.parametrize("coalesce_when_idle", [False, True])
+@pytest.mark.parametrize("decode_is_idle", [False, True])
+@pytest.mark.parametrize("requires_pending_builds", [False, True])
+@pytest.mark.parametrize("has_build_work", [False, True])
+@pytest.mark.parametrize("coalesce_after_builds_during_decode", [False, True])
+@pytest.mark.parametrize(
+    "enqueue_times",
+    [(), (None,), (99.99,), (99.9, None), (99.99, 99.995, None)],
+)
+def test_the_extracted_gate_matches_the_gate_before_extraction(
+    upstream: mock.MagicMock,
+    clock: mock.MagicMock,
+    coalesce_requests: int,
+    has_chunked_request: bool,
+    coalesce_when_idle: bool,
+    decode_is_idle: bool,
+    requires_pending_builds: bool,
+    has_build_work: bool,
+    coalesce_after_builds_during_decode: bool,
+    enqueue_times: tuple[float | None, ...],
+) -> None:
+    state = {
+        "coalesce_requests": coalesce_requests,
+        "has_chunked_request": has_chunked_request,
+        "coalesce_when_idle": coalesce_when_idle,
+        "decode_is_idle": decode_is_idle,
+        "requires_pending_builds": requires_pending_builds,
+        "has_build_work": has_build_work,
+        "coalesce_after_builds_during_decode": coalesce_after_builds_during_decode,
+        "enqueue_times": enqueue_times,
+    }
+    reference = gate_state(**state)
+    extracted = gate_state(**state)
+
+    reference_plan = gate_before_extraction(reference, reference.running_batch)
+    reference_upstream_calls = upstream.call_count
+    upstream.reset_mock()
+    extracted_plan = OmniScheduler.get_new_batch_prefill(
+        extracted, extracted.running_batch
+    )
+
+    assert extracted_plan.batch_to_run is reference_plan.batch_to_run
+    assert upstream.call_count == reference_upstream_calls
+    assert enqueue_stamps(extracted) == enqueue_stamps(reference)
+    assert (
+        extracted.request_admission_lock.acquire_count
+        == reference.request_admission_lock.acquire_count
+    )
+
+
+@pytest.mark.parametrize(
+    "enqueue_times",
+    [(None,), (99.99,), (99.9, None), (99.99, 99.995, None), (99.8,)],
+)
+@pytest.mark.parametrize("requires_pending_builds", [False, True])
+def test_the_hold_predicate_stamps_nothing_and_agrees_with_the_gate(
+    upstream: mock.MagicMock,
+    clock: mock.MagicMock,
+    enqueue_times: tuple[float | None, ...],
+    requires_pending_builds: bool,
+) -> None:
+    sched = gate_state(
+        coalesce_requests=8,
+        has_chunked_request=False,
+        coalesce_when_idle=False,
+        decode_is_idle=False,
+        requires_pending_builds=requires_pending_builds,
+        has_build_work=True,
+        coalesce_after_builds_during_decode=False,
+        enqueue_times=enqueue_times,
+    )
+
+    is_held = OmniScheduler.prefill_coalesce_holds(
+        sched, sched.running_batch, clock.return_value
+    )
+
+    assert enqueue_stamps(sched) == list(enqueue_times)
+    assert is_held == (sched.get_new_batch_prefill() is None)
