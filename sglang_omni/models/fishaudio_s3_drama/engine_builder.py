@@ -3,8 +3,13 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.models.registry import ModelRegistry
@@ -15,13 +20,19 @@ from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.request_id_prefill_cuda_graph_runner import (
     RequestIdPrefillCudaGraphRunner,
 )
+from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
 from sglang_omni.models.fishaudio_s3_drama import CAPABILITIES
 from sglang_omni.models.fishaudio_s3_drama.config import (
+    DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS,
+    DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
     DEFAULT_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     DEFAULT_STREAM_STRIDE,
+)
+from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
+    S3DramaFirstFrameGraphs,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import S3DramaModelRunner
@@ -54,6 +65,8 @@ ATTENTION_BACKEND = "triton"
 PREFILL_CUDA_GRAPH_MAX_TOKENS = 2048
 DECODE_STEPS_BETWEEN_PREFILLS = 4
 
+logger = logging.getLogger(__name__)
+
 
 class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     """Single-GPU engine replaying decode CUDA graphs; no radix, chunked prefill or
@@ -76,6 +89,10 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         stream_followup_stride: int = DEFAULT_STREAM_FOLLOWUP_STRIDE,
         max_prompt_rows: int = DEFAULT_MAX_PROMPT_ROWS,
         max_new_tokens_cap: int = DEFAULT_MAX_NEW_TOKENS_CAP,
+        first_frame_cuda_graphs: bool = DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
+        first_frame_cuda_graph_max_requests: int = (
+            DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
+        ),
     ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
@@ -84,7 +101,10 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         self.stream_followup_stride = stream_followup_stride
         self.max_prompt_rows = max_prompt_rows
         self.max_new_tokens_cap = max_new_tokens_cap
+        self.first_frame_cuda_graphs = first_frame_cuda_graphs
+        self.first_frame_cuda_graph_max_requests = first_frame_cuda_graph_max_requests
         self.frame_streamer: S3DramaFrameStreamer | None = None
+        self.sglang_runner: SGLModelRunner | None = None
 
     def resolve_checkpoint(self, model_path: str) -> str:
         return resolve_checkpoint(model_path)
@@ -219,6 +239,58 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         )
         sglang_runner.extra_prefill_graph_attention_layers = list(model.tower_attention)
         sglang_runner.prefill_graph_runner_class = RequestIdPrefillCudaGraphRunner
+        self.sglang_runner = sglang_runner
+        if resolved_view(server_args).disable_cuda_graph:
+            logger.info(
+                "S3-drama first-frame CUDA graphs: off, CUDA graphs are disabled"
+            )
+        else:
+            pass
+
+    def post_cuda_graph_setup(
+        self, model: S3DramaForCausalLM, server_args: ServerArgs
+    ) -> None:
+        sglang_runner = self.sglang_runner
+        assert sglang_runner is not None
+        attention_backend = sglang_runner.attn_backend
+        decode_graph_runner = sglang_runner.decode_cuda_graph_runner
+        decode_graph_config = resolved_view(server_args).cuda_graph_config.decode
+        if not self.first_frame_cuda_graphs:
+            logger.info(
+                "S3-drama first-frame CUDA graphs: off, "
+                "tts_engine.factory.first_frame_cuda_graphs is false"
+            )
+        elif decode_graph_runner is None:
+            logger.info(
+                f"S3-drama first-frame CUDA graphs: off, no decode CUDA graph "
+                f"(decode backend {decode_graph_config.backend})"
+            )
+        else:
+            assert isinstance(attention_backend, HybridLinearAttnBackend)
+            max_request_count = min(
+                self.first_frame_cuda_graph_max_requests, decode_graph_runner.max_bs
+            )
+            text_config = model.config.text_config
+            first_frame_graphs = S3DramaFirstFrameGraphs.capture(
+                sample_first_frames=model.sample_first_frames,
+                attention_backend=attention_backend,
+                max_request_count=max_request_count,
+                vocab_size=text_config.vocab_size,
+                hidden_size=text_config.hidden_size,
+                hidden_dtype=sglang_runner.model_config.dtype,
+                frame_width=1 + model.config.audio_decoder_config.num_codebooks,
+                device=model.lm_head.weight.device,
+            )
+            model.first_frame_graphs = first_frame_graphs
+            logger.info(
+                f"S3-drama first-frame CUDA graphs: on for 1..{max_request_count} "
+                f"requests (first_frame_cuda_graph_max_requests "
+                f"{self.first_frame_cuda_graph_max_requests}, decode CUDA graph max "
+                f"batch {decode_graph_runner.max_bs}), captured in "
+                f"{first_frame_graphs.capture_seconds:.2f} s, static inputs "
+                f"{first_frame_graphs.static_input_bytes / 2**20:.1f} MiB, reserved "
+                f"memory +{first_frame_graphs.reserved_bytes / 2**20:.1f} MiB"
+            )
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor

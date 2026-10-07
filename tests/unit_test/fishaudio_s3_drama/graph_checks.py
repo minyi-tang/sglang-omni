@@ -486,3 +486,80 @@ def stream_problems(run: GraphEngineRun) -> list[str]:
         else:
             pass
     return problems
+
+
+def first_frame_path_problems(run: GraphEngineRun) -> list[str]:
+    captured_request_counts = set(run.facts.first_frame_request_counts or [])
+    problems = []
+    for record in run.forwards:
+        request_count = len(record.steps)
+        if not record.is_extend:
+            expected = ({}, 0, 0)
+        elif request_count in captured_request_counts:
+            expected = ({request_count: 1}, 0, 0)
+        else:
+            expected = ({}, 1, 1)
+        actual = (
+            record.first_frame_replays,
+            record.first_frame_eager_count,
+            record.first_frame_sampler_calls,
+        )
+        if actual != expected:
+            problems.append(
+                f"{run.kind} {forward_name(record)}: first-frame replays, eager steps "
+                f"and sampler calls {actual}, not {expected}"
+            )
+        else:
+            pass
+    return problems
+
+
+def first_frame_split_problems(pair: EnginePair) -> list[str]:
+    return [
+        f"{forward_name(graph_record)}: first-frame KV splits eager "
+        f"{eager_record.first_frame_kv_splits} graph "
+        f"{graph_record.first_frame_kv_splits}"
+        for eager_record, graph_record in zip(
+            pair.eager.forwards, pair.graph.forwards, strict=True
+        )
+        if eager_record.first_frame_kv_splits != graph_record.first_frame_kv_splits
+    ]
+
+
+def generator_offset_problems(
+    pair: EnginePair, scenario_names: set[str] | None
+) -> list[str]:
+    return [
+        f"{forward_name(graph_record)}: generator offset eager "
+        f"{eager_record.generator_offset} graph {graph_record.generator_offset}"
+        for eager_record, graph_record in zip(
+            pair.eager.forwards, pair.graph.forwards, strict=True
+        )
+        if (scenario_names is None or graph_record.scenario_name in scenario_names)
+        and eager_record.generator_offset != graph_record.generator_offset
+    ]
+
+
+def lean_problems(run: GraphEngineRun) -> list[str]:
+    facts = run.facts
+    problems = (
+        []
+        if facts.lean_attention_override is None
+        else [
+            f"{run.kind} engine sets Lean attention to {facts.lean_attention_override}"
+        ]
+    )
+    problems.extend(
+        f"{run.kind} startup chose Lean for a batch of {choice.batch_size} by its "
+        f"{choice.policy} policy"
+        for choice in facts.startup_lean_choices
+        if choice.is_lean
+    )
+    problems.extend(
+        f"{run.kind} {forward_name(record)} chose Lean for a batch of "
+        f"{choice.batch_size} by its {choice.policy} policy"
+        for record in run.forwards
+        for choice in record.lean_choices
+        if choice.is_lean
+    )
+    return problems

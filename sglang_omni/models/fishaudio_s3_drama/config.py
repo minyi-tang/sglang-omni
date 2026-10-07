@@ -24,6 +24,8 @@ DEFAULT_MAX_PROMPT_ROWS = 8192
 DEFAULT_STREAM_STRIDE = 10
 DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP = (10, 12, 32)
 DEFAULT_STREAM_FOLLOWUP_STRIDE = 64
+DEFAULT_FIRST_FRAME_CUDA_GRAPHS = True
+DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS = 16
 # The codec of the public S2-Pro release, pinned to an immutable commit.
 DEFAULT_CODEC_PATH = "fishaudio/s2-pro@1de9996b6be38b745688de084d87a5633f714e4e"
 PREPROCESSING_TOTAL_RESERVE_BYTES = "6GiB"
@@ -56,6 +58,10 @@ class S3DramaEngineFactoryArgs(FactoryArgs):
     max_running_requests: int = Field(default=DEFAULT_MAX_RUNNING_REQUESTS, ge=1)
     max_new_tokens: int = Field(default=DEFAULT_MAX_NEW_TOKENS_CAP, gt=0)
     max_prompt_rows: int = Field(default=DEFAULT_MAX_PROMPT_ROWS, ge=2)
+    first_frame_cuda_graphs: bool = DEFAULT_FIRST_FRAME_CUDA_GRAPHS
+    first_frame_cuda_graph_max_requests: int = Field(
+        default=DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS, ge=1
+    )
 
 
 class S3DramaEngineStageConfig(EngineStageConfig):

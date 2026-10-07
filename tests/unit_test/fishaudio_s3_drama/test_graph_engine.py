@@ -20,7 +20,11 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     capture_break_problems,
     draw_problems,
     finite_problems,
+    first_frame_path_problems,
+    first_frame_split_problems,
+    generator_offset_problems,
     history_problems,
+    lean_problems,
     outcome_problems,
     prefill_path_problems,
     prompt_row_counts,
@@ -47,6 +51,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     GraphForwardRecord,
     GraphRequestStep,
     GraphScenario,
+    LeanChoice,
     bits,
 )
 from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
@@ -74,6 +79,8 @@ RETRACT_ENVIRONMENT = {
 PADDED_BATCH_SIZES = {3, 5, 6, 7}
 SMALL_BUDGET_MAX_PREFILL_TOKENS = 32
 SMALL_BUDGET_CONTEXT_LENGTH = 112
+FIRST_FRAME_REQUEST_COUNTS = list(range(1, max(CUDA_GRAPH_BATCH_SIZES) + 1))
+LOW_FIRST_FRAME_CAP = 3
 # One line per problem is enough to locate the first divergence.
 REPORTED_PROBLEM_COUNT = 20
 
@@ -87,6 +94,9 @@ class GraphEngineRuns:
     prefill_fp8: EnginePair
     prefill_retract: EnginePair
     prefill_small_budget: EnginePair
+    first_frame_off: EnginePair
+    first_frame_low_cap: EnginePair
+    first_frame_on_against_off: EnginePair
     workdir: Path
 
 
@@ -190,6 +200,28 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         )
         for kind in ("eager", "prefill_graph")
     }
+    first_frame_off = run_engine(
+        "main-graph-first-frame-off",
+        GraphEngineSpec(
+            model_dir=str(checkpoint_dir),
+            kind="graph",
+            first_frame_cuda_graphs=False,
+            scenarios=MAIN_SCENARIOS,
+        ),
+        workdir,
+        {},
+    )
+    first_frame_low_cap = run_engine(
+        "main-graph-first-frame-low-cap",
+        GraphEngineSpec(
+            model_dir=str(checkpoint_dir),
+            kind="graph",
+            first_frame_cuda_graph_max_requests=LOW_FIRST_FRAME_CAP,
+            scenarios=MAIN_SCENARIOS,
+        ),
+        workdir,
+        {},
+    )
     runs = GraphEngineRuns(
         main=main,
         fp8=fp8,
@@ -201,6 +233,15 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
             eager=small_budget_runs["eager"],
             graph=small_budget_runs["prefill_graph"],
             scenarios=SMALL_BUDGET_SCENARIOS,
+        ),
+        first_frame_off=EnginePair(
+            eager=main.eager, graph=first_frame_off, scenarios=MAIN_SCENARIOS
+        ),
+        first_frame_low_cap=EnginePair(
+            eager=main.eager, graph=first_frame_low_cap, scenarios=MAIN_SCENARIOS
+        ),
+        first_frame_on_against_off=EnginePair(
+            eager=first_frame_off, graph=main.graph, scenarios=MAIN_SCENARIOS
         ),
         workdir=workdir,
     )
@@ -217,6 +258,8 @@ def all_pairs(engine_runs: GraphEngineRuns) -> dict[str, EnginePair]:
         "prefill fp8": engine_runs.prefill_fp8,
         "prefill retract": engine_runs.prefill_retract,
         "prefill small budget": engine_runs.prefill_small_budget,
+        "first-frame off": engine_runs.first_frame_off,
+        "first-frame low cap": engine_runs.first_frame_low_cap,
     }
 
 
@@ -260,6 +303,16 @@ def test_engines_start_as_specified(engine_runs: GraphEngineRuns) -> None:
         assert eager_facts.max_kv_splits == graph_facts.max_kv_splits == 8, name
         assert eager_facts.kv_pool_size == graph_facts.kv_pool_size, name
         assert eager_facts.expert_paths == graph_facts.expert_paths, name
+        first_frame_request_counts = {
+            "first-frame off": None,
+            "first-frame low cap": list(range(1, LOW_FIRST_FRAME_CAP + 1)),
+        }.get(name, FIRST_FRAME_REQUEST_COUNTS)
+        assert eager_facts.first_frame_request_counts is None, name
+        assert (
+            graph_facts.first_frame_request_counts == first_frame_request_counts
+        ), name
+        assert eager_facts.first_frame_capture_written_kv_slots == [], name
+        assert graph_facts.first_frame_capture_written_kv_slots == [], name
     for expert_path in engine_runs.fp8.graph.facts.expert_paths:
         assert expert_path.quant_method == "Fp8MoEMethod"
         assert expert_path.runner_backend == "TRITON"
@@ -417,6 +470,104 @@ def test_prefill_graph_replays_beside_live_requests(
     assert replays_beside_live_requests
 
 
+def test_each_first_frame_step_replays_its_request_count_or_runs_eager(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = first_frame_path_problems(run)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+
+
+def test_first_frame_graphs_replay_every_request_count_and_resume_past_the_cap(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for run in (engine_runs.main.graph, engine_runs.prefill_main.graph):
+        assert {
+            request_count
+            for record in run.forwards
+            for request_count in record.first_frame_replays
+        } == set(FIRST_FRAME_REQUEST_COUNTS), run.kind
+    extends = [
+        record
+        for record in engine_runs.first_frame_low_cap.graph.forwards
+        if record.is_extend
+    ]
+    assert any(
+        earlier.first_frame_eager_count == 1
+        and len(earlier.steps) > LOW_FIRST_FRAME_CAP
+        and later.first_frame_replays
+        for earlier, later in zip(extends, extends[1:])
+    )
+
+
+def test_first_frame_replays_alternate_with_decode_replays_of_other_sizes(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    directions: set[str] = set()
+    for pair in all_pairs(engine_runs).values():
+        forwards = pair.graph.forwards
+        for earlier, later in zip(forwards, forwards[1:]):
+            if (
+                earlier.first_frame_replays
+                and not later.is_extend
+                and later.is_graph_replay
+                and later.graph_batch_size != len(earlier.steps)
+            ):
+                directions.add("first frame, then decode")
+            elif (
+                not earlier.is_extend
+                and earlier.is_graph_replay
+                and later.first_frame_replays
+                and len(later.steps) != earlier.graph_batch_size
+            ):
+                directions.add("decode, then first frame")
+            else:
+                pass
+    assert directions == {"first frame, then decode", "decode, then first frame"}
+
+
+def test_first_frame_graphs_draw_and_split_like_the_eager_step(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    on_against_off = engine_runs.first_frame_on_against_off
+    problems = (
+        schedule_problems(on_against_off)
+        + bit_problems(on_against_off)
+        + first_frame_split_problems(on_against_off)
+        + generator_offset_problems(on_against_off, None)
+    )
+    assert not problems, f"first-frame on against off:\n{first_problems(problems)}"
+    for name, pair in all_pairs(engine_runs).items():
+        problems = first_frame_split_problems(pair) + generator_offset_problems(
+            pair, {RANDOM_WAVES.name}
+        )
+        assert not problems, f"{name}:\n{first_problems(problems)}"
+    assert any(
+        record.scenario_name == RANDOM_WAVES.name and record.first_frame_replays
+        for record in engine_runs.main.graph.forwards
+    )
+
+
+def test_decode_attention_keeps_the_standard_kernel(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = lean_problems(run)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+    assert set(FIRST_FRAME_REQUEST_COUNTS) <= {
+        choice.batch_size
+        for choice in engine_runs.main.graph.facts.startup_lean_choices
+        if choice.policy == "capture"
+    }
+    assert {
+        choice.policy
+        for record in engine_runs.main.eager.forwards
+        for choice in record.lean_choices
+    } == {"sequence_length"}
+
+
 def with_record(run: GraphEngineRun, record: GraphForwardRecord) -> GraphEngineRun:
     forwards = list(run.forwards)
     forwards[record.forward_index] = record
@@ -495,6 +646,87 @@ def test_capture_break_check_catches_a_missing_or_changed_tower_break(
         )
         problems = capture_break_problems(changed_run)
         assert len(problems) == problem_count, problems
+
+
+def test_first_frame_checks_catch_a_changed_record(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    run = engine_runs.main.graph
+    replayed = next(record for record in run.forwards if record.first_frame_replays)
+    decoded = next(record for record in run.forwards if not record.is_extend)
+    request_count = len(replayed.steps)
+    for changed in (
+        replace(replayed, first_frame_replays={request_count + 1: 1}),
+        replace(replayed, first_frame_replays={request_count: 2}),
+        replace(replayed, first_frame_replays={}, first_frame_eager_count=1),
+        replace(replayed, first_frame_sampler_calls=1),
+        replace(decoded, first_frame_eager_count=1, first_frame_sampler_calls=1),
+    ):
+        problems = first_frame_path_problems(with_record(run, changed))
+        assert len(problems) == 1, problems
+    low_cap_run = engine_runs.first_frame_low_cap.graph
+    past_the_cap = next(
+        record for record in low_cap_run.forwards if record.first_frame_eager_count
+    )
+    problems = first_frame_path_problems(
+        with_record(
+            low_cap_run,
+            replace(
+                past_the_cap,
+                first_frame_replays={len(past_the_cap.steps): 1},
+                first_frame_eager_count=0,
+                first_frame_sampler_calls=0,
+            ),
+        )
+    )
+    assert len(problems) == 1, problems
+    uncaptured_run = replace(
+        run, facts=replace(run.facts, first_frame_request_counts=None)
+    )
+    assert len(first_frame_path_problems(uncaptured_run)) == sum(
+        bool(record.first_frame_replays) for record in run.forwards
+    )
+    pair = engine_runs.main
+    assert replayed.scenario_name == RANDOM_WAVES.name
+    offset_problems = generator_offset_problems(
+        replace(
+            pair,
+            graph=with_record(
+                pair.graph,
+                replace(replayed, generator_offset=replayed.generator_offset + 4),
+            ),
+        ),
+        {RANDOM_WAVES.name},
+    )
+    assert len(offset_problems) == 1, offset_problems
+    split_problems = first_frame_split_problems(
+        replace(
+            pair,
+            graph=with_record(
+                pair.graph,
+                replace(
+                    replayed,
+                    first_frame_kv_splits=[
+                        split + 1 for split in replayed.first_frame_kv_splits
+                    ],
+                ),
+            ),
+        )
+    )
+    assert len(split_problems) == 1, split_problems
+    lean_record = replace(
+        decoded,
+        lean_choices=[LeanChoice(policy="capture", batch_size=8, is_lean=True)],
+    )
+    assert len(lean_problems(with_record(run, lean_record))) == 1
+    assert (
+        len(
+            lean_problems(
+                replace(run, facts=replace(run.facts, lean_attention_override=True))
+            )
+        )
+        == 1
+    )
 
 
 def test_inputs_the_model_read_follow_each_history(

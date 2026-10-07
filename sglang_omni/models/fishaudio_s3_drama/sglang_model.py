@@ -32,6 +32,11 @@ from sglang.srt.utils import add_prefix
 from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
+from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
+    FirstFrameInputs,
+    FirstFrameRuns,
+    S3DramaFirstFrameGraphs,
+)
 from sglang_omni.models.fishaudio_s3_drama.hf_config import (
     FishOmniConfig,
     S3DramaTextConfig,
@@ -345,6 +350,8 @@ class S3DramaForCausalLM(nn.Module):
         self.step_exchange = StepExchange()
         # The engine builder allocates these once the request pool is sized.
         self.decode_buffers: S3DramaDecodeBuffers | None = None
+        self.first_frame_graphs: S3DramaFirstFrameGraphs | None = None
+        self.first_frame_runs = FirstFrameRuns()
 
     @property
     def start_layer(self) -> int:
@@ -414,6 +421,33 @@ class S3DramaForCausalLM(nn.Module):
         )
         hidden_states = hidden_states[:row_count]
         positions = positions[:row_count]
+        first_frame_graphs = self.first_frame_graphs
+        request_count = forward_batch.batch_size
+        if (
+            first_frame_graphs is not None
+            and request_count <= first_frame_graphs.max_request_count
+        ):
+            self.step_exchange.publish(
+                first_frame_graphs.replay(
+                    FirstFrameInputs(
+                        semantic_logits=logits_output.next_token_logits,
+                        hidden_states=hidden_states[last_rows],
+                        positions=positions[last_rows],
+                        input_frames=frames[last_rows],
+                        previous_main_tokens=step_inputs.ras_windows,
+                        temperature=step_inputs.temperature,
+                        top_k=step_inputs.top_k,
+                        top_p=step_inputs.top_p,
+                        request_pool_indices=forward_batch.req_pool_indices,
+                        sequence_lengths=forward_batch.seq_lens,
+                        cache_slots=forward_batch.out_cache_loc[last_rows],
+                    )
+                )
+            )
+            self.first_frame_runs.replays_by_request_count[request_count] += 1
+            return logits_output
+        else:
+            pass
         # The backbone is done with the extend metadata, so the full-attention
         # backend is re-planned for one newest row per request.
         step_batch = dataclasses.replace(
@@ -425,7 +459,7 @@ class S3DramaForCausalLM(nn.Module):
         attention_backend = get_attn_backend()
         assert isinstance(attention_backend, HybridLinearAttnBackend)
         attention_backend.full_attn_backend.init_forward_metadata(step_batch)
-        sampled_frames = self.audio_decoder.decode_step(
+        sampled_frames = self.sample_first_frames(
             logits_output.next_token_logits,
             hidden_states[last_rows],
             step_batch.positions,
@@ -434,10 +468,35 @@ class S3DramaForCausalLM(nn.Module):
             step_inputs.temperature,
             step_inputs.top_k,
             step_inputs.top_p,
-            PagedTowerAttention(self.tower_attention, step_batch),
+            step_batch,
         )
+        self.first_frame_runs.eager_count += 1
         self.step_exchange.publish(sampled_frames)
         return logits_output
+
+    def sample_first_frames(
+        self,
+        semantic_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_frames: torch.Tensor,
+        previous_main_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        return self.audio_decoder.decode_step(
+            semantic_logits,
+            hidden_states,
+            positions,
+            input_frames,
+            previous_main_tokens,
+            temperature,
+            top_k,
+            top_p,
+            PagedTowerAttention(self.tower_attention, forward_batch),
+        )
 
     def backbone_logits(
         self,

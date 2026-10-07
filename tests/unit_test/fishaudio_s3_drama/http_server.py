@@ -19,6 +19,8 @@ from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.schema import StageConfig
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS,
+    DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
     DEFAULT_MAX_NEW_TOKENS_CAP,
     DEFAULT_MAX_PROMPT_ROWS,
     DEFAULT_MAX_RUNNING_REQUESTS,
@@ -95,6 +97,10 @@ def create_eos_masked_tts_engine_executor(
     stream_stride: int = DEFAULT_STREAM_STRIDE,
     stream_followup_stride_ramp: tuple[int, ...] = DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     stream_followup_stride: int = DEFAULT_STREAM_FOLLOWUP_STRIDE,
+    first_frame_cuda_graphs: bool = DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
+    first_frame_cuda_graph_max_requests: int = (
+        DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
+    ),
 ) -> OmniScheduler[S3DramaRequestData]:
     return EosMaskedEngineBuilder(
         context_length=context_length,
@@ -104,6 +110,8 @@ def create_eos_masked_tts_engine_executor(
         stream_followup_stride=stream_followup_stride,
         max_prompt_rows=max_prompt_rows,
         max_new_tokens_cap=max_new_tokens,
+        first_frame_cuda_graphs=first_frame_cuda_graphs,
+        first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
     ).build(
         model_path,
         device=device,

@@ -10,6 +10,10 @@ from collections import Counter
 from dataclasses import replace
 
 import torch
+from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+    HybridLinearAttnBackend,
+)
+from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -32,10 +36,36 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     SamplingMode,
     bits,
 )
-from tests.unit_test.fishaudio_s3_drama.graph_recording_model import GraphRecordingModel
+from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
+    GraphRecordingModel,
+    LeanChoiceRecorder,
+)
 
 # Far above any logit the synthetic heads produce, so greedy sampling takes eos.
 FORCED_END_OF_SPEECH_LOGIT = 1.0e4
+
+
+def full_attention_kv_buffers(kv_pool: HybridLinearKVPool) -> list[torch.Tensor]:
+    return [
+        buffer
+        for layer_id in sorted(kv_pool.full_attention_layer_id_mapping)
+        for buffer in (
+            kv_pool.get_key_buffer(layer_id),
+            kv_pool.get_value_buffer(layer_id),
+        )
+    ]
+
+
+def changed_slots(
+    snapshot: list[torch.Tensor], buffers: list[torch.Tensor], slot_dim: int
+) -> set[int]:
+    changed = torch.zeros(
+        buffers[0].shape[slot_dim], dtype=torch.bool, device=buffers[0].device
+    )
+    for before, after in zip(snapshot, buffers, strict=True):
+        differs = bits(before) != bits(after)
+        changed |= differs.movedim(slot_dim, 0).flatten(1).any(dim=1)
+    return set(changed.nonzero().flatten().tolist())
 
 
 class GraphRecordingRunner(S3DramaModelRunner):
@@ -57,6 +87,11 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.kv_pool = kv_pool
         self.request_pool = request_pool
         self.full_attention_layer_ids = sorted(kv_pool.full_attention_layer_id_mapping)
+        attention_backend = sglang_runner.attn_backend
+        assert isinstance(attention_backend, HybridLinearAttnBackend)
+        full_attention_backend = attention_backend.full_attn_backend
+        assert isinstance(full_attention_backend, TritonAttnBackend)
+        self.full_attention_backend = full_attention_backend
         self.decode_graph_runner = sglang_runner.decode_cuda_graph_runner
         self.request_specs: dict[str, GraphRequestSpec] = {}
         self.sampling_mode: SamplingMode = "greedy"
@@ -70,17 +105,11 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.state_snapshot: list[torch.Tensor] = []
         self.usage_snapshot = PrefillCudaGraphUsage()
         self.tower_prefill_runs_snapshot = 0
-
-    def kv_buffers(self) -> list[torch.Tensor]:
-        """Every full-attention layer's key and value buffer, slot-major."""
-        return [
-            buffer
-            for layer_id in self.full_attention_layer_ids
-            for buffer in (
-                self.kv_pool.get_key_buffer(layer_id),
-                self.kv_pool.get_value_buffer(layer_id),
-            )
-        ]
+        self.lean_choice_recorder: LeanChoiceRecorder | None = None
+        self.first_frame_replays_snapshot: Counter[int] = Counter()
+        self.first_frame_eager_snapshot = 0
+        self.first_frame_sampler_calls_snapshot = 0
+        self.lean_choice_count_snapshot = 0
 
     def state_buffers(self) -> list[torch.Tensor]:
         """Every linear-attention state tensor, [layers, slots, ...]."""
@@ -108,7 +137,9 @@ class GraphRecordingRunner(S3DramaModelRunner):
         )
 
     def take_snapshots(self) -> None:
-        self.kv_snapshot = [buffer.clone() for buffer in self.kv_buffers()]
+        self.kv_snapshot = [
+            buffer.clone() for buffer in full_attention_kv_buffers(self.kv_pool)
+        ]
         self.state_snapshot = [buffer.clone() for buffer in self.state_buffers()]
         usage = self.model_worker.prefill_cuda_graph_usage
         self.usage_snapshot = replace(
@@ -118,6 +149,14 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.tower_prefill_runs_snapshot = (
             tower_prefill_runs.extend_mode + tower_prefill_runs.other_modes
         )
+        first_frame_runs = self.model.first_frame_runs
+        self.first_frame_replays_snapshot = Counter(
+            first_frame_runs.replays_by_request_count
+        )
+        self.first_frame_eager_snapshot = first_frame_runs.eager_count
+        self.first_frame_sampler_calls_snapshot = self.model.first_frame_sampler_calls
+        assert self.lean_choice_recorder is not None
+        self.lean_choice_count_snapshot = len(self.lean_choice_recorder.choices)
 
     def before_prefill(
         self,
@@ -183,17 +222,6 @@ class GraphRecordingRunner(S3DramaModelRunner):
         assert forward_batch is not None
         self.record_forward(result, forward_batch, requests, is_extend=False)
 
-    def changed_slots(
-        self, snapshot: list[torch.Tensor], buffers: list[torch.Tensor], slot_dim: int
-    ) -> set[int]:
-        changed = torch.zeros(
-            buffers[0].shape[slot_dim], dtype=torch.bool, device=buffers[0].device
-        )
-        for before, after in zip(snapshot, buffers, strict=True):
-            differs = bits(before) != bits(after)
-            changed |= differs.movedim(slot_dim, 0).flatten(1).any(dim=1)
-        return set(changed.nonzero().flatten().tolist())
-
     def record_forward(
         self,
         result: GenerationBatchResult,
@@ -227,7 +255,9 @@ class GraphRecordingRunner(S3DramaModelRunner):
             top_k = staged_inputs.top_k.tolist()
             top_p = staged_inputs.top_p.tolist()
             stray_kv_slots = sorted(
-                self.changed_slots(self.kv_snapshot, self.kv_buffers(), 0)
+                changed_slots(
+                    self.kv_snapshot, full_attention_kv_buffers(self.kv_pool), 0
+                )
                 - set(written_slots)
             )
         else:
@@ -238,16 +268,38 @@ class GraphRecordingRunner(S3DramaModelRunner):
             top_p = recording_buffers.top_p[:request_count].tolist()
             # The KV pool's slot 0 is where padded graph rows write.
             stray_kv_slots = sorted(
-                self.changed_slots(self.kv_snapshot, self.kv_buffers(), 0)
+                changed_slots(
+                    self.kv_snapshot, full_attention_kv_buffers(self.kv_pool), 0
+                )
                 - set(written_slots)
                 - {0}
             )
         stray_mamba_slots = sorted(
-            self.changed_slots(self.state_snapshot, self.state_buffers(), 1)
+            changed_slots(self.state_snapshot, self.state_buffers(), 1)
             - set(mamba_slots)
         )
         usage = self.model_worker.prefill_cuda_graph_usage
         is_graph_replay = bool(result.can_run_cuda_graph)
+        first_frame_runs = self.model.first_frame_runs
+        first_frame_replays = dict(
+            first_frame_runs.replays_by_request_count
+            - self.first_frame_replays_snapshot
+        )
+        first_frame_kv_splits: list[int]
+        if not is_extend:
+            first_frame_kv_splits = []
+        elif first_frame_replays:
+            first_frame_kv_splits = (
+                self.full_attention_backend.cuda_graph_num_kv_splits[
+                    :request_count
+                ].tolist()
+            )
+        else:
+            first_frame_kv_splits = (
+                self.full_attention_backend.forward_metadata.num_kv_splits.tolist()
+            )
+        lean_choice_recorder = self.lean_choice_recorder
+        assert lean_choice_recorder is not None
         steps = []
         for index, request in enumerate(requests):
             request_data = request_data_of(request)
@@ -314,6 +366,18 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 tower_prefill_runs=self.model.tower_prefill_runs.extend_mode
                 + self.model.tower_prefill_runs.other_modes
                 - self.tower_prefill_runs_snapshot,
+                first_frame_replays=first_frame_replays,
+                first_frame_eager_count=first_frame_runs.eager_count
+                - self.first_frame_eager_snapshot,
+                first_frame_sampler_calls=self.model.first_frame_sampler_calls
+                - self.first_frame_sampler_calls_snapshot,
+                first_frame_kv_splits=first_frame_kv_splits,
+                generator_offset=torch.cuda.default_generators[
+                    forward_batch.out_cache_loc.device.index
+                ].get_offset(),
+                lean_choices=lean_choice_recorder.choices[
+                    self.lean_choice_count_snapshot :
+                ],
                 steps=steps,
                 stray_kv_slots=stray_kv_slots,
                 stray_mamba_slots=stray_mamba_slots,

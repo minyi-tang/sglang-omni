@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import torch
+from sglang.kernels.ops.attention import decode_attention
 from sglang.srt.layers import radix_attention
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -37,6 +38,7 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationResult,
     S3DramaRequestData,
 )
+from sglang_omni.models.fishaudio_s3_drama.sglang_model import S3DramaForCausalLM
 from sglang_omni.proto.admin import ADMIN_CONTINUE_GENERATION, ADMIN_PAUSE_GENERATION
 from sglang_omni.proto.request import OmniRequest, StagePayload
 from sglang_omni.scheduling.bootstrap import InfrastructureOptions
@@ -61,13 +63,17 @@ from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
     CountingTowerPrefill,
     DrawRecorder,
     GraphRecordingModel,
+    LeanChoiceRecorder,
 )
 from tests.unit_test.fishaudio_s3_drama.graph_recording_runner import (
     GraphRecordingRunner,
+    changed_slots,
+    full_attention_kv_buffers,
 )
 from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import FreePoolCounts
 
 SCENARIO_TIMEOUT_SECONDS = 300.0
+KV_SENTINEL = 1.0
 IDLE_TIMEOUT_SECONDS = 30.0
 OUTBOX_POLL_SECONDS = 0.05
 
@@ -81,15 +87,28 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
         super().__init__(
             context_length=spec.context_length,
             max_running_requests=spec.max_running_requests,
+            first_frame_cuda_graphs=spec.first_frame_cuda_graphs,
+            first_frame_cuda_graph_max_requests=spec.first_frame_cuda_graph_max_requests,
         )
         self.spec = spec
         self.capture_break_recorder = CaptureBreakRecorder(
             radix_attention.breakable_unified_attention_with_output
         )
+        self.lean_choice_recorder = LeanChoiceRecorder(
+            decode_attention.lean_capture_policy,
+            decode_attention.lean_decode_seqlen_gate,
+        )
+        self.first_frame_capture_written_kv_slots: list[int] = []
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         super().pre_infra_setup(checkpoint_dir)
         ModelRegistry.models[FISH_OMNI_ARCHITECTURE] = GraphRecordingModel
+        decode_attention.lean_capture_policy = (
+            self.lean_choice_recorder.record_capture_policy
+        )
+        decode_attention.lean_decode_seqlen_gate = (
+            self.lean_choice_recorder.record_sequence_length_gate
+        )
 
     def generation_defaults(self, *, dtype: str) -> GenerationDefaults:
         return {
@@ -137,6 +156,25 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             next_frames=tower_prefill.next_frames,
             runs=model.tower_prefill_runs,
         )
+
+    def post_cuda_graph_setup(
+        self, model: S3DramaForCausalLM, server_args: ServerArgs
+    ) -> None:
+        sglang_runner = self.sglang_runner
+        assert sglang_runner is not None
+        kv_pool = sglang_runner.token_to_kv_pool
+        assert isinstance(kv_pool, HybridLinearKVPool)
+        kv_buffers = full_attention_kv_buffers(kv_pool)
+        kv_contents = [buffer.clone() for buffer in kv_buffers]
+        for buffer in kv_buffers:
+            buffer.fill_(KV_SENTINEL)
+        kv_snapshot = [buffer.clone() for buffer in kv_buffers]
+        super().post_cuda_graph_setup(model, server_args)
+        self.first_frame_capture_written_kv_slots = sorted(
+            changed_slots(kv_snapshot, kv_buffers, 0)
+        )
+        for buffer, contents in zip(kv_buffers, kv_contents, strict=True):
+            buffer.copy_(contents)
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor
@@ -344,7 +382,7 @@ class GraphSchedulerDriver:
 def engine_facts(
     scheduler: OmniScheduler[S3DramaRequestData],
     model: GraphRecordingModel,
-    capture_break_recorder: CaptureBreakRecorder,
+    builder: GraphRecordingEngineBuilder,
 ) -> GraphEngineFacts:
     sglang_runner = scheduler.tp_worker.model_runner
     attention_backend = sglang_runner.attn_backend
@@ -359,6 +397,7 @@ def engine_facts(
     prefill_graph_runner = sglang_runner.prefill_cuda_graph_runner
     kv_pool = sglang_runner.token_to_kv_pool
     assert isinstance(kv_pool, HybridLinearKVPool)
+    first_frame_graphs = model.first_frame_graphs
     expert_paths = []
     for module in model.modules():
         if isinstance(module, FusedMoE):
@@ -402,8 +441,16 @@ def engine_facts(
         tower_prefill_runs_outside_extend=model.tower_prefill_runs.other_modes,
         tower_prefill_rows=tower_prefill.input_frames.shape[0],
         prefill_capture_break_layer_ids=(
-            capture_break_recorder.layer_ids_by_token_count
+            builder.capture_break_recorder.layer_ids_by_token_count
         ),
+        first_frame_request_counts=(
+            None if first_frame_graphs is None else sorted(first_frame_graphs.graphs)
+        ),
+        first_frame_capture_written_kv_slots=(
+            builder.first_frame_capture_written_kv_slots
+        ),
+        lean_attention_override=full_attention_backend.enable_lean_attention,
+        startup_lean_choices=list(builder.lean_choice_recorder.choices),
     )
 
 
@@ -442,10 +489,11 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
     assert isinstance(model, GraphRecordingModel)
     assert isinstance(runner, GraphRecordingRunner)
     runner.abort_inbox = scheduler.inbox
+    runner.lean_choice_recorder = builder.lean_choice_recorder
     # Graph capture drew random numbers after the worker seeded them; both
     # engines start serving from the same generator state.
     torch.manual_seed(spec.random_seed)
-    facts = engine_facts(scheduler, model, builder.capture_break_recorder)
+    facts = engine_facts(scheduler, model, builder)
     logger.info(f"S3-drama graph test engine ({spec.kind}): {facts}")
     driver = GraphSchedulerDriver(scheduler, runner, spec.prompts)
     baseline = driver.free_pool_counts()

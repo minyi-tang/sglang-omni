@@ -6,13 +6,14 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import logging
 import math
 from array import array
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, Protocol
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import huggingface_hub
 import pytest
@@ -29,12 +30,17 @@ from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
+from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
+from sglang_omni.models.fishaudio_s3_drama import engine_builder
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
     DECODE_STEPS_BETWEEN_PREFILLS,
     PREFILL_CUDA_GRAPH_MAX_TOKENS,
     S3DramaEngineBuilder,
+)
+from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
+    S3DramaFirstFrameGraphs,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.model_runner import (
@@ -94,6 +100,9 @@ from tests.unit_test.fishaudio_s3_drama.test_audio_decoder import (
     loaded_decoder,
     random_checkpoint,
     torch_fused_op_backend,
+)
+from tests.unit_test.fishaudio_s3_drama.test_first_frame_graphs import (
+    cpu_first_frame_graphs,
 )
 from tests.unit_test.fishaudio_s3_drama.test_hf_config import fish_config_dict
 
@@ -899,6 +908,28 @@ def test_tower_prefill_refuses_rows_past_its_buffers() -> None:
     tower_prefill.audio_decoder.prefill.assert_not_called()
 
 
+def set_up_mocked_model(
+    builder: S3DramaEngineBuilder, server_args: ServerArgs, checkpoint_dir: Path
+) -> Mock:
+    model = Mock(spec=S3DramaForCausalLM)
+    model.config = FishOmniConfig(**fish_config_dict())
+    model.audio_decoder = Mock(spec=AudioDecoder)
+    model.tower_attention = torch.nn.ModuleList()
+    model.model = SimpleNamespace(tower_prefill=None)
+    worker = Mock(spec=ModelWorker)
+    worker.model_runner = SimpleNamespace(
+        model=model, req_to_token_pool=SimpleNamespace(size=4)
+    )
+    builder.setup_model(
+        model_worker=worker,
+        checkpoint_dir=str(checkpoint_dir),
+        device="cpu",
+        gpu_id=0,
+        server_args=server_args,
+    )
+    return model
+
+
 @pytest.mark.parametrize(
     ("overrides", "context_length", "row_count"),
     [
@@ -924,23 +955,8 @@ def test_setup_model_gives_the_backbone_rows_for_the_largest_extend_or_bucket(
 ) -> None:
     builder, server_args = engine_server_args(tmp_path, overrides, context_length)
     builder.validate_before_infrastructure(server_args)
-    model = Mock(spec=S3DramaForCausalLM)
-    model.config = FishOmniConfig(**fish_config_dict())
-    model.audio_decoder = Mock(spec=AudioDecoder)
-    model.tower_attention = torch.nn.ModuleList()
-    model.model = SimpleNamespace(tower_prefill=None)
-    worker = Mock(spec=ModelWorker)
-    worker.model_runner = SimpleNamespace(
-        model=model, req_to_token_pool=SimpleNamespace(size=4)
-    )
 
-    builder.setup_model(
-        model_worker=worker,
-        checkpoint_dir=str(tmp_path),
-        device="cpu",
-        gpu_id=0,
-        server_args=server_args,
-    )
+    model = set_up_mocked_model(builder, server_args, tmp_path)
 
     tower_prefill = model.model.tower_prefill
     assert isinstance(tower_prefill, S3DramaTowerPrefill)
@@ -950,6 +966,150 @@ def test_setup_model_gives_the_backbone_rows_for_the_largest_extend_or_bucket(
     assert tower_prefill.next_frames.shape == (row_count, FRAME_WIDTH)
     assert not tower_prefill.input_frames.any()
     assert not tower_prefill.next_frames.any()
+
+
+def test_setup_model_reports_first_frame_graphs_off_without_cuda_graphs(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    builder, server_args = engine_server_args(tmp_path, {"disable_cuda_graph": True})
+
+    with caplog.at_level(logging.INFO, logger=engine_builder.logger.name):
+        set_up_mocked_model(builder, server_args, tmp_path)
+
+    assert "S3-drama first-frame CUDA graphs: off, CUDA graphs are disabled" in (
+        caplog.text
+    )
+
+
+def first_frame_graph_setup(
+    *,
+    first_frame_cuda_graphs: bool,
+    first_frame_cuda_graph_max_requests: int,
+    decode_graph_max_batch_size: int | None,
+) -> tuple[S3DramaEngineBuilder, Mock]:
+    builder = S3DramaEngineBuilder(
+        context_length=CONTEXT_LENGTH,
+        max_running_requests=2,
+        first_frame_cuda_graphs=first_frame_cuda_graphs,
+        first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
+    )
+    sglang_runner = Mock(spec=SGLModelRunner)
+    sglang_runner.attn_backend = Mock(spec=HybridLinearAttnBackend)
+    sglang_runner.decode_cuda_graph_runner = (
+        None
+        if decode_graph_max_batch_size is None
+        else SimpleNamespace(max_bs=decode_graph_max_batch_size)
+    )
+    sglang_runner.model_config = SimpleNamespace(dtype=torch.bfloat16)
+    builder.sglang_runner = sglang_runner
+    model = Mock(spec=S3DramaForCausalLM)
+    model.config = FishOmniConfig(**fish_config_dict())
+    model.lm_head = SimpleNamespace(weight=torch.zeros(1))
+    model.first_frame_graphs = None
+    return builder, model
+
+
+@pytest.mark.parametrize(
+    (
+        "first_frame_cuda_graph_max_requests",
+        "decode_graph_max_batch_size",
+        "max_request_count",
+    ),
+    [(16, 8, 8), (3, 8, 3), (16, 16, 16)],
+)
+def test_first_frame_graphs_cover_requests_up_to_the_decode_graph_batch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first_frame_cuda_graph_max_requests: int,
+    decode_graph_max_batch_size: int,
+    max_request_count: int,
+) -> None:
+    _, server_args = engine_server_args(tmp_path, {})
+    builder, model = first_frame_graph_setup(
+        first_frame_cuda_graphs=True,
+        first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
+        decode_graph_max_batch_size=decode_graph_max_batch_size,
+    )
+    graphs = cpu_first_frame_graphs([])
+    capture = Mock(return_value=graphs)
+    monkeypatch.setattr(S3DramaFirstFrameGraphs, "capture", capture)
+
+    with caplog.at_level(logging.INFO, logger=engine_builder.logger.name):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    sglang_runner = builder.sglang_runner
+    assert sglang_runner is not None
+    text_config = model.config.text_config
+    assert capture.call_args == call(
+        sample_first_frames=model.sample_first_frames,
+        attention_backend=sglang_runner.attn_backend,
+        max_request_count=max_request_count,
+        vocab_size=text_config.vocab_size,
+        hidden_size=text_config.hidden_size,
+        hidden_dtype=torch.bfloat16,
+        frame_width=FRAME_WIDTH,
+        device=torch.device("cpu"),
+    )
+    assert model.first_frame_graphs is graphs
+    assert (
+        f"S3-drama first-frame CUDA graphs: on for 1..{max_request_count} requests "
+        f"(first_frame_cuda_graph_max_requests {first_frame_cuda_graph_max_requests}"
+        f", decode CUDA graph max batch {decode_graph_max_batch_size})"
+    ) in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("first_frame_cuda_graphs", "decode_graph_max_batch_size", "reason"),
+    [
+        (False, 8, "tts_engine.factory.first_frame_cuda_graphs is false"),
+        (True, None, "no decode CUDA graph"),
+    ],
+)
+def test_the_first_frame_step_stays_eager_when_switched_off_or_without_decode_graphs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    first_frame_cuda_graphs: bool,
+    decode_graph_max_batch_size: int | None,
+    reason: str,
+) -> None:
+    _, server_args = engine_server_args(tmp_path, {})
+    builder, model = first_frame_graph_setup(
+        first_frame_cuda_graphs=first_frame_cuda_graphs,
+        first_frame_cuda_graph_max_requests=16,
+        decode_graph_max_batch_size=decode_graph_max_batch_size,
+    )
+    capture = Mock(side_effect=AssertionError("captured first-frame graphs"))
+    monkeypatch.setattr(S3DramaFirstFrameGraphs, "capture", capture)
+
+    with caplog.at_level(logging.INFO, logger=engine_builder.logger.name):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    capture.assert_not_called()
+    assert model.first_frame_graphs is None
+    assert f"S3-drama first-frame CUDA graphs: off, {reason}" in caplog.text
+
+
+def test_a_failed_first_frame_capture_stops_the_engine_without_graphs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, server_args = engine_server_args(tmp_path, {})
+    builder, model = first_frame_graph_setup(
+        first_frame_cuda_graphs=True,
+        first_frame_cuda_graph_max_requests=16,
+        decode_graph_max_batch_size=8,
+    )
+    monkeypatch.setattr(
+        S3DramaFirstFrameGraphs,
+        "capture",
+        Mock(side_effect=RuntimeError("the graph for 2 requests failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="the graph for 2 requests failed"):
+        builder.post_cuda_graph_setup(model, server_args)
+
+    assert model.first_frame_graphs is None
 
 
 # Written by a decode forward that fails, so collecting it would show.

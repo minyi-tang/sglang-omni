@@ -10,6 +10,9 @@ from typing import Literal
 import torch
 from pydantic import BaseModel
 
+from sglang_omni.models.fishaudio_s3_drama.config import (
+    DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS,
+)
 from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
     CONTEXT_LENGTH,
     MAX_RUNNING_REQUESTS,
@@ -34,6 +37,7 @@ INTEGER_DTYPES = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64
 # padded batch samples like an unpadded one; random: the request's own knobs.
 SamplingMode = Literal["greedy", "random"]
 EngineKind = Literal["eager", "graph", "prefill_graph"]
+LeanPolicy = Literal["capture", "sequence_length"]
 
 
 def bits(tensor: torch.Tensor) -> torch.Tensor:
@@ -69,6 +73,10 @@ class GraphEngineSpec(BaseModel):
     max_total_tokens: int = MAX_TOTAL_TOKENS
     total_gpu_memory_fraction: float = TOTAL_GPU_MEMORY_FRACTION
     random_seed: int = RANDOM_SEED
+    first_frame_cuda_graphs: bool = True
+    first_frame_cuda_graph_max_requests: int = (
+        DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
+    )
     prompts: dict[str, list[list[int]]] = PROMPTS
     scenarios: list[GraphScenario]
 
@@ -105,6 +113,13 @@ class GraphRequestStep:
 
 
 @dataclass(frozen=True, kw_only=True)
+class LeanChoice:
+    policy: LeanPolicy
+    batch_size: int
+    is_lean: bool
+
+
+@dataclass(frozen=True, kw_only=True)
 class GraphForwardRecord:
     forward_index: int
     scenario_name: str
@@ -116,6 +131,12 @@ class GraphForwardRecord:
     prefill_eager_count: int
     prefill_replay_buckets: dict[int, int]
     tower_prefill_runs: int
+    first_frame_replays: dict[int, int]
+    first_frame_eager_count: int
+    first_frame_sampler_calls: int
+    first_frame_kv_splits: list[int]
+    generator_offset: int
+    lean_choices: list[LeanChoice]
     steps: list[GraphRequestStep]
     stray_kv_slots: list[int]
     stray_mamba_slots: list[int]
@@ -146,6 +167,10 @@ class GraphEngineFacts:
     tower_prefill_runs_outside_extend: int
     tower_prefill_rows: int
     prefill_capture_break_layer_ids: dict[int, list[int]]
+    first_frame_request_counts: list[int] | None
+    first_frame_capture_written_kv_slots: list[int]
+    lean_attention_override: bool | None
+    startup_lean_choices: list[LeanChoice]
 
 
 @dataclass(kw_only=True)
@@ -293,6 +318,20 @@ GREEDY_SAME_BUCKET = GraphScenario(
         )
     ],
 )
+GREEDY_ODD_WAVES = GraphScenario(
+    name="greedy_odd_waves",
+    sampling_mode="greedy",
+    waves=[
+        [
+            GraphRequestSpec(prompt_name=prompt_name, max_new_tokens=8)
+            for prompt_name in prompt_names
+        ]
+        for prompt_names in (
+            ["p60", "p31", "p13", "p5", "p40"],
+            ["p2", "p5", "p9", "p13", "p31", "p40", "p60"],
+        )
+    ],
+)
 MAIN_SCENARIOS = [
     RANDOM_WAVES,
     GREEDY_SINGLE,
@@ -300,6 +339,7 @@ MAIN_SCENARIOS = [
     GREEDY_ABORT_REUSE,
     GREEDY_LONG_WAVE,
     GREEDY_SAME_BUCKET,
+    GREEDY_ODD_WAVES,
 ]
 GREEDY_SMALL_BUDGET = GraphScenario(
     name="greedy_small_budget",

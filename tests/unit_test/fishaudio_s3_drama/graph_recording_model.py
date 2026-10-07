@@ -21,6 +21,7 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaForCausalLM,
     S3DramaTowerPrefill,
 )
+from tests.unit_test.fishaudio_s3_drama.graph_fixtures import LeanChoice
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -157,6 +158,7 @@ class GraphRecordingModel(S3DramaForCausalLM):
         self.logits_processor = self.end_of_speech_logits
         self.recording_buffers: RecordingBuffers | None = None
         self.draw_column = 0
+        self.first_frame_sampler_calls = 0
         self.tower_prefill_runs = TowerPrefillRuns()
         for head_index, head in enumerate(self.audio_decoder.codebook_heads):
             head.register_forward_hook(
@@ -232,6 +234,32 @@ class GraphRecordingModel(S3DramaForCausalLM):
             pass
         return output
 
+    def sample_first_frames(
+        self,
+        semantic_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        input_frames: torch.Tensor,
+        previous_main_tokens: torch.Tensor,
+        temperature: torch.Tensor,
+        top_k: torch.Tensor,
+        top_p: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        self.draw_column = 0
+        self.first_frame_sampler_calls += 1
+        return super().sample_first_frames(
+            semantic_logits,
+            hidden_states,
+            positions,
+            input_frames,
+            previous_main_tokens,
+            temperature,
+            top_k,
+            top_p,
+            forward_batch,
+        )
+
 
 class TopKTopPSampler(Protocol):
     def __call__(
@@ -267,3 +295,56 @@ class DrawRecorder:
         )
         self.model.draw_column = column + 1
         return candidate_columns
+
+
+class LeanCapturePolicy(Protocol):
+    def __call__(
+        self, num_q_heads: int, kv_group_num: int, batch: int, is_mla: bool = False
+    ) -> bool: ...
+
+
+class LeanSequenceLengthGate(Protocol):
+    def __call__(
+        self,
+        num_q_heads: int,
+        kv_group_num: int,
+        batch: int,
+        seq_lens_sum: int | None,
+        is_mla: bool = False,
+    ) -> bool: ...
+
+
+class LeanChoiceRecorder:
+    def __init__(
+        self,
+        capture_policy: LeanCapturePolicy,
+        sequence_length_gate: LeanSequenceLengthGate,
+    ) -> None:
+        self.capture_policy = capture_policy
+        self.sequence_length_gate = sequence_length_gate
+        self.choices: list[LeanChoice] = []
+
+    def record_capture_policy(
+        self, num_q_heads: int, kv_group_num: int, batch: int, is_mla: bool = False
+    ) -> bool:
+        is_lean = self.capture_policy(num_q_heads, kv_group_num, batch, is_mla)
+        self.choices.append(
+            LeanChoice(policy="capture", batch_size=batch, is_lean=is_lean)
+        )
+        return is_lean
+
+    def record_sequence_length_gate(
+        self,
+        num_q_heads: int,
+        kv_group_num: int,
+        batch: int,
+        seq_lens_sum: int | None,
+        is_mla: bool = False,
+    ) -> bool:
+        is_lean = self.sequence_length_gate(
+            num_q_heads, kv_group_num, batch, seq_lens_sum, is_mla
+        )
+        self.choices.append(
+            LeanChoice(policy="sequence_length", batch_size=batch, is_lean=is_lean)
+        )
+        return is_lean
