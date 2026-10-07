@@ -17,6 +17,7 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
 from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     EnginePair,
     bit_problems,
+    capture_break_problems,
     draw_problems,
     finite_problems,
     history_problems,
@@ -39,6 +40,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     RANDOM_WAVES,
     RETRACT_INTERVAL,
     RETRACT_SCENARIOS,
+    SMALL_BUDGET_SCENARIOS,
     EngineKind,
     GraphEngineRun,
     GraphEngineSpec,
@@ -70,6 +72,8 @@ RETRACT_ENVIRONMENT = {
 }
 # Requests whose last step never comes: the abort target.
 PADDED_BATCH_SIZES = {3, 5, 6, 7}
+SMALL_BUDGET_MAX_PREFILL_TOKENS = 32
+SMALL_BUDGET_CONTEXT_LENGTH = 112
 # One line per problem is enough to locate the first divergence.
 REPORTED_PROBLEM_COUNT = 20
 
@@ -82,6 +86,7 @@ class GraphEngineRuns:
     prefill_main: EnginePair
     prefill_fp8: EnginePair
     prefill_retract: EnginePair
+    prefill_small_budget: EnginePair
     workdir: Path
 
 
@@ -170,6 +175,21 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
     retract, prefill_retract = engine_pairs(
         "retract", checkpoint_dir, RETRACT_SCENARIOS, workdir, RETRACT_ENVIRONMENT
     )
+    small_budget_runs = {
+        kind: run_engine(
+            f"small-budget-{kind}",
+            GraphEngineSpec(
+                model_dir=str(checkpoint_dir),
+                kind=kind,
+                context_length=SMALL_BUDGET_CONTEXT_LENGTH,
+                max_prefill_tokens=SMALL_BUDGET_MAX_PREFILL_TOKENS,
+                scenarios=SMALL_BUDGET_SCENARIOS,
+            ),
+            workdir,
+            {},
+        )
+        for kind in ("eager", "prefill_graph")
+    }
     runs = GraphEngineRuns(
         main=main,
         fp8=fp8,
@@ -177,6 +197,11 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         prefill_main=prefill_main,
         prefill_fp8=prefill_fp8,
         prefill_retract=prefill_retract,
+        prefill_small_budget=EnginePair(
+            eager=small_budget_runs["eager"],
+            graph=small_budget_runs["prefill_graph"],
+            scenarios=SMALL_BUDGET_SCENARIOS,
+        ),
         workdir=workdir,
     )
     print(f"Artifacts: {workdir}")
@@ -191,6 +216,7 @@ def all_pairs(engine_runs: GraphEngineRuns) -> dict[str, EnginePair]:
         "prefill main": engine_runs.prefill_main,
         "prefill fp8": engine_runs.prefill_fp8,
         "prefill retract": engine_runs.prefill_retract,
+        "prefill small budget": engine_runs.prefill_small_budget,
     }
 
 
@@ -219,6 +245,17 @@ def test_engines_start_as_specified(engine_runs: GraphEngineRuns) -> None:
             assert set(facts.tower_layer_ids) <= set(facts.recorded_kv_layer_ids), name
             assert facts.decode_buffer_rows >= facts.request_pool_size, name
             assert facts.decode_buffer_rows >= max(CUDA_GRAPH_BATCH_SIZES), name
+            assert facts.tower_prefill_runs_outside_extend == 0, name
+            assert facts.tower_prefill_rows >= max(
+                facts.prefill_capture_token_counts or [0]
+            ), name
+        assert eager_facts.tower_prefill_runs_before_serving == 0, name
+        if pair.graph.kind == "prefill_graph":
+            assert graph_facts.tower_prefill_runs_before_serving >= len(
+                PREFILL_CUDA_GRAPH_TOKEN_COUNTS
+            ), name
+        else:
+            assert graph_facts.tower_prefill_runs_before_serving == 0, name
         # The split count saturating at its cap keeps padding out of the split.
         assert eager_facts.max_kv_splits == graph_facts.max_kv_splits == 8, name
         assert eager_facts.kv_pool_size == graph_facts.kv_pool_size, name
@@ -285,6 +322,34 @@ def test_each_prefill_replays_its_bucket_or_runs_eager(
             assert not problems, f"{name}:\n{first_problems(problems)}"
 
 
+def test_each_prefill_graph_capture_breaks_at_every_attention_layer(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    assert engine_runs.prefill_main.graph.facts.tower_layer_ids
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = capture_break_problems(run)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+
+
+def test_prefill_graph_replays_a_bucket_past_its_prefill_budget_and_context(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    pair = engine_runs.prefill_small_budget
+    largest_extend = max(SMALL_BUDGET_MAX_PREFILL_TOKENS, SMALL_BUDGET_CONTEXT_LENGTH)
+    assert max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS) > largest_extend
+    assert pair.graph.facts.tower_prefill_rows >= max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS)
+    assert any(
+        bucket > largest_extend
+        for record in pair.graph.forwards
+        for bucket in record.prefill_replay_buckets
+    )
+    assert any(
+        record.is_extend and record.token_count > SMALL_BUDGET_MAX_PREFILL_TOKENS
+        for record in pair.eager.forwards
+    )
+
+
 def test_prefill_graph_replays_every_admissible_shape(
     engine_runs: GraphEngineRuns,
 ) -> None:
@@ -305,6 +370,13 @@ def test_prefill_graph_replays_every_admissible_shape(
     assert any(
         later < earlier
         for earlier, later in zip(replayed_buckets, replayed_buckets[1:])
+    )
+    assert any(
+        earlier.is_graph_replay
+        and later.prefill_replay_buckets == earlier.prefill_replay_buckets
+        and later.token_count < earlier.token_count
+        and len(later.steps) != len(earlier.steps)
+        for earlier, later in zip(extends, extends[1:])
     )
     assert any(
         record.token_count > max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS)
@@ -361,6 +433,7 @@ def test_prefill_checks_catch_a_changed_record(engine_runs: GraphEngineRuns) -> 
         for record in run.forwards
         if record.is_extend and not record.is_graph_replay
     )
+    decoded = next(record for record in run.forwards if not record.is_extend)
     for changed in (
         replace(
             replayed,
@@ -377,6 +450,9 @@ def test_prefill_checks_catch_a_changed_record(engine_runs: GraphEngineRuns) -> 
         ),
         replace(replayed, is_graph_replay=False),
         replace(fallen_back, prefill_replay_count=1, prefill_eager_count=0),
+        replace(replayed, tower_prefill_runs=1),
+        replace(fallen_back, tower_prefill_runs=0),
+        replace(decoded, tower_prefill_runs=1),
     ):
         problems = prefill_path_problems(with_record(run, changed))
         assert len(problems) == 1, problems
@@ -386,6 +462,39 @@ def test_prefill_checks_catch_a_changed_record(engine_runs: GraphEngineRuns) -> 
     ):
         problems = stray_write_problems(with_record(run, changed))
         assert len(problems) == 1, problems
+
+
+def test_capture_break_check_catches_a_missing_or_changed_tower_break(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    run = engine_runs.prefill_main.graph
+    facts = run.facts
+    token_count = max(PREFILL_CUDA_GRAPH_TOKEN_COUNTS)
+    layer_ids = facts.prefill_capture_break_layer_ids[token_count]
+    backbone_layer_ids = [
+        layer_id for layer_id in layer_ids if layer_id not in facts.tower_layer_ids
+    ]
+    other_captures = {
+        captured_token_count: captured_layer_ids
+        for captured_token_count, captured_layer_ids in (
+            facts.prefill_capture_break_layer_ids.items()
+        )
+        if captured_token_count != token_count
+    }
+    for changed_captures, problem_count in (
+        ({**other_captures, token_count: layer_ids[:-1]}, 1),
+        ({**other_captures, token_count: backbone_layer_ids}, 1),
+        ({**other_captures, token_count: layer_ids + layer_ids[-1:]}, 1),
+        ({**other_captures, token_count: layer_ids[:-1] + [max(layer_ids) + 1]}, 1),
+        (other_captures, 1),
+        ({**other_captures, 2 * token_count: layer_ids}, 2),
+    ):
+        changed_run = replace(
+            run,
+            facts=replace(facts, prefill_capture_break_layer_ids=changed_captures),
+        )
+        problems = capture_break_problems(changed_run)
+        assert len(problems) == problem_count, problems
 
 
 def test_inputs_the_model_read_follow_each_history(

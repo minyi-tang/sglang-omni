@@ -20,7 +20,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorO
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.qwen3_5 import Qwen3_5MoeForCausalLM
 from sglang.srt.runtime_context import get_parallel
@@ -28,7 +32,10 @@ from sglang.srt.utils import add_prefix
 from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
-from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.hf_config import (
+    FishOmniConfig,
+    S3DramaTextConfig,
+)
 from sglang_omni.models.fishaudio_s3_drama.sampling import (
     EMPTY_RAS_SLOT,
     RAS_WINDOW_FRAMES,
@@ -172,6 +179,104 @@ class PagedTowerAttention:
         return layer(query, key, value, self.forward_batch)
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class S3DramaTowerPrefill:
+    audio_decoder: AudioDecoder
+    tower_attention: nn.ModuleList
+    input_frames: torch.Tensor
+    next_frames: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        audio_decoder: AudioDecoder,
+        tower_attention: nn.ModuleList,
+        row_count: int,
+        frame_width: int,
+        device: torch.device,
+    ) -> S3DramaTowerPrefill:
+        return cls(
+            audio_decoder=audio_decoder,
+            tower_attention=tower_attention,
+            input_frames=torch.zeros(
+                (row_count, frame_width), dtype=torch.int64, device=device
+            ),
+            next_frames=torch.zeros(
+                (row_count, frame_width), dtype=torch.int64, device=device
+            ),
+        )
+
+    def require_rows(self, row_count: int) -> None:
+        buffer_row_count = min(self.input_frames.shape[0], self.next_frames.shape[0])
+        if row_count > buffer_row_count:
+            raise RuntimeError(
+                f"{row_count} rows exceed the {buffer_row_count} tower prefill rows"
+            )
+        else:
+            pass
+
+    def stage(self, input_frames: torch.Tensor, next_frames: torch.Tensor) -> None:
+        row_count = input_frames.shape[0]
+        self.require_rows(row_count)
+        self.input_frames[:row_count].copy_(input_frames)
+        self.next_frames[:row_count].copy_(next_frames)
+
+    def run(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        row_count = hidden_states.shape[0]
+        self.require_rows(row_count)
+        self.audio_decoder.prefill(
+            hidden_states,
+            positions,
+            self.input_frames[:row_count],
+            self.next_frames[:row_count],
+            PagedTowerAttention(self.tower_attention, forward_batch),
+        )
+
+
+class S3DramaBackbone(Qwen3_5MoeForCausalLM):
+    def __init__(
+        self,
+        config: S3DramaTextConfig,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config, quant_config=quant_config, prefix=prefix)
+        self.tower_prefill: S3DramaTowerPrefill | None = None
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
+        pp_proxy_tensors: PPProxyTensors | None = None,
+        input_deepstack_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        hidden_states = super().forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors,
+            input_deepstack_embeds,
+        )
+        assert isinstance(hidden_states, torch.Tensor)
+        tower_prefill = self.tower_prefill
+        if forward_batch.forward_mode != ForwardMode.EXTEND:
+            return hidden_states
+        elif tower_prefill is None:
+            raise RuntimeError("the engine allocated no S3-drama tower prefill buffers")
+        else:
+            tower_prefill.run(hidden_states, positions, forward_batch)
+            return hidden_states
+
+
 class S3DramaForCausalLM(nn.Module):
     """Backbone, lm_head and codebook tower; one forward samples one frame per request."""
 
@@ -215,7 +320,7 @@ class S3DramaForCausalLM(nn.Module):
         else:
             pass
         self.config = config
-        self.model = Qwen3_5MoeForCausalLM(
+        self.model = S3DramaBackbone(
             text_config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
         self.lm_head = ParallelLMHead(
@@ -296,19 +401,19 @@ class S3DramaForCausalLM(nn.Module):
         row_count = forward_batch.extend_num_tokens
         step_inputs = self.step_exchange.take_inputs(forward_batch.rids, row_count)
         frames = step_inputs.frames
+        last_rows = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
+        tower_prefill = self.model.tower_prefill
+        if tower_prefill is None:
+            raise RuntimeError("the engine allocated no S3-drama tower prefill buffers")
+        else:
+            tower_prefill.stage(
+                frames, next_frame_labels(frames, last_rows, self.config.eos_token_id)
+            )
         hidden_states, logits_output = self.backbone_logits(
             input_ids, positions, forward_batch, frames
         )
         hidden_states = hidden_states[:row_count]
         positions = positions[:row_count]
-        last_rows = forward_batch.extend_start_loc + forward_batch.extend_seq_lens - 1
-        self.audio_decoder.prefill(
-            hidden_states,
-            positions,
-            frames,
-            next_frame_labels(frames, last_rows, self.config.eos_token_id),
-            PagedTowerAttention(self.tower_attention, forward_batch),
-        )
         # The backbone is done with the extend metadata, so the full-attention
         # backend is re-planned for one newest row per request.
         step_batch = dataclasses.replace(

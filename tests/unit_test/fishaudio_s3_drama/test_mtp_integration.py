@@ -29,6 +29,7 @@ from sglang.srt.server_args import ServerArgs
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
+from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
     DECODE_STEPS_BETWEEN_PREFILLS,
@@ -60,6 +61,7 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaDecodeBuffers,
     S3DramaForCausalLM,
     S3DramaStepInputs,
+    S3DramaTowerPrefill,
     StepExchange,
     next_frame_labels,
 )
@@ -847,6 +849,107 @@ def test_decode_staging_rewrites_rows_in_place_as_the_batch_shrinks_and_grows() 
     stage_decode_rows(buffers, batch_request_data)
     assert staged_rows(buffers, 4) == expected_rows(batch_request_data)
     assert buffer_addresses(buffers) == addresses
+
+
+def tower_prefill_of(row_count: int) -> S3DramaTowerPrefill:
+    return S3DramaTowerPrefill.allocate(
+        audio_decoder=Mock(spec=AudioDecoder),
+        tower_attention=torch.nn.ModuleList(),
+        row_count=row_count,
+        frame_width=FRAME_WIDTH,
+        device=torch.device("cpu"),
+    )
+
+
+def test_tower_prefill_stages_rows_in_place_over_zeroed_buffers() -> None:
+    tower_prefill = tower_prefill_of(6)
+    addresses = (
+        tower_prefill.input_frames.data_ptr(),
+        tower_prefill.next_frames.data_ptr(),
+    )
+    assert tower_prefill.input_frames.shape == (6, FRAME_WIDTH)
+    assert tower_prefill.next_frames.shape == (6, FRAME_WIDTH)
+    assert not tower_prefill.input_frames.any()
+    assert not tower_prefill.next_frames.any()
+    frames = torch.tensor(frame_rows_of([4], seed=3)[0])
+    next_frames = next_frame_labels(frames, torch.tensor([3]), 2)
+
+    tower_prefill.stage(frames, next_frames)
+    assert torch.equal(tower_prefill.input_frames[:4], frames)
+    assert torch.equal(tower_prefill.next_frames[:4], next_frames)
+    assert not tower_prefill.input_frames[4:].any()
+    tower_prefill.stage(frames[:2], next_frames[:2])
+
+    assert torch.equal(tower_prefill.input_frames[:4], frames)
+    assert torch.equal(tower_prefill.next_frames[:4], next_frames)
+    assert (
+        tower_prefill.input_frames.data_ptr(),
+        tower_prefill.next_frames.data_ptr(),
+    ) == addresses
+
+
+def test_tower_prefill_refuses_rows_past_its_buffers() -> None:
+    tower_prefill = tower_prefill_of(3)
+    frames = torch.zeros((4, FRAME_WIDTH), dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match="4 rows exceed the 3 tower prefill rows"):
+        tower_prefill.stage(frames, frames)
+    with pytest.raises(RuntimeError, match="4 rows exceed the 3 tower prefill rows"):
+        tower_prefill.run(torch.zeros((4, 8)), torch.arange(4), Mock(spec=ForwardBatch))
+    tower_prefill.audio_decoder.prefill.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "context_length", "row_count"),
+    [
+        (
+            {"max_prefill_tokens": 16, "cuda_graph_backend_prefill": "disabled"},
+            100,
+            100,
+        ),
+        (
+            {"max_prefill_tokens": 64, "cuda_graph_backend_prefill": "disabled"},
+            CONTEXT_LENGTH,
+            64,
+        ),
+        ({"max_prefill_tokens": 64, "cuda_graph_max_bs_prefill": 256}, 128, 256),
+        ({"max_prefill_tokens": 512, "cuda_graph_max_bs_prefill": 256}, 128, 512),
+    ],
+)
+def test_setup_model_gives_the_backbone_rows_for_the_largest_extend_or_bucket(
+    tmp_path: Path,
+    overrides: dict[str, int | str],
+    context_length: int,
+    row_count: int,
+) -> None:
+    builder, server_args = engine_server_args(tmp_path, overrides, context_length)
+    builder.validate_before_infrastructure(server_args)
+    model = Mock(spec=S3DramaForCausalLM)
+    model.config = FishOmniConfig(**fish_config_dict())
+    model.audio_decoder = Mock(spec=AudioDecoder)
+    model.tower_attention = torch.nn.ModuleList()
+    model.model = SimpleNamespace(tower_prefill=None)
+    worker = Mock(spec=ModelWorker)
+    worker.model_runner = SimpleNamespace(
+        model=model, req_to_token_pool=SimpleNamespace(size=4)
+    )
+
+    builder.setup_model(
+        model_worker=worker,
+        checkpoint_dir=str(tmp_path),
+        device="cpu",
+        gpu_id=0,
+        server_args=server_args,
+    )
+
+    tower_prefill = model.model.tower_prefill
+    assert isinstance(tower_prefill, S3DramaTowerPrefill)
+    assert tower_prefill.audio_decoder is model.audio_decoder
+    assert tower_prefill.tower_attention is model.tower_attention
+    assert tower_prefill.input_frames.shape == (row_count, FRAME_WIDTH)
+    assert tower_prefill.next_frames.shape == (row_count, FRAME_WIDTH)
+    assert not tower_prefill.input_frames.any()
+    assert not tower_prefill.next_frames.any()
 
 
 # Written by a decode forward that fails, so collecting it would show.

@@ -17,7 +17,10 @@ from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.sampling import RAS_WINDOW_FRAMES
-from sglang_omni.models.fishaudio_s3_drama.sglang_model import S3DramaForCausalLM
+from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
+    S3DramaForCausalLM,
+    S3DramaTowerPrefill,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -35,6 +38,79 @@ class RecordingBuffers:
     draws: torch.Tensor
     semantic_logits: torch.Tensor
     head_logits: torch.Tensor
+
+
+@dataclass(kw_only=True)
+class TowerPrefillRuns:
+    extend_mode: int = 0
+    other_modes: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class CountingTowerPrefill(S3DramaTowerPrefill):
+    runs: TowerPrefillRuns
+
+    def run(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
+            self.runs.extend_mode += 1
+        else:
+            self.runs.other_modes += 1
+        super().run(hidden_states, positions, forward_batch)
+
+
+class AttentionBreak(Protocol):
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        output: torch.Tensor,
+        save_kv_cache: bool,
+        layer_id: int,
+        *,
+        use_mha_companion: bool,
+        key_value_num_tokens: int | None,
+    ) -> None: ...
+
+
+class CaptureBreakRecorder:
+    def __init__(self, attention_break: AttentionBreak) -> None:
+        self.attention_break = attention_break
+        self.layer_ids_by_token_count: dict[int, list[int]] = {}
+
+    def __call__(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        value: torch.Tensor | None,
+        output: torch.Tensor,
+        save_kv_cache: bool,
+        layer_id: int,
+        *,
+        use_mha_companion: bool,
+        key_value_num_tokens: int | None,
+    ) -> None:
+        if torch.cuda.is_current_stream_capturing():
+            self.layer_ids_by_token_count.setdefault(query.shape[0], []).append(
+                layer_id
+            )
+        else:
+            pass
+        self.attention_break(
+            query,
+            key,
+            value,
+            output,
+            save_kv_cache,
+            layer_id,
+            use_mha_companion=use_mha_companion,
+            key_value_num_tokens=key_value_num_tokens,
+        )
 
 
 class EndOfSpeechControlledLogits(nn.Module):
@@ -81,6 +157,7 @@ class GraphRecordingModel(S3DramaForCausalLM):
         self.logits_processor = self.end_of_speech_logits
         self.recording_buffers: RecordingBuffers | None = None
         self.draw_column = 0
+        self.tower_prefill_runs = TowerPrefillRuns()
         for head_index, head in enumerate(self.audio_decoder.codebook_heads):
             head.register_forward_hook(
                 functools.partial(self.keep_head_logits, head_index)

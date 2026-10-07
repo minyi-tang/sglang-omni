@@ -336,20 +336,21 @@ def prefill_path_problems(run: GraphEngineRun) -> list[str]:
             else None
         )
         if not record.is_extend:
-            expected = (0, 0, {})
+            expected = (0, 0, {}, 0)
         elif expected_bucket is None:
-            expected = (0, 1, {})
+            expected = (0, 1, {}, 1)
         else:
-            expected = (1, 0, {expected_bucket: 1})
+            expected = (1, 0, {expected_bucket: 1}, 0)
         actual = (
             record.prefill_replay_count,
             record.prefill_eager_count,
             record.prefill_replay_buckets,
+            record.tower_prefill_runs,
         )
         if actual != expected:
             problems.append(
-                f"{run.kind} {forward_name(record)}: prefill replays, eager prefills "
-                f"and replayed buckets {actual}, not {expected}"
+                f"{run.kind} {forward_name(record)}: prefill replays, eager prefills, "
+                f"replayed buckets and tower prefill runs {actual}, not {expected}"
             )
         elif record.is_extend and record.is_graph_replay != (
             expected_bucket is not None
@@ -361,6 +362,26 @@ def prefill_path_problems(run: GraphEngineRun) -> list[str]:
         else:
             pass
     return problems
+
+
+def capture_break_problems(run: GraphEngineRun) -> list[str]:
+    facts = run.facts
+    backbone_layer_ids = [
+        layer_id
+        for layer_id in facts.recorded_kv_layer_ids
+        if layer_id not in facts.tower_layer_ids
+    ]
+    expected = {
+        token_count: backbone_layer_ids + facts.tower_layer_ids
+        for token_count in facts.prefill_capture_token_counts or []
+    }
+    actual = facts.prefill_capture_break_layer_ids
+    return [
+        f"{run.kind} prefill graph of {token_count} tokens: attention breaks at "
+        f"layers {actual.get(token_count)}, not {expected.get(token_count)}"
+        for token_count in sorted(expected.keys() | actual.keys())
+        if actual.get(token_count) != expected.get(token_count)
+    ]
 
 
 def stray_write_problems(run: GraphEngineRun) -> list[str]:

@@ -115,6 +115,7 @@ class GraphForwardRecord:
     prefill_replay_count: int
     prefill_eager_count: int
     prefill_replay_buckets: dict[int, int]
+    tower_prefill_runs: int
     steps: list[GraphRequestStep]
     stray_kv_slots: list[int]
     stray_mamba_slots: list[int]
@@ -141,6 +142,10 @@ class GraphEngineFacts:
     max_kv_splits: int
     multiprocessor_count: int
     expert_paths: list[ExpertPath]
+    tower_prefill_runs_before_serving: int
+    tower_prefill_runs_outside_extend: int
+    tower_prefill_rows: int
+    prefill_capture_break_layer_ids: dict[int, list[int]]
 
 
 @dataclass(kw_only=True)
@@ -273,12 +278,41 @@ GREEDY_LONG_WAVE = GraphScenario(
         ]
     ],
 )
+GREEDY_SAME_BUCKET = GraphScenario(
+    name="greedy_same_bucket",
+    sampling_mode="greedy",
+    waves=[
+        [
+            GraphRequestSpec(prompt_name=prompt_name, max_new_tokens=8)
+            for prompt_name in prompt_names
+        ]
+        for prompt_names in (
+            ["p60", "p40", "p23"],
+            ["p31", "p9", "p40", "p13"],
+            ["p5", "p60"],
+        )
+    ],
+)
 MAIN_SCENARIOS = [
     RANDOM_WAVES,
     GREEDY_SINGLE,
     GREEDY_STAGGERED,
     GREEDY_ABORT_REUSE,
     GREEDY_LONG_WAVE,
+    GREEDY_SAME_BUCKET,
 ]
+GREEDY_SMALL_BUDGET = GraphScenario(
+    name="greedy_small_budget",
+    sampling_mode="greedy",
+    waves=[
+        [GraphRequestSpec(prompt_name="c100", max_new_tokens=8)],
+        [GraphRequestSpec(prompt_name="p60", max_new_tokens=8)],
+        [
+            GraphRequestSpec(prompt_name=prompt_name, max_new_tokens=8)
+            for prompt_name in ["p13", "p9"]
+        ],
+    ],
+)
 FP8_SCENARIOS = [GREEDY_SINGLE, GREEDY_STAGGERED]
+SMALL_BUDGET_SCENARIOS = [GREEDY_SMALL_BUDGET]
 RETRACT_SCENARIOS = [GREEDY_RETRACT]

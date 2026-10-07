@@ -38,6 +38,7 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaDecodeBuffers,
     S3DramaForCausalLM,
+    S3DramaTowerPrefill,
 )
 from sglang_omni.scheduling.engine_factory import (
     GenerationDefaults,
@@ -188,14 +189,31 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         gpu_id: int,
         server_args: ServerArgs,
     ) -> None:
-        """Allocate the decode buffers before graph capture; the checkpoint, GPU
-        and server arguments are the interface contract."""
+        """Allocate the decode buffers before graph capture; the checkpoint and
+        GPU arguments are the interface contract."""
         sglang_runner = model_worker.model_runner
         model = sglang_runner.model
         assert isinstance(model, S3DramaForCausalLM)
         # No decode batch or captured graph size exceeds the request slots.
         model.decode_buffers = S3DramaDecodeBuffers.allocate(
             row_count=sglang_runner.req_to_token_pool.size,
+            frame_width=1 + model.config.audio_decoder_config.num_codebooks,
+            device=torch.device(device),
+        )
+        prefill_graph_config = resolved_view(server_args).cuda_graph_config.prefill
+        largest_prefill_graph_token_count = (
+            0
+            if prefill_graph_config.backend == CudaGraphBackend.DISABLED
+            else max(prefill_graph_config.bs or [0])
+        )
+        model.model.tower_prefill = S3DramaTowerPrefill.allocate(
+            audio_decoder=model.audio_decoder,
+            tower_attention=model.tower_attention,
+            row_count=max(
+                server_args.max_prefill_tokens,
+                self.context_length,
+                largest_prefill_graph_token_count,
+            ),
             frame_width=1 + model.config.audio_decoder_config.num_codebooks,
             device=torch.device(device),
         )

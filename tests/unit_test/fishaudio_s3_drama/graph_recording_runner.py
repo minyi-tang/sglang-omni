@@ -69,6 +69,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.kv_snapshot: list[torch.Tensor] = []
         self.state_snapshot: list[torch.Tensor] = []
         self.usage_snapshot = PrefillCudaGraphUsage()
+        self.tower_prefill_runs_snapshot = 0
 
     def kv_buffers(self) -> list[torch.Tensor]:
         """Every full-attention layer's key and value buffer, slot-major."""
@@ -112,6 +113,10 @@ class GraphRecordingRunner(S3DramaModelRunner):
         usage = self.model_worker.prefill_cuda_graph_usage
         self.usage_snapshot = replace(
             usage, replay_buckets=Counter(usage.replay_buckets)
+        )
+        tower_prefill_runs = self.model.tower_prefill_runs
+        self.tower_prefill_runs_snapshot = (
+            tower_prefill_runs.extend_mode + tower_prefill_runs.other_modes
         )
 
     def before_prefill(
@@ -306,6 +311,9 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 prefill_replay_buckets=dict(
                     usage.replay_buckets - self.usage_snapshot.replay_buckets
                 ),
+                tower_prefill_runs=self.model.tower_prefill_runs.extend_mode
+                + self.model.tower_prefill_runs.other_modes
+                - self.tower_prefill_runs_snapshot,
                 steps=steps,
                 stray_kv_slots=stray_kv_slots,
                 stray_mamba_slots=stray_mamba_slots,

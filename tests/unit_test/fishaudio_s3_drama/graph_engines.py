@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 
 import torch
+from sglang.srt.layers import radix_attention
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
@@ -56,6 +57,8 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     GraphScenarioOutcome,
 )
 from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
+    CaptureBreakRecorder,
+    CountingTowerPrefill,
     DrawRecorder,
     GraphRecordingModel,
 )
@@ -80,6 +83,9 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             max_running_requests=spec.max_running_requests,
         )
         self.spec = spec
+        self.capture_break_recorder = CaptureBreakRecorder(
+            radix_attention.breakable_unified_attention_with_output
+        )
 
     def pre_infra_setup(self, checkpoint_dir: str) -> None:
         super().pre_infra_setup(checkpoint_dir)
@@ -119,6 +125,18 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             model_worker.model_runner.req_to_token_pool.size, torch.device(device)
         )
         sampling.sample_top_k_top_p = DrawRecorder(model, sampling.sample_top_k_top_p)
+        radix_attention.breakable_unified_attention_with_output = (
+            self.capture_break_recorder
+        )
+        tower_prefill = model.model.tower_prefill
+        assert tower_prefill is not None
+        model.model.tower_prefill = CountingTowerPrefill(
+            audio_decoder=tower_prefill.audio_decoder,
+            tower_attention=tower_prefill.tower_attention,
+            input_frames=tower_prefill.input_frames,
+            next_frames=tower_prefill.next_frames,
+            runs=model.tower_prefill_runs,
+        )
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor
@@ -324,7 +342,9 @@ class GraphSchedulerDriver:
 
 
 def engine_facts(
-    scheduler: OmniScheduler[S3DramaRequestData], model: GraphRecordingModel
+    scheduler: OmniScheduler[S3DramaRequestData],
+    model: GraphRecordingModel,
+    capture_break_recorder: CaptureBreakRecorder,
 ) -> GraphEngineFacts:
     sglang_runner = scheduler.tp_worker.model_runner
     attention_backend = sglang_runner.attn_backend
@@ -333,6 +353,8 @@ def engine_facts(
     assert isinstance(full_attention_backend, TritonAttnBackend)
     decode_buffers = model.decode_buffers
     assert decode_buffers is not None
+    tower_prefill = model.model.tower_prefill
+    assert tower_prefill is not None
     graph_runner = sglang_runner.decode_cuda_graph_runner
     prefill_graph_runner = sglang_runner.prefill_cuda_graph_runner
     kv_pool = sglang_runner.token_to_kv_pool
@@ -376,6 +398,12 @@ def engine_facts(
         max_kv_splits=full_attention_backend.max_kv_splits,
         multiprocessor_count=full_attention_backend.device_core_count,
         expert_paths=expert_paths,
+        tower_prefill_runs_before_serving=model.tower_prefill_runs.extend_mode,
+        tower_prefill_runs_outside_extend=model.tower_prefill_runs.other_modes,
+        tower_prefill_rows=tower_prefill.input_frames.shape[0],
+        prefill_capture_break_layer_ids=(
+            capture_break_recorder.layer_ids_by_token_count
+        ),
     )
 
 
@@ -417,7 +445,7 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
     # Graph capture drew random numbers after the worker seeded them; both
     # engines start serving from the same generator state.
     torch.manual_seed(spec.random_seed)
-    facts = engine_facts(scheduler, model)
+    facts = engine_facts(scheduler, model, builder.capture_break_recorder)
     logger.info(f"S3-drama graph test engine ({spec.kind}): {facts}")
     driver = GraphSchedulerDriver(scheduler, runner, spec.prompts)
     baseline = driver.free_pool_counts()
