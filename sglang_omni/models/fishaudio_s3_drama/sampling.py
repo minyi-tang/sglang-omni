@@ -5,6 +5,14 @@ from __future__ import annotations
 
 import torch
 
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    FIRST_DRAW_STREAM,
+    RAS_DRAW_STREAM,
+    CodebookSampler,
+    sample_codebook_head,
+    sample_semantic_candidates,
+)
+
 # note (SunskyXH): repetition-aware sampling is fixed by the training recipe:
 # when the first draw repeats a main token from the last 16 frames, the frame
 # takes a second draw made with these parameters instead.
@@ -22,6 +30,8 @@ def sample_top_k_top_p(
     temperature: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
+    sampler: CodebookSampler | None,
+    stream_id: int,
 ) -> torch.Tensor:
     """One token id per row of [rows, vocab] logits, computed in fp32.
 
@@ -29,6 +39,12 @@ def sample_top_k_top_p(
     the cumulative probability up to and including it exceeds top_p; the most
     likely token always stays. top_k must be >= 1.
     """
+    if sampler is not None:
+        return sample_codebook_head(
+            logits, temperature, top_k, top_p, sampler, stream_id, MINIMUM_TEMPERATURE
+        )
+    else:
+        pass
     scaled_logits = logits.float() / temperature.float().clamp(
         min=MINIMUM_TEMPERATURE
     ).unsqueeze(-1)
@@ -60,6 +76,7 @@ def sample_semantic_with_ras(
     top_p: torch.Tensor,
     semantic_begin_id: int,
     codebook_size: int,
+    sampler: CodebookSampler | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Sample each frame's main token and its codebook-0 code.
 
@@ -71,11 +88,29 @@ def sample_semantic_with_ras(
             f"previous_main_tokens must hold the last {RAS_WINDOW_FRAMES} frames; "
             f"got shape {tuple(previous_main_tokens.shape)}"
         )
+    elif sampler is not None:
+        return sample_semantic_candidates(
+            semantic_logits,
+            candidate_token_ids,
+            previous_main_tokens,
+            temperature,
+            top_k,
+            top_p,
+            semantic_begin_id,
+            codebook_size,
+            sampler,
+            minimum_temperature=MINIMUM_TEMPERATURE,
+            ras_temperature=RAS_TEMPERATURE,
+            ras_top_k=RAS_TOP_K,
+            ras_top_p=RAS_TOP_P,
+        )
     else:
         pass
     candidate_logits = semantic_logits.index_select(-1, candidate_token_ids).float()
     first_draw = candidate_token_ids[
-        sample_top_k_top_p(candidate_logits, temperature, top_k, top_p)
+        sample_top_k_top_p(
+            candidate_logits, temperature, top_k, top_p, None, FIRST_DRAW_STREAM
+        )
     ]
     row_count = candidate_logits.shape[0]
     device = candidate_logits.device
@@ -87,6 +122,8 @@ def sample_semantic_with_ras(
             ),
             torch.full((row_count,), RAS_TOP_K, dtype=torch.int64, device=device),
             torch.full((row_count,), RAS_TOP_P, dtype=torch.float32, device=device),
+            None,
+            RAS_DRAW_STREAM,
         )
     ]
     is_repeat = (previous_main_tokens == first_draw.unsqueeze(-1)).any(dim=-1)

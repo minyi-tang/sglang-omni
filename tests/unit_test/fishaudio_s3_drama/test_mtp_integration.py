@@ -63,6 +63,7 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
     EMPTY_RAS_SLOT,
     RAS_WINDOW_FRAMES,
 )
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import PHILOX_SEED_MODULUS
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaDecodeBuffers,
     S3DramaForCausalLM,
@@ -913,7 +914,12 @@ def set_up_mocked_model(
 ) -> Mock:
     model = Mock(spec=S3DramaForCausalLM)
     model.config = FishOmniConfig(**fish_config_dict())
+    codebook_size = model.config.audio_decoder_config.vocab_size
     model.audio_decoder = Mock(spec=AudioDecoder)
+    model.audio_decoder.codebook_size = codebook_size
+    model.audio_decoder.main_token_candidate_ids = torch.arange(codebook_size + 1)
+    model.audio_decoder.sampling_step = torch.zeros((), dtype=torch.int64)
+    model.audio_decoder.sampler = None
     model.tower_attention = torch.nn.ModuleList()
     model.model = SimpleNamespace(tower_prefill=None)
     worker = Mock(spec=ModelWorker)
@@ -979,6 +985,54 @@ def test_setup_model_reports_first_frame_graphs_off_without_cuda_graphs(
     assert "S3-drama first-frame CUDA graphs: off, CUDA graphs are disabled" in (
         caplog.text
     )
+
+
+@pytest.mark.parametrize(
+    ("triton_sampling", "unsupported_reason", "expected_log"),
+    [
+        (
+            False,
+            None,
+            "S3-drama codebook sampling: PyTorch, "
+            "tts_engine.factory.triton_sampling is false",
+        ),
+        (
+            True,
+            "Triton is not installed",
+            "S3-drama codebook sampling: PyTorch, Triton is not installed",
+        ),
+        (True, None, "S3-drama codebook sampling: Triton kernels"),
+    ],
+)
+def test_setup_model_picks_the_codebook_sampler_and_logs_why(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    triton_sampling: bool,
+    unsupported_reason: str | None,
+    expected_log: str,
+) -> None:
+    builder, server_args = engine_server_args(tmp_path, {})
+    builder.triton_sampling = triton_sampling
+    generator_seed = 2**64 - 5
+    monkeypatch.setattr(
+        engine_builder,
+        "triton_sampling_unsupported_reason",
+        Mock(return_value=unsupported_reason),
+    )
+    monkeypatch.setattr(torch.cuda, "initial_seed", Mock(return_value=generator_seed))
+
+    with caplog.at_level(logging.INFO, logger=engine_builder.logger.name):
+        model = set_up_mocked_model(builder, server_args, tmp_path)
+
+    assert expected_log in caplog.text
+    audio_decoder = model.audio_decoder
+    if triton_sampling and unsupported_reason is None:
+        assert audio_decoder.sampler is not None
+        assert audio_decoder.sampler.step is audio_decoder.sampling_step
+        assert audio_decoder.sampler.seed == generator_seed % PHILOX_SEED_MODULUS
+    else:
+        assert audio_decoder.sampler is None
 
 
 def first_frame_graph_setup(

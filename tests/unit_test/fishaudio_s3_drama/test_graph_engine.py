@@ -30,6 +30,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     prompt_row_counts,
     replay_problems,
     resampled_choice_count,
+    sampling_step_problems,
     schedule_problems,
     stray_write_problems,
     stream_problems,
@@ -97,6 +98,8 @@ class GraphEngineRuns:
     first_frame_off: EnginePair
     first_frame_low_cap: EnginePair
     first_frame_on_against_off: EnginePair
+    triton_main: EnginePair
+    triton_prefill_main: EnginePair
     workdir: Path
 
 
@@ -153,10 +156,16 @@ def engine_pairs(
     scenarios: list[GraphScenario],
     workdir: Path,
     extra_environment: dict[str, str],
+    triton_sampling: bool,
 ) -> tuple[EnginePair, EnginePair]:
     runs: dict[EngineKind, GraphEngineRun] = {}
     for kind in ("eager", "graph", "prefill_graph"):
-        spec = GraphEngineSpec(model_dir=str(model_dir), kind=kind, scenarios=scenarios)
+        spec = GraphEngineSpec(
+            model_dir=str(model_dir),
+            kind=kind,
+            triton_sampling=triton_sampling,
+            scenarios=scenarios,
+        )
         runs[kind] = run_engine(f"{name}-{kind}", spec, workdir, extra_environment)
     return (
         EnginePair(eager=runs["eager"], graph=runs["graph"], scenarios=scenarios),
@@ -177,13 +186,21 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
     write_expert_variant(checkpoint_dir, fp8_checkpoint_dir, "fp8")
     # Serial on purpose: each engine owns its process and its share of the GPU.
     main, prefill_main = engine_pairs(
-        "main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}
+        "main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}, False
     )
     fp8, prefill_fp8 = engine_pairs(
-        "fp8", fp8_checkpoint_dir, FP8_SCENARIOS, workdir, {}
+        "fp8", fp8_checkpoint_dir, FP8_SCENARIOS, workdir, {}, False
     )
     retract, prefill_retract = engine_pairs(
-        "retract", checkpoint_dir, RETRACT_SCENARIOS, workdir, RETRACT_ENVIRONMENT
+        "retract",
+        checkpoint_dir,
+        RETRACT_SCENARIOS,
+        workdir,
+        RETRACT_ENVIRONMENT,
+        False,
+    )
+    triton_main, triton_prefill_main = engine_pairs(
+        "triton-main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}, True
     )
     small_budget_runs = {
         kind: run_engine(
@@ -243,6 +260,8 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         first_frame_on_against_off=EnginePair(
             eager=first_frame_off, graph=main.graph, scenarios=MAIN_SCENARIOS
         ),
+        triton_main=triton_main,
+        triton_prefill_main=triton_prefill_main,
         workdir=workdir,
     )
     print(f"Artifacts: {workdir}")
@@ -547,6 +566,58 @@ def test_first_frame_graphs_draw_and_split_like_the_eager_step(
         record.scenario_name == RANDOM_WAVES.name and record.first_frame_replays
         for record in engine_runs.main.graph.forwards
     )
+
+
+def test_triton_sampling_engines_match_bit_for_bit_and_step_once_per_forward(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in {
+        "triton main": engine_runs.triton_main,
+        "triton prefill main": engine_runs.triton_prefill_main,
+    }.items():
+        problems = (
+            schedule_problems(pair)
+            + bit_problems(pair)
+            + first_frame_split_problems(pair)
+            + replay_problems(pair)
+            + first_frame_path_problems(pair.graph)
+        )
+        for run in (pair.eager, pair.graph):
+            problems += (
+                history_problems(run, pair.scenarios)
+                + finite_problems(run)
+                + outcome_problems(run)
+                + sampling_step_problems(run, True)
+            )
+        assert not problems, f"{name}:\n{first_problems(problems)}"
+    eager_forwards = engine_runs.triton_main.eager.forwards
+    graph_forwards = engine_runs.triton_main.graph.forwards
+    assert any(record.first_frame_replays for record in graph_forwards)
+    assert any(
+        record.is_graph_replay and not record.is_extend for record in graph_forwards
+    )
+    assert any(record.first_frame_eager_count for record in eager_forwards)
+    assert any(not record.is_extend for record in eager_forwards)
+
+
+def test_pytorch_sampling_engines_never_step(engine_runs: GraphEngineRuns) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        for run in (pair.eager, pair.graph):
+            problems = sampling_step_problems(run, False)
+            assert not problems, f"{name} {run.kind}:\n{first_problems(problems)}"
+
+
+def test_sampling_step_check_catches_a_changed_or_mislabeled_run(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    triton_run = engine_runs.triton_main.graph
+    record = triton_run.forwards[len(triton_run.forwards) // 2]
+    changed_run = with_record(
+        triton_run, replace(record, sampling_step=record.sampling_step + 1)
+    )
+    assert len(sampling_step_problems(changed_run, True)) == 1
+    assert sampling_step_problems(engine_runs.main.graph, True)
+    assert sampling_step_problems(triton_run, False)
 
 
 def test_decode_attention_keeps_the_standard_kernel(

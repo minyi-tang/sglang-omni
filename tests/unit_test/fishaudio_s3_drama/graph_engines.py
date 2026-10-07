@@ -89,6 +89,7 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             max_running_requests=spec.max_running_requests,
             first_frame_cuda_graphs=spec.first_frame_cuda_graphs,
             first_frame_cuda_graph_max_requests=spec.first_frame_cuda_graph_max_requests,
+            triton_sampling=spec.triton_sampling,
         )
         self.spec = spec
         self.capture_break_recorder = CaptureBreakRecorder(
@@ -451,6 +452,7 @@ def engine_facts(
         ),
         lean_attention_override=full_attention_backend.enable_lean_attention,
         startup_lean_choices=list(builder.lean_choice_recorder.choices),
+        uses_triton_sampling=model.audio_decoder.sampler is not None,
     )
 
 
@@ -493,6 +495,7 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
     # Graph capture drew random numbers after the worker seeded them; both
     # engines start serving from the same generator state.
     torch.manual_seed(spec.random_seed)
+    model.audio_decoder.sampling_step.zero_()
     facts = engine_facts(scheduler, model, builder)
     logger.info(f"S3-drama graph test engine ({spec.kind}): {facts}")
     driver = GraphSchedulerDriver(scheduler, runner, spec.prompts)

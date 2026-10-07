@@ -77,6 +77,7 @@ class GraphEngineSpec(BaseModel):
     first_frame_cuda_graph_max_requests: int = (
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     )
+    triton_sampling: bool = False
     prompts: dict[str, list[list[int]]] = PROMPTS
     scenarios: list[GraphScenario]
 
@@ -136,6 +137,7 @@ class GraphForwardRecord:
     first_frame_sampler_calls: int
     first_frame_kv_splits: list[int]
     generator_offset: int
+    sampling_step: int
     lean_choices: list[LeanChoice]
     steps: list[GraphRequestStep]
     stray_kv_slots: list[int]
@@ -171,6 +173,7 @@ class GraphEngineFacts:
     first_frame_capture_written_kv_slots: list[int]
     lean_attention_override: bool | None
     startup_lean_choices: list[LeanChoice]
+    uses_triton_sampling: bool
 
 
 @dataclass(kw_only=True)

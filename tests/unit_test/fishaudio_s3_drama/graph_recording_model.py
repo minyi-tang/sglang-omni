@@ -17,6 +17,7 @@ from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.sampling import RAS_WINDOW_FRAMES
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import CodebookSampler
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaForCausalLM,
     S3DramaTowerPrefill,
@@ -268,6 +269,8 @@ class TopKTopPSampler(Protocol):
         temperature: torch.Tensor,
         top_k: torch.Tensor,
         top_p: torch.Tensor,
+        sampler: CodebookSampler | None,
+        stream_id: int,
     ) -> torch.Tensor: ...
 
 
@@ -285,8 +288,12 @@ class DrawRecorder:
         temperature: torch.Tensor,
         top_k: torch.Tensor,
         top_p: torch.Tensor,
+        sampler: CodebookSampler | None,
+        stream_id: int,
     ) -> torch.Tensor:
-        candidate_columns = self.sample(logits, temperature, top_k, top_p)
+        candidate_columns = self.sample(
+            logits, temperature, top_k, top_p, sampler, stream_id
+        )
         recording_buffers = self.model.recording_buffers
         column = self.model.draw_column
         assert recording_buffers is not None and column < 2

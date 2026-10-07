@@ -26,6 +26,7 @@ DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP = (10, 12, 32)
 DEFAULT_STREAM_FOLLOWUP_STRIDE = 64
 DEFAULT_FIRST_FRAME_CUDA_GRAPHS = True
 DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS = 16
+DEFAULT_TRITON_SAMPLING = True
 # The codec of the public S2-Pro release, pinned to an immutable commit.
 DEFAULT_CODEC_PATH = "fishaudio/s2-pro@1de9996b6be38b745688de084d87a5633f714e4e"
 PREPROCESSING_TOTAL_RESERVE_BYTES = "6GiB"
@@ -62,6 +63,7 @@ class S3DramaEngineFactoryArgs(FactoryArgs):
     first_frame_cuda_graph_max_requests: int = Field(
         default=DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS, ge=1
     )
+    triton_sampling: bool = DEFAULT_TRITON_SAMPLING
 
 
 class S3DramaEngineStageConfig(EngineStageConfig):

@@ -4,6 +4,10 @@
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 
 import pytest
 import torch
@@ -14,6 +18,11 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
     RAS_TOP_P,
     sample_semantic_with_ras,
     sample_top_k_top_p,
+)
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    FIRST_CODEBOOK_HEAD_STREAM,
+    FIRST_DRAW_STREAM,
+    RAS_DRAW_STREAM,
 )
 
 DRAW_COUNT = 2000
@@ -59,7 +68,9 @@ def test_top_k_one_takes_the_argmax() -> None:
     torch.manual_seed(0)
     logits = torch.randn(64, 32)
 
-    sampled = sample_top_k_top_p(logits, *request_parameters(64, 1.0, 1, 1.0))
+    sampled = sample_top_k_top_p(
+        logits, *request_parameters(64, 1.0, 1, 1.0), None, FIRST_CODEBOOK_HEAD_STREAM
+    )
 
     assert torch.equal(sampled, logits.argmax(dim=-1))
 
@@ -72,7 +83,12 @@ def test_top_p_drops_the_token_that_crosses_p(
     torch.manual_seed(0)
     logits = repeated([math.log(0.5), math.log(0.3), math.log(0.2)], DRAW_COUNT)
 
-    sampled = sample_top_k_top_p(logits, *request_parameters(DRAW_COUNT, 1.0, 3, top_p))
+    sampled = sample_top_k_top_p(
+        logits,
+        *request_parameters(DRAW_COUNT, 1.0, 3, top_p),
+        None,
+        FIRST_CODEBOOK_HEAD_STREAM,
+    )
 
     assert set(sampled.tolist()) == kept_tokens
 
@@ -81,7 +97,12 @@ def test_top_k_and_temperature_limit_the_candidates() -> None:
     torch.manual_seed(0)
     logits = repeated([2.0, 1.9, 1.8, 1.7, 1.6], DRAW_COUNT)
 
-    sampled = sample_top_k_top_p(logits, *request_parameters(DRAW_COUNT, 5.0, 2, 1.0))
+    sampled = sample_top_k_top_p(
+        logits,
+        *request_parameters(DRAW_COUNT, 5.0, 2, 1.0),
+        None,
+        FIRST_CODEBOOK_HEAD_STREAM,
+    )
 
     assert set(sampled.tolist()) == {0, 1}
 
@@ -92,7 +113,9 @@ def test_sampling_keeps_inputs_and_returns_int64_ids() -> None:
     temperature, top_k, top_p = request_parameters(4, 0.7, 5, 0.9)
     originals = [tensor.clone() for tensor in (logits, temperature, top_k, top_p)]
 
-    sampled = sample_top_k_top_p(logits, temperature, top_k, top_p)
+    sampled = sample_top_k_top_p(
+        logits, temperature, top_k, top_p, None, FIRST_CODEBOOK_HEAD_STREAM
+    )
 
     assert sampled.dtype == torch.int64
     assert sampled.device == logits.device
@@ -121,12 +144,16 @@ def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
     candidate_logits = logits[:, candidates]
     torch.manual_seed(3)
     first_draw = candidates[
-        sample_top_k_top_p(candidate_logits, temperature, top_k, top_p)
+        sample_top_k_top_p(
+            candidate_logits, temperature, top_k, top_p, None, FIRST_DRAW_STREAM
+        )
     ]
     second_draw = candidates[
         sample_top_k_top_p(
             candidate_logits,
             *request_parameters(rows, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P),
+            None,
+            RAS_DRAW_STREAM,
         )
     ]
     window = torch.full((rows, 16), EMPTY_WINDOW_TOKEN)
@@ -143,6 +170,7 @@ def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
         top_p,
         SEMANTIC_BEGIN_ID,
         CODEBOOK_SIZE,
+        None,
     )
 
     assert torch.equal(first_draw, torch.full((rows,), SEMANTIC_BEGIN_ID + 5))
@@ -167,6 +195,7 @@ def test_ras_draws_the_same_random_numbers_with_or_without_a_hit() -> None:
             *parameters,
             SEMANTIC_BEGIN_ID,
             CODEBOOK_SIZE,
+            None,
         )
         next_numbers.append(torch.rand(3))
 
@@ -187,6 +216,7 @@ def test_semantic_sampling_allows_only_the_band_and_eos() -> None:
         *request_parameters(rows, 1.0, TEXT_VOCAB_SIZE, 1.0),
         SEMANTIC_BEGIN_ID,
         CODEBOOK_SIZE,
+        None,
     )
     logits[:, EOS_TOKEN_ID] = 9.0
     eos_tokens, eos_codebook_zero = sample_semantic_with_ras(
@@ -196,6 +226,7 @@ def test_semantic_sampling_allows_only_the_band_and_eos() -> None:
         *request_parameters(rows, 1.0, 1, 1.0),
         SEMANTIC_BEGIN_ID,
         CODEBOOK_SIZE,
+        None,
     )
 
     allowed = set(range(SEMANTIC_BEGIN_ID, SEMANTIC_BEGIN_ID + CODEBOOK_SIZE)) | {
@@ -218,6 +249,7 @@ def test_ras_window_must_hold_sixteen_frames() -> None:
             *request_parameters(1, 1.0, 1, 1.0),
             SEMANTIC_BEGIN_ID,
             CODEBOOK_SIZE,
+            None,
         )
 
 
@@ -234,10 +266,14 @@ def test_top_k_one_takes_the_token_the_biased_full_row_takes() -> None:
         *parameters,
         SEMANTIC_BEGIN_ID,
         CODEBOOK_SIZE,
+        None,
     )
 
     assert torch.equal(
-        main_tokens, sample_top_k_top_p(logits + semantic_bias(), *parameters)
+        main_tokens,
+        sample_top_k_top_p(
+            logits + semantic_bias(), *parameters, None, FIRST_DRAW_STREAM
+        ),
     )
 
 
@@ -278,10 +314,12 @@ def test_tied_top_tokens_resolve_as_in_the_biased_full_row_on_the_device() -> No
         *parameters,
         semantic_begin_id,
         codebook_size,
+        None,
     )
 
     assert torch.equal(
-        main_tokens, sample_top_k_top_p(logits.float() + bias, *parameters)
+        main_tokens,
+        sample_top_k_top_p(logits.float() + bias, *parameters, None, FIRST_DRAW_STREAM),
     )
     assert set(main_tokens.tolist()) == {eos_token_id}
 
@@ -335,6 +373,7 @@ def test_semantic_draws_follow_the_top_k_top_p_rule(
         *request_parameters(draw_count, temperature, top_k, top_p),
         SEMANTIC_BEGIN_ID,
         CODEBOOK_SIZE,
+        None,
     )
 
     columns = torch.searchsorted(candidates, main_tokens)
@@ -344,3 +383,70 @@ def test_semantic_draws_follow_the_top_k_top_p_rule(
     standard_errors = (expected * (1 - expected) / draw_count).sqrt()
     assert bool(((frequencies - expected).abs() <= 5 * standard_errors + 1e-9).all())
     assert bool((frequencies[expected == 0] == 0).all())
+
+
+def test_sampling_imports_and_samples_on_pytorch_without_triton() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                """
+                import builtins
+
+                original_import = builtins.__import__
+
+                def without_triton(name, *args, **kwargs):
+                    if name == "triton" or name.startswith("triton."):
+                        raise ModuleNotFoundError(name, name=name)
+                    return original_import(name, *args, **kwargs)
+
+                builtins.__import__ = without_triton
+
+                import torch
+
+                from sglang_omni.models.fishaudio_s3_drama import sampling
+                from sglang_omni.models.fishaudio_s3_drama import sampling_kernels
+
+                assert not sampling_kernels.HAS_TRITON
+                assert (
+                    sampling_kernels.triton_sampling_unsupported_reason(
+                        torch.device("cpu"), 64, 65
+                    )
+                    == "Triton is not installed"
+                )
+                rows = 4
+                parameters = (
+                    torch.ones(rows),
+                    torch.full((rows,), 30),
+                    torch.full((rows,), 0.9),
+                )
+                head_codes = sampling.sample_top_k_top_p(
+                    torch.randn(rows, 64),
+                    *parameters,
+                    None,
+                    sampling_kernels.FIRST_CODEBOOK_HEAD_STREAM,
+                )
+                assert head_codes.dtype == torch.int64
+                assert bool(((head_codes >= 0) & (head_codes < 64)).all())
+                candidates = torch.cat((torch.tensor([2]), torch.arange(8, 72)))
+                main_tokens, codebook_zero = sampling.sample_semantic_with_ras(
+                    torch.randn(rows, 80),
+                    candidates,
+                    torch.full((rows, sampling.RAS_WINDOW_FRAMES), -1),
+                    *parameters,
+                    8,
+                    64,
+                    None,
+                )
+                assert bool(torch.isin(main_tokens, candidates).all())
+                assert torch.equal(codebook_zero, (main_tokens - 8).clamp(0, 63))
+                """
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[3],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

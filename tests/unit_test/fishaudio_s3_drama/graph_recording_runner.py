@@ -375,6 +375,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 generator_offset=torch.cuda.default_generators[
                     forward_batch.out_cache_loc.device.index
                 ].get_offset(),
+                sampling_step=int(self.model.audio_decoder.sampling_step),
                 lean_choices=lean_choice_recorder.choices[
                     self.lean_choice_count_snapshot :
                 ],

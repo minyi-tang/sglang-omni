@@ -27,6 +27,7 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     DEFAULT_STREAM_STRIDE,
+    DEFAULT_TRITON_SAMPLING,
     S3DramaPipelineConfig,
 )
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
@@ -101,6 +102,7 @@ def create_eos_masked_tts_engine_executor(
     first_frame_cuda_graph_max_requests: int = (
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     ),
+    triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
 ) -> OmniScheduler[S3DramaRequestData]:
     return EosMaskedEngineBuilder(
         context_length=context_length,
@@ -112,6 +114,7 @@ def create_eos_masked_tts_engine_executor(
         max_new_tokens_cap=max_new_tokens,
         first_frame_cuda_graphs=first_frame_cuda_graphs,
         first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
+        triton_sampling=triton_sampling,
     ).build(
         model_path,
         device=device,

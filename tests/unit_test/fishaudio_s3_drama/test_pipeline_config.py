@@ -108,6 +108,7 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "max_prompt_rows": 8192,
         "first_frame_cuda_graphs": True,
         "first_frame_cuda_graph_max_requests": 16,
+        "triton_sampling": True,
         "stream_stride": 10,
         "stream_followup_stride_ramp": (10, 12, 32),
         "stream_followup_stride": 64,

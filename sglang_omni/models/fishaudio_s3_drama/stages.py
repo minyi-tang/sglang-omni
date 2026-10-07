@@ -30,6 +30,7 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     DEFAULT_STREAM_STRIDE,
+    DEFAULT_TRITON_SAMPLING,
 )
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import S3DramaEngineBuilder
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
@@ -150,6 +151,7 @@ def create_tts_engine_executor(
     first_frame_cuda_graph_max_requests: int = (
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     ),
+    triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
 ) -> OmniScheduler[S3DramaRequestData]:
     """The engine; max_new_tokens caps a request that sets none."""
     overrides = dict(server_args_overrides or {})
@@ -177,6 +179,7 @@ def create_tts_engine_executor(
         max_new_tokens_cap=max_new_tokens,
         first_frame_cuda_graphs=first_frame_cuda_graphs,
         first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
+        triton_sampling=triton_sampling,
     ).build(
         model_path,
         device=device,

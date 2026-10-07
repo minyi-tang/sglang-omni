@@ -25,6 +25,10 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
     sample_semantic_with_ras,
     sample_top_k_top_p,
 )
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    FIRST_CODEBOOK_HEAD_STREAM,
+    CodebookSampler,
+)
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.interface import JointRopeInplaceKernel
 
@@ -260,6 +264,10 @@ class AudioDecoder(nn.Module):
             ),
             persistent=False,
         )
+        self.register_buffer(
+            "sampling_step", torch.zeros((), dtype=torch.int64), persistent=False
+        )
+        self.sampler: CodebookSampler | None = None
 
     def is_semantic(self, token_ids: torch.Tensor) -> torch.Tensor:
         return (token_ids >= self.semantic_begin_id) & (
@@ -381,6 +389,11 @@ class AudioDecoder(nn.Module):
         Returns int64 frames [rows, 1 + num_codebooks]. A frame whose main token
         is not semantic (end of speech) still runs every layer.
         """
+        sampler = self.sampler
+        if sampler is not None:
+            sampler.step.add_(1)
+        else:
+            pass
         main_tokens, codebook_zero = sample_semantic_with_ras(
             semantic_logits,
             self.main_token_candidate_ids,
@@ -390,6 +403,7 @@ class AudioDecoder(nn.Module):
             top_p,
             self.semantic_begin_id,
             self.codebook_size,
+            sampler,
         )
         label_is_semantic = self.is_semantic(main_tokens)
         hidden_states = self.run_shared_layers(
@@ -414,6 +428,13 @@ class AudioDecoder(nn.Module):
                 len(self.shared_layers) + residual_index,
             )
             codes.append(
-                sample_top_k_top_p(head(hidden_states), temperature, top_k, top_p)
+                sample_top_k_top_p(
+                    head(hidden_states),
+                    temperature,
+                    top_k,
+                    top_p,
+                    sampler,
+                    FIRST_CODEBOOK_HEAD_STREAM + residual_index,
+                )
             )
         return torch.stack([main_tokens, *codes], dim=-1)

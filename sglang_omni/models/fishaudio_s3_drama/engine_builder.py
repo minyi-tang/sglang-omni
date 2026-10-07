@@ -30,6 +30,7 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     DEFAULT_STREAM_STRIDE,
+    DEFAULT_TRITON_SAMPLING,
 )
 from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
     S3DramaFirstFrameGraphs,
@@ -45,6 +46,11 @@ from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaRequestBuilder,
     S3DramaRequestData,
     S3DramaResultAdapter,
+)
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    PHILOX_SEED_MODULUS,
+    CodebookSampler,
+    triton_sampling_unsupported_reason,
 )
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaDecodeBuffers,
@@ -93,6 +99,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         first_frame_cuda_graph_max_requests: int = (
             DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
         ),
+        triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
     ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
@@ -103,6 +110,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         self.max_new_tokens_cap = max_new_tokens_cap
         self.first_frame_cuda_graphs = first_frame_cuda_graphs
         self.first_frame_cuda_graph_max_requests = first_frame_cuda_graph_max_requests
+        self.triton_sampling = triton_sampling
         self.frame_streamer: S3DramaFrameStreamer | None = None
         self.sglang_runner: SGLModelRunner | None = None
 
@@ -237,6 +245,25 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             frame_width=1 + model.config.audio_decoder_config.num_codebooks,
             device=torch.device(device),
         )
+        audio_decoder = model.audio_decoder
+        unsupported_reason = triton_sampling_unsupported_reason(
+            torch.device(device),
+            audio_decoder.codebook_size,
+            audio_decoder.main_token_candidate_ids.shape[0],
+        )
+        if not self.triton_sampling:
+            logger.info(
+                "S3-drama codebook sampling: PyTorch, "
+                "tts_engine.factory.triton_sampling is false"
+            )
+        elif unsupported_reason is not None:
+            logger.info(f"S3-drama codebook sampling: PyTorch, {unsupported_reason}")
+        else:
+            audio_decoder.sampler = CodebookSampler(
+                step=audio_decoder.sampling_step,
+                seed=torch.cuda.initial_seed() % PHILOX_SEED_MODULUS,
+            )
+            logger.info("S3-drama codebook sampling: Triton kernels")
         sglang_runner.extra_prefill_graph_attention_layers = list(model.tower_attention)
         sglang_runner.prefill_graph_runner_class = RequestIdPrefillCudaGraphRunner
         self.sglang_runner = sglang_runner
