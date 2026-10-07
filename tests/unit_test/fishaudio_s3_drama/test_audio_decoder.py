@@ -653,6 +653,31 @@ def test_frame_embeddings_of_an_empty_codebook_range_are_zero(
     torch.testing.assert_close(shared_input[2], torch.zeros(DIM))
 
 
+@pytest.mark.parametrize(
+    ("eos_token_id", "candidate_token_ids"),
+    [
+        (EOS_TOKEN_ID, [EOS_TOKEN_ID, *range(SEMANTIC_BEGIN_ID, SEMANTIC_END_ID + 1)]),
+        (
+            TEXT_VOCAB_SIZE - 1,
+            [*range(SEMANTIC_BEGIN_ID, SEMANTIC_END_ID + 1), TEXT_VOCAB_SIZE - 1],
+        ),
+    ],
+)
+def test_main_token_candidates_are_sorted_and_build_on_the_meta_device(
+    eos_token_id: int, candidate_token_ids: list[int]
+) -> None:
+    config_dict = fish_config_dict()
+    config_dict["eos_token_id"] = eos_token_id
+    with torch.device("meta"):
+        meta_decoder = AudioDecoder(FishOmniConfig(**config_dict))
+    decoder = AudioDecoder(FishOmniConfig(**config_dict))
+
+    assert meta_decoder.main_token_candidate_ids.is_meta
+    assert meta_decoder.main_token_candidate_ids.shape == (len(candidate_token_ids),)
+    assert decoder.main_token_candidate_ids.dtype == torch.int64
+    assert decoder.main_token_candidate_ids.tolist() == candidate_token_ids
+
+
 def test_wqkv_rows_are_regrouped_per_head() -> None:
     # Two heads of width 2, one kv head: rows 0-3 query, 4-7 gate, 8-9 key, 10-11 value.
     flat_weight = torch.arange(12.0).unsqueeze(-1)

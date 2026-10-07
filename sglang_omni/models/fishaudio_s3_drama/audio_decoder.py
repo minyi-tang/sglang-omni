@@ -250,12 +250,12 @@ class AudioDecoder(nn.Module):
         )
         self.register_buffer(
             "main_token_candidate_ids",
-            torch.unique(
-                torch.cat(
-                    (
-                        torch.tensor([config.eos_token_id]),
-                        torch.arange(self.semantic_begin_id, self.semantic_end_id + 1),
-                    )
+            torch.tensor(
+                sorted(
+                    {
+                        config.eos_token_id,
+                        *range(self.semantic_begin_id, self.semantic_end_id + 1),
+                    }
                 )
             ),
             persistent=False,
