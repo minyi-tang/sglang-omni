@@ -31,7 +31,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_execution import SGLangExecutionBridge
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
-from sglang_omni.models.fishaudio_s3_drama import engine_builder
+from sglang_omni.models.fishaudio_s3_drama import engine_builder, sglang_model
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.config import S3DramaVocoderFactoryArgs
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
@@ -1419,6 +1419,29 @@ def test_model_rejects_a_tower_that_cannot_share_the_backbone_pool() -> None:
     config.text_config.tower_layer_count = 4
     with pytest.raises(ValueError, match="tower layers"):
         S3DramaForCausalLM(config)
+
+
+@pytest.mark.parametrize(
+    "pipeline_parallel_size,tensor_parallel_size", [(2, 1), (1, 2)]
+)
+def test_model_rejects_more_than_one_tensor_or_pipeline_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    pipeline_parallel_size: int,
+    tensor_parallel_size: int,
+) -> None:
+    config_dict = fish_config_dict()
+    decoder_config = config_dict["audio_decoder_config"]
+    assert isinstance(decoder_config, dict)
+    decoder_config["head_dim"] = 8
+    monkeypatch.setattr(
+        sglang_model,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            pp_size=pipeline_parallel_size, tp_size=tensor_parallel_size
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="one tensor and pipeline rank"):
+        S3DramaForCausalLM(FishOmniConfig(**config_dict))
 
 
 def engine_server_args(
