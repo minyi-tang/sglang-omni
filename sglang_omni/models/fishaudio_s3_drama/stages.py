@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -49,8 +51,12 @@ from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleSched
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_concrete_device
 
+logger = logging.getLogger(__name__)
+
 CODEC_FILE_NAME = "codec.pth"
 REFERENCE_ENCODE_WARMUP_SECONDS = 1.0
+MEMORY_PROBE_ROW_COUNT = 2
+MEMORY_PROBE_FRAME_COUNT = 128
 # A hub codec names a full commit, so preprocessing and the vocoder load one file.
 HUB_CODEC_PATTERN = re.compile(
     r"(?P<repo_id>[^@\s]+/[^@\s]+)@(?P<revision>[0-9a-f]{40})"
@@ -193,6 +199,57 @@ def create_tts_engine_executor(
     )
 
 
+def measure_max_padded_frames_per_decode(
+    decode: WindowDecoder,
+    *,
+    device: torch.device,
+    num_codebooks: int,
+    total_gpu_memory_fraction: float | None,
+    max_new_tokens: int,
+) -> int:
+    device_module = torch.get_device_module(device)
+    device_module.empty_cache()
+    held_bytes = device_module.memory_reserved(device)
+    probe_codes = torch.zeros(
+        (MEMORY_PROBE_ROW_COUNT, num_codebooks, MEMORY_PROBE_FRAME_COUNT),
+        dtype=torch.long,
+        device=device,
+    )
+    allocated_bytes = device_module.memory_allocated(device)
+    device_module.reset_peak_memory_stats(device)
+    with torch.no_grad():
+        decode(probe_codes)
+    probe_peak_bytes = device_module.max_memory_allocated(device) - allocated_bytes
+    device_module.empty_cache()
+    bytes_per_padded_frame = math.ceil(
+        probe_peak_bytes / (MEMORY_PROBE_ROW_COUNT * MEMORY_PROBE_FRAME_COUNT)
+    )
+    device_bytes = device_module.get_device_properties(device).total_memory
+    if total_gpu_memory_fraction is None:
+        share_bytes = device_bytes
+    else:
+        share_bytes = int(total_gpu_memory_fraction * device_bytes)
+    max_padded_frames_per_decode = (share_bytes - held_bytes) // bytes_per_padded_frame
+    if max_padded_frames_per_decode < max_new_tokens:
+        raise ValueError(
+            f"the vocoder's GPU memory share of {share_bytes / 2**30:.2f} GiB holds "
+            f"{held_bytes / 2**30:.2f} GiB of codec weights and CUDA graphs and "
+            f"leaves room for {max_padded_frames_per_decode} padded frames per "
+            f"decode, fewer than one request of max_new_tokens={max_new_tokens} "
+            f"frames; raise --vocoder.gpu_memory_fraction or lower "
+            f"--tts_engine.factory.max_new_tokens"
+        )
+    else:
+        pass
+    logger.info(
+        f"S3-drama vocoder: a non-streaming decode takes up to "
+        f"{max_padded_frames_per_decode} padded frames of {bytes_per_padded_frame} "
+        f"bytes each; share {share_bytes / 2**30:.2f} GiB, held "
+        f"{held_bytes / 2**30:.2f} GiB"
+    )
+    return max_padded_frames_per_decode
+
+
 def create_vocoder_executor(
     *,
     device: str | None = None,
@@ -207,10 +264,17 @@ def create_vocoder_executor(
     max_batch_wait_ms: int,
     window_cuda_graphs: bool,
     decode_dtype: Literal["float32", "float16"],
+    max_new_tokens: int,
+    total_gpu_memory_fraction: float | None = None,
 ) -> S3DramaVocoderScheduler:
     resolved_device = str(resolve_concrete_device(device, gpu_id))
+    torch_device = torch.device(resolved_device)
     codec = load_codec(resolve_codec_directory(codec_path), resolved_device)
     codec.fold_weight_norm()
+    num_codebooks = (
+        codec.quantizer.semantic_quantizer.n_codebooks
+        + codec.quantizer.quantizer.n_codebooks
+    )
     if decode_dtype == "float16":
         decode: WindowDecoder = ChannelsLastDecoder(codec, dtype=torch.float16)
     else:
@@ -218,10 +282,9 @@ def create_vocoder_executor(
     if window_cuda_graphs:
         decode_window: WindowDecoder = WindowGraphDecoder(
             decode,
-            num_codebooks=codec.quantizer.semantic_quantizer.n_codebooks
-            + codec.quantizer.quantizer.n_codebooks,
+            num_codebooks=num_codebooks,
             frame_length=int(codec.frame_length),
-            device=torch.device(resolved_device),
+            device=torch_device,
             window_lengths=stream_window_lengths(
                 stream_stride=stream_stride,
                 stream_followup_stride_ramp=stream_followup_stride_ramp,
@@ -231,6 +294,16 @@ def create_vocoder_executor(
         )
     else:
         decode_window = decode
+    if torch_device.type == "cpu":
+        max_padded_frames_per_decode = None
+    else:
+        max_padded_frames_per_decode = measure_max_padded_frames_per_decode(
+            decode,
+            device=torch_device,
+            num_codebooks=num_codebooks,
+            total_gpu_memory_fraction=total_gpu_memory_fraction,
+            max_new_tokens=max_new_tokens,
+        )
     return S3DramaVocoderScheduler(
         codec,
         device=resolved_device,
@@ -242,4 +315,5 @@ def create_vocoder_executor(
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
         decode_window=decode_window,
+        max_padded_frames_per_decode=max_padded_frames_per_decode,
     )

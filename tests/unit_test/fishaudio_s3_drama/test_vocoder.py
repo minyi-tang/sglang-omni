@@ -27,6 +27,7 @@ from sglang_omni.models.fishaudio_s3_drama.stream_windows import (
 from sglang_omni.models.fishaudio_s3_drama.vocoder import (
     S3DramaVocoderScheduler,
     WindowGraphDecoder,
+    non_streaming_decode_groups,
 )
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -85,6 +86,7 @@ def vocoder_with(
     decode_window: WindowDecoder | None = None,
     *,
     factory_args: S3DramaVocoderFactoryArgs | None = None,
+    max_padded_frames_per_decode: int | None = None,
 ) -> S3DramaVocoderScheduler:
     """The vocoder with the configured windows."""
     window_kwargs = (factory_args or S3DramaVocoderFactoryArgs()).model_dump(
@@ -99,7 +101,11 @@ def vocoder_with(
         }
     )
     return S3DramaVocoderScheduler(
-        codec, device="cpu", decode_window=decode_window, **window_kwargs
+        codec,
+        device="cpu",
+        decode_window=decode_window,
+        max_padded_frames_per_decode=max_padded_frames_per_decode,
+        **window_kwargs,
     )
 
 
@@ -432,6 +438,61 @@ def test_a_non_streaming_batch_decodes_through_the_given_window_decoder() -> Non
         5 * SAMPLES_PER_FRAME,
         7 * SAMPLES_PER_FRAME,
     ]
+
+
+@pytest.mark.parametrize(
+    ("frame_counts", "max_padded_frames_per_decode", "groups"),
+    [
+        ([5, 7], None, [[0, 1]]),
+        ([3, 5, 2], 15, [[0, 1, 2]]),
+        ([4, 10, 7, 10, 2], 20, [[1, 3], [2, 0], [4]]),
+        ([30], 20, [[0]]),
+    ],
+)
+def test_non_streaming_rows_split_longest_first_under_the_padded_frame_limit(
+    frame_counts: list[int],
+    max_padded_frames_per_decode: int | None,
+    groups: list[list[int]],
+) -> None:
+    assert (
+        non_streaming_decode_groups(frame_counts, max_padded_frames_per_decode)
+        == groups
+    )
+
+
+@pytest.mark.parametrize(
+    ("max_padded_frames_per_decode", "decoded_shapes"),
+    [
+        (21, [(3, NUM_CODEBOOKS, 7)]),
+        (12, [(1, NUM_CODEBOOKS, 7), (2, NUM_CODEBOOKS, 5)]),
+    ],
+)
+def test_a_non_streaming_batch_over_the_limit_decodes_in_smaller_calls(
+    max_padded_frames_per_decode: int,
+    decoded_shapes: list[tuple[int, ...]],
+) -> None:
+    codec = FrameNumberCodec()
+    vocoder = vocoder_with(
+        codec, max_padded_frames_per_decode=max_padded_frames_per_decode
+    )
+    frame_counts = [5, 7, 3]
+
+    results = vocoder.vocode_payloads(
+        [
+            final_payload(numbered_frames(frame_count), is_streaming=False)
+            for frame_count in frame_counts
+        ]
+    )
+
+    assert [tuple(codes.shape) for codes in codec.decoded_codes] == decoded_shapes
+    for result, frame_count in zip(results, frame_counts, strict=True):
+        assert isinstance(result.data, dict)
+        assert (
+            result.data["audio_data"]
+            == np.repeat(
+                np.arange(frame_count, dtype=np.float32), SAMPLES_PER_FRAME
+            ).tolist()
+        )
 
 
 @pytest.mark.accelerator

@@ -115,10 +115,12 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
     }
     assert launch_kwargs(config, "vocoder") == {
         "gpu_id": 0,
+        "total_gpu_memory_fraction": 0.10,
         "codec_path": DEFAULT_CODEC_PATH,
         **VOCODER_WINDOWS,
         "window_cuda_graphs": True,
         "decode_dtype": "float16",
+        "max_new_tokens": 2048,
     }
 
 
@@ -180,6 +182,26 @@ def test_the_engine_streams_by_the_vocoder_windows() -> None:
         ("stream_followup_stride", 48),
     ):
         assert engine_kwargs[field_name] == vocoder_kwargs[field_name] == value
+
+
+def test_the_vocoder_sizes_its_decodes_by_the_engine_cap_on_new_frames() -> None:
+    config = ConfigManager(S3DramaPipelineConfig(model_path="checkpoint")).merge_config(
+        [("tts_engine.factory.max_new_tokens", "1024")]
+    )
+    assert isinstance(config, S3DramaPipelineConfig)
+
+    assert launch_kwargs(config, "vocoder")["max_new_tokens"] == 1024
+
+
+def test_the_vocoder_cannot_set_the_engine_cap_on_new_frames() -> None:
+    manager = ConfigManager(S3DramaPipelineConfig(model_path="checkpoint"))
+
+    with pytest.raises(ValidationError) as rejection:
+        manager.merge_config([("vocoder.factory.max_new_tokens", "1024")])
+
+    assert "set stages.tts_engine.factory.max_new_tokens instead" in str(
+        rejection.value
+    )
 
 
 @pytest.mark.parametrize(

@@ -41,6 +41,29 @@ def generation_result_of(payload: StagePayload) -> S3DramaGenerationResult:
         return result
 
 
+def non_streaming_decode_groups(
+    frame_counts: list[int], max_padded_frames_per_decode: int | None
+) -> list[list[int]]:
+    if max_padded_frames_per_decode is None or (
+        len(frame_counts) * max(frame_counts) <= max_padded_frames_per_decode
+    ):
+        return [list(range(len(frame_counts)))]
+    else:
+        groups: list[list[int]] = []
+        for index in sorted(
+            range(len(frame_counts)), key=frame_counts.__getitem__, reverse=True
+        ):
+            if (
+                groups
+                and (len(groups[-1]) + 1) * frame_counts[groups[-1][0]]
+                <= max_padded_frames_per_decode
+            ):
+                groups[-1].append(index)
+            else:
+                groups.append([index])
+        return groups
+
+
 class WindowGraphDecoder:
     def __init__(
         self,
@@ -129,6 +152,7 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
         max_batch_size: int,
         max_batch_wait_ms: int,
         decode_window: WindowDecoder | None = None,
+        max_padded_frames_per_decode: int | None = None,
     ) -> None:
         if not all(stride > 0 for stride in stream_followup_stride_ramp):
             raise ValueError(
@@ -150,6 +174,7 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
         )
         self.stream_followup_stride_ramp = tuple(stream_followup_stride_ramp)
         self.stream_window_counts: dict[str, int] = {}
+        self.max_padded_frames_per_decode = max_padded_frames_per_decode
 
     def followup_stride(self, request_id: str) -> int:
         window_count = self.stream_window_counts.get(request_id, 0)
@@ -254,9 +279,22 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
         return final_data
 
     def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
-        audios = self.decode_codebook_codes(
-            [generation_result_of(payload).frames[:, 1:].T for payload in payloads]
-        )
+        codebook_codes = [
+            generation_result_of(payload).frames[:, 1:].T for payload in payloads
+        ]
+        audio_by_index: dict[int, torch.Tensor] = {}
+        for group in non_streaming_decode_groups(
+            [int(codes.shape[-1]) for codes in codebook_codes],
+            self.max_padded_frames_per_decode,
+        ):
+            audio_by_index.update(
+                zip(
+                    group,
+                    self.decode_codebook_codes([codebook_codes[i] for i in group]),
+                    strict=True,
+                )
+            )
+        audios = [audio_by_index[index] for index in range(len(payloads))]
         return [
             StagePayload(
                 request_id=payload.request_id,

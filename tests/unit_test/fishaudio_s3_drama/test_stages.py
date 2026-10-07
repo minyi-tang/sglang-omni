@@ -12,9 +12,11 @@ import torch
 from tokenizers import Tokenizer
 
 from sglang_omni.models.fishaudio_s2_pro.stages import FishReferenceEncodeHook
+from sglang_omni.models.fishaudio_s2_pro.streaming_vocoder import WindowDecoder
 from sglang_omni.models.fishaudio_s3_drama import stages
 from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_CODEC_PATH,
+    DEFAULT_MAX_NEW_TOKENS_CAP,
     S3DramaVocoderFactoryArgs,
 )
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import S3DramaEngineBuilder
@@ -390,6 +392,7 @@ def cpu_vocoder(factory_args: S3DramaVocoderFactoryArgs) -> S3DramaVocoderSchedu
         max_batch_wait_ms=factory_args.max_batch_wait_ms,
         window_cuda_graphs=factory_args.window_cuda_graphs,
         decode_dtype=factory_args.decode_dtype,
+        max_new_tokens=DEFAULT_MAX_NEW_TOKENS_CAP,
     )
 
 
@@ -418,6 +421,7 @@ def test_the_vocoder_factory_loads_the_codec_on_its_device_with_the_windows(
         vocoder.stream_crossfade_samples,
         vocoder.max_batch_size,
     ) == (10, (10, 12, 32), 64, 32, 0, 8)
+    assert vocoder.max_padded_frames_per_decode is None
 
 
 def test_window_cuda_graphs_on_a_cpu_device_are_refused(
@@ -431,4 +435,51 @@ def test_window_cuda_graphs_on_a_cpu_device_are_refused(
             S3DramaVocoderFactoryArgs(codec_path=str(codec_file)).model_copy(
                 update={"decode_dtype": "float32"}
             )
+        )
+
+
+def bytes_per_frame_decoder(bytes_per_frame: int) -> WindowDecoder:
+    def decode(indices: torch.Tensor) -> torch.Tensor:
+        return torch.empty(
+            (indices.shape[0], 1, indices.shape[-1] * bytes_per_frame // 4),
+            dtype=torch.float32,
+            device=indices.device,
+        )
+
+    return decode
+
+
+@pytest.mark.accelerator
+def test_the_padded_frame_limit_is_the_share_left_after_held_memory() -> None:
+    device = torch.device("cuda")
+    bytes_per_frame = 4096
+    share_bytes = int(0.01 * torch.cuda.get_device_properties(device).total_memory)
+    torch.cuda.empty_cache()
+    held_before = torch.cuda.memory_reserved(device)
+
+    max_padded_frames_per_decode = stages.measure_max_padded_frames_per_decode(
+        bytes_per_frame_decoder(bytes_per_frame),
+        device=device,
+        num_codebooks=4,
+        total_gpu_memory_fraction=0.01,
+        max_new_tokens=16,
+    )
+
+    held_after = torch.cuda.memory_reserved(device)
+    assert (
+        (share_bytes - held_after) // bytes_per_frame
+        <= max_padded_frames_per_decode
+        <= (share_bytes - held_before) // bytes_per_frame
+    )
+
+
+@pytest.mark.accelerator
+def test_a_share_that_cannot_hold_one_longest_request_is_refused() -> None:
+    with pytest.raises(ValueError, match="--vocoder.gpu_memory_fraction"):
+        stages.measure_max_padded_frames_per_decode(
+            bytes_per_frame_decoder(4096),
+            device=torch.device("cuda"),
+            num_codebooks=4,
+            total_gpu_memory_fraction=0.01,
+            max_new_tokens=10**9,
         )

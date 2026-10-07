@@ -183,6 +183,13 @@ class S3DramaPipelineConfig(PipelineConfig):
                 )
             else:
                 pass
+        if self.stage_named("vocoder").factory.max_new_tokens is not None:
+            raise ValueError(
+                "S3-drama's vocoder takes max_new_tokens from the tts_engine stage; "
+                "set stages.tts_engine.factory.max_new_tokens instead"
+            )
+        else:
+            pass
 
     def stage_factory_kwargs(
         self, stage_name: str
@@ -202,6 +209,8 @@ class S3DramaPipelineConfig(PipelineConfig):
                 "stream_followup_stride_ramp": vocoder_factory.stream_followup_stride_ramp,
                 "stream_followup_stride": vocoder_factory.stream_followup_stride,
             }
+        elif stage_name == "vocoder":
+            return {"max_new_tokens": engine_factory.max_new_tokens}
         else:
             return {}
 
