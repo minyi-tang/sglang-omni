@@ -78,6 +78,7 @@ class GraphEngineSpec(BaseModel):
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     )
     triton_sampling: bool = False
+    tower_fused_layers: bool = True
     enable_async_decode: bool = False
     async_decode_min_batch_size: int = 1
     prompts: dict[str, list[list[int]]] = PROMPTS
@@ -136,6 +137,8 @@ class GraphForwardRecord:
     prefill_eager_count: int
     prefill_replay_buckets: dict[int, int]
     tower_prefill_runs: int
+    fused_layer_calls: int
+    tower_prefill_fused_layer_calls: int
     first_frame_replays: dict[int, int]
     first_frame_eager_count: int
     first_frame_sampler_calls: int
@@ -178,6 +181,8 @@ class GraphEngineFacts:
     lean_attention_override: bool | None
     startup_lean_choices: list[LeanChoice]
     uses_triton_sampling: bool
+    uses_fused_tower_layers: bool
+    fused_max_rows: int | None
     enable_async_decode: bool
     async_decode_min_batch_size: int
     async_decode_resolve_before_prefill: bool

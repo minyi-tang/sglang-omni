@@ -36,6 +36,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
     bits,
 )
 from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
+    FusedLayerCalls,
     GraphRecordingModel,
     LeanChoiceRecorder,
 )
@@ -104,6 +105,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.state_snapshot: list[torch.Tensor] = []
         self.usage_snapshot = PrefillCudaGraphUsage()
         self.tower_prefill_runs_snapshot = 0
+        self.fused_layer_calls_snapshot = FusedLayerCalls()
         self.lean_choice_recorder: LeanChoiceRecorder | None = None
         self.first_frame_replays_snapshot: Counter[int] = Counter()
         self.first_frame_eager_snapshot = 0
@@ -154,6 +156,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.tower_prefill_runs_snapshot = (
             tower_prefill_runs.extend_mode + tower_prefill_runs.other_modes
         )
+        self.fused_layer_calls_snapshot = replace(self.model.fused_layer_calls)
         first_frame_runs = self.model.first_frame_runs
         self.first_frame_replays_snapshot = Counter(
             first_frame_runs.replays_by_request_count
@@ -446,6 +449,12 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 tower_prefill_runs=self.model.tower_prefill_runs.extend_mode
                 + self.model.tower_prefill_runs.other_modes
                 - self.tower_prefill_runs_snapshot,
+                fused_layer_calls=self.model.fused_layer_calls.total
+                - self.fused_layer_calls_snapshot.total,
+                tower_prefill_fused_layer_calls=(
+                    self.model.fused_layer_calls.during_tower_prefill
+                    - self.fused_layer_calls_snapshot.during_tower_prefill
+                ),
                 first_frame_replays=first_frame_replays,
                 first_frame_eager_count=first_frame_runs.eager_count
                 - self.first_frame_eager_snapshot,

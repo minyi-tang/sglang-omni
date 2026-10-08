@@ -16,7 +16,7 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal, Protocol
-from unittest.mock import Mock, call, patch
+from unittest.mock import ANY, Mock, call, patch
 
 import huggingface_hub
 import pytest
@@ -78,6 +78,10 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaTowerPrefill,
     StepExchange,
     next_frame_labels,
+)
+from sglang_omni.models.fishaudio_s3_drama.tower_kernels import (
+    FUSED_KERNELS,
+    MAX_FUSED_ROWS,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.proto.request import OmniRequest, StagePayload
@@ -946,7 +950,10 @@ def test_tower_prefill_refuses_rows_past_its_buffers() -> None:
 
 
 def set_up_mocked_model(
-    builder: S3DramaEngineBuilder, server_args: ServerArgs, checkpoint_dir: Path
+    builder: S3DramaEngineBuilder,
+    server_args: ServerArgs,
+    checkpoint_dir: Path,
+    fused_layers_reason: str | None = "the KV pool is a test double",
 ) -> Mock:
     model = Mock(spec=S3DramaForCausalLM)
     model.config = FishOmniConfig(**fish_config_dict())
@@ -956,11 +963,16 @@ def set_up_mocked_model(
     model.audio_decoder.main_token_candidate_ids = torch.arange(codebook_size + 1)
     model.audio_decoder.sampling_step = torch.zeros((), dtype=torch.int64)
     model.audio_decoder.sampler = None
+    model.audio_decoder.fused_layers_unsupported_reason.return_value = (
+        fused_layers_reason
+    )
     model.tower_attention = torch.nn.ModuleList()
     model.model = SimpleNamespace(tower_prefill=None)
     worker = Mock(spec=ModelWorker)
     worker.model_runner = SimpleNamespace(
-        model=model, req_to_token_pool=SimpleNamespace(size=4)
+        model=model,
+        req_to_token_pool=SimpleNamespace(size=4),
+        token_to_kv_pool=Mock(spec=HybridLinearKVPool),
     )
     builder.setup_model(
         model_worker=worker,
@@ -1069,6 +1081,57 @@ def test_setup_model_picks_the_codebook_sampler_and_logs_why(
         assert audio_decoder.sampler.seed == generator_seed % PHILOX_SEED_MODULUS
     else:
         assert audio_decoder.sampler is None
+
+
+@pytest.mark.parametrize(
+    ("tower_fused_layers", "unsupported_reason", "expected_log"),
+    [
+        (
+            False,
+            None,
+            "S3-drama tower fused layers: off, "
+            "tts_engine.factory.tower_fused_layers is false",
+        ),
+        (
+            True,
+            "Triton is not installed",
+            "S3-drama tower fused layers: off, Triton is not installed",
+        ),
+        (
+            True,
+            None,
+            f"S3-drama tower fused layers: on for passes up to {MAX_FUSED_ROWS} rows "
+            f"({', '.join(FUSED_KERNELS)})",
+        ),
+    ],
+)
+def test_setup_model_picks_the_tower_layers_and_logs_why(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    tower_fused_layers: bool,
+    unsupported_reason: str | None,
+    expected_log: str,
+) -> None:
+    builder, server_args = engine_server_args(tmp_path, {})
+    builder.tower_fused_layers = tower_fused_layers
+
+    with caplog.at_level(logging.INFO, logger=engine_builder.logger.name):
+        model = set_up_mocked_model(
+            builder, server_args, tmp_path, fused_layers_reason=unsupported_reason
+        )
+
+    assert expected_log in caplog.text
+    audio_decoder = model.audio_decoder
+    audio_decoder.fused_layers_unsupported_reason.assert_called_once_with(
+        kv_pool=ANY,
+        tower_layer_ids=[],
+        context_length=builder.context_length,
+        device=torch.device("cpu"),
+    )
+    if tower_fused_layers and unsupported_reason is None:
+        audio_decoder.enable_fused_layers.assert_called_once_with(torch.device("cpu"))
+    else:
+        audio_decoder.enable_fused_layers.assert_not_called()
 
 
 def first_frame_graph_setup(
@@ -1964,6 +2027,8 @@ def test_the_graph_harness_is_busy_until_a_resolve_has_marked_its_record() -> No
             prefill_eager_count=0,
             prefill_replay_buckets={},
             tower_prefill_runs=0,
+            fused_layer_calls=0,
+            tower_prefill_fused_layer_calls=0,
             first_frame_replays={},
             first_frame_eager_count=0,
             first_frame_sampler_calls=0,

@@ -60,6 +60,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
 )
 from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
     CaptureBreakRecorder,
+    CountingFusedTowerLayers,
     CountingTowerPrefill,
     DrawRecorder,
     GraphRecordingModel,
@@ -90,6 +91,7 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             first_frame_cuda_graphs=spec.first_frame_cuda_graphs,
             first_frame_cuda_graph_max_requests=spec.first_frame_cuda_graph_max_requests,
             triton_sampling=spec.triton_sampling,
+            tower_fused_layers=spec.tower_fused_layers,
             enable_async_decode=spec.enable_async_decode,
             async_decode_min_batch_size=spec.async_decode_min_batch_size,
         )
@@ -158,7 +160,18 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             input_frames=tower_prefill.input_frames,
             next_frames=tower_prefill.next_frames,
             runs=model.tower_prefill_runs,
+            fused_layer_calls=model.fused_layer_calls,
         )
+        fused_layers = model.audio_decoder.fused_layers
+        if fused_layers is not None:
+            model.audio_decoder.fused_layers = CountingFusedTowerLayers(
+                shape=fused_layers.shape,
+                rotary_cos_sin=fused_layers.rotary_cos_sin,
+                device=torch.device(device),
+                calls=model.fused_layer_calls,
+            )
+        else:
+            pass
 
     def post_cuda_graph_setup(
         self, model: S3DramaForCausalLM, server_args: ServerArgs
@@ -466,6 +479,12 @@ def engine_facts(
         lean_attention_override=full_attention_backend.enable_lean_attention,
         startup_lean_choices=list(builder.lean_choice_recorder.choices),
         uses_triton_sampling=model.audio_decoder.sampler is not None,
+        uses_fused_tower_layers=model.audio_decoder.fused_layers is not None,
+        fused_max_rows=(
+            None
+            if model.audio_decoder.fused_layers is None
+            else model.audio_decoder.fused_layers.max_rows
+        ),
         enable_async_decode=scheduler.enable_async_decode,
         async_decode_min_batch_size=scheduler.async_decode_min_batch_size,
         async_decode_resolve_before_prefill=(

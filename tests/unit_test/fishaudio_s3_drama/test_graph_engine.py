@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
+from sglang_omni.models.fishaudio_s3_drama.tower_kernels import MAX_FUSED_ROWS
 from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     EnginePair,
     bit_problems,
@@ -22,6 +23,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     finite_problems,
     first_frame_path_problems,
     first_frame_split_problems,
+    fused_layer_problems,
     generator_offset_problems,
     history_problems,
     lean_problems,
@@ -91,6 +93,7 @@ LOOKAHEAD_PAIR_NAMES = {
 }
 # One line per problem is enough to locate the first divergence.
 REPORTED_PROBLEM_COUNT = 20
+UNFUSED_PAIR_NAMES = {"unfused main", "unfused prefill main"}
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -111,6 +114,8 @@ class GraphEngineRuns:
     lookahead_prefill_main: EnginePair
     lookahead_retract: EnginePair
     lookahead_prefill_retract: EnginePair
+    unfused_main: EnginePair
+    unfused_prefill_main: EnginePair
     workdir: Path
 
 
@@ -170,6 +175,7 @@ def engine_pairs(
     triton_sampling: bool,
     *,
     enable_async_decode: bool,
+    tower_fused_layers: bool = True,
 ) -> tuple[EnginePair, EnginePair]:
     runs: dict[EngineKind, GraphEngineRun] = {}
     for kind in ("eager", "graph", "prefill_graph"):
@@ -177,6 +183,7 @@ def engine_pairs(
             model_dir=str(model_dir),
             kind=kind,
             triton_sampling=triton_sampling,
+            tower_fused_layers=tower_fused_layers,
             enable_async_decode=enable_async_decode,
             scenarios=scenarios,
         )
@@ -253,6 +260,16 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         False,
         enable_async_decode=True,
     )
+    unfused_main, unfused_prefill_main = engine_pairs(
+        "unfused-main",
+        checkpoint_dir,
+        MAIN_SCENARIOS,
+        workdir,
+        {},
+        False,
+        enable_async_decode=False,
+        tower_fused_layers=False,
+    )
     small_budget_runs = {
         kind: run_engine(
             f"small-budget-{kind}",
@@ -317,6 +334,8 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         lookahead_prefill_main=lookahead_prefill_main,
         lookahead_retract=lookahead_retract,
         lookahead_prefill_retract=lookahead_prefill_retract,
+        unfused_main=unfused_main,
+        unfused_prefill_main=unfused_prefill_main,
         workdir=workdir,
     )
     print(f"Artifacts: {workdir}")
@@ -338,6 +357,8 @@ def all_pairs(engine_runs: GraphEngineRuns) -> dict[str, EnginePair]:
         "lookahead prefill main": engine_runs.lookahead_prefill_main,
         "lookahead retract": engine_runs.lookahead_retract,
         "lookahead prefill retract": engine_runs.lookahead_prefill_retract,
+        "unfused main": engine_runs.unfused_main,
+        "unfused prefill main": engine_runs.unfused_prefill_main,
     }
 
 
@@ -723,6 +744,87 @@ def test_sampling_step_check_catches_a_changed_or_mislabeled_run(
     assert len(sampling_step_problems(changed_run, True)) == 1
     assert sampling_step_problems(engine_runs.main.graph, True)
     assert sampling_step_problems(triton_run, False)
+
+
+def test_fused_layers_run_each_eager_decode_step_and_no_tower_prefill(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    pairs = {
+        **all_pairs(engine_runs),
+        "triton main": engine_runs.triton_main,
+        "triton prefill main": engine_runs.triton_prefill_main,
+    }
+    for name, pair in pairs.items():
+        is_fused = name not in UNFUSED_PAIR_NAMES
+        for run in (pair.eager, pair.graph):
+            problems = fused_layer_problems(run, is_fused)
+            assert not problems, f"{name} {run.kind}:\n{first_problems(problems)}"
+            assert fused_layer_problems(run, not is_fused), f"{name} {run.kind}"
+    tower_layer_count = len(engine_runs.main.eager.facts.tower_layer_ids)
+    eager_forwards = engine_runs.main.eager.forwards
+    assert any(
+        record.is_extend and record.fused_layer_calls == tower_layer_count
+        for record in eager_forwards
+    )
+    assert any(
+        not record.is_extend and record.fused_layer_calls == tower_layer_count
+        for record in eager_forwards
+    )
+
+
+def test_fused_layer_check_catches_a_changed_record(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    eager_run = engine_runs.main.eager
+    graph_run = engine_runs.main.graph
+    extend = next(record for record in eager_run.forwards if record.is_extend)
+    decode = next(record for record in eager_run.forwards if not record.is_extend)
+    replayed = next(
+        record
+        for record in graph_run.forwards
+        if record.is_graph_replay and not record.is_extend
+    )
+    for run, record in (
+        (eager_run, replace(extend, tower_prefill_fused_layer_calls=1)),
+        (eager_run, replace(decode, fused_layer_calls=0)),
+        (eager_run, replace(decode, fused_layer_calls=decode.fused_layer_calls - 1)),
+        (graph_run, replace(replayed, fused_layer_calls=1)),
+    ):
+        assert len(fused_layer_problems(with_record(run, record), True)) == 1
+
+
+def test_tower_prefill_writes_the_unfused_bits_and_the_decode_step_fuses(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    fused_extends = [
+        record for record in engine_runs.main.eager.forwards if record.is_extend
+    ]
+    unfused_extends = [
+        record for record in engine_runs.unfused_main.eager.forwards if record.is_extend
+    ]
+    assert len(fused_extends) == len(unfused_extends) > 0
+    assert any(record.token_count <= MAX_FUSED_ROWS for record in fused_extends)
+    for fused_extend, unfused_extend in zip(
+        fused_extends, unfused_extends, strict=True
+    ):
+        assert fused_extend.tower_prefill_runs == unfused_extend.tower_prefill_runs
+        assert fused_extend.tower_prefill_fused_layer_calls == 0
+        assert [step.request_id for step in fused_extend.steps] == [
+            step.request_id for step in unfused_extend.steps
+        ]
+        for fused_step, unfused_step in zip(
+            fused_extend.steps, unfused_extend.steps, strict=True
+        ):
+            assert torch.equal(
+                bits(fused_step.written_cache[:, :-1]),
+                bits(unfused_step.written_cache[:, :-1]),
+            ), (fused_extend.forward_index, fused_step.request_id)
+    tower_layer_count = len(engine_runs.main.eager.facts.tower_layer_ids)
+    first_decode = next(
+        record for record in engine_runs.main.eager.forwards if not record.is_extend
+    )
+    assert fused_extends[0].fused_layer_calls == tower_layer_count
+    assert first_decode.fused_layer_calls == tower_layer_count
 
 
 def test_decode_attention_keeps_the_standard_kernel(

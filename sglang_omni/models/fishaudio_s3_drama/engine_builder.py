@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.server_args import ServerArgs
@@ -32,6 +33,7 @@ from sglang_omni.models.fishaudio_s3_drama.config import (
     DEFAULT_STREAM_FOLLOWUP_STRIDE,
     DEFAULT_STREAM_FOLLOWUP_STRIDE_RAMP,
     DEFAULT_STREAM_STRIDE,
+    DEFAULT_TOWER_FUSED_LAYERS,
     DEFAULT_TRITON_SAMPLING,
 )
 from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
@@ -58,6 +60,10 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaDecodeBuffers,
     S3DramaForCausalLM,
     S3DramaTowerPrefill,
+)
+from sglang_omni.models.fishaudio_s3_drama.tower_kernels import (
+    FUSED_KERNELS,
+    MAX_FUSED_ROWS,
 )
 from sglang_omni.scheduling.engine_factory import (
     GenerationDefaults,
@@ -102,6 +108,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
         ),
         triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
+        tower_fused_layers: bool = DEFAULT_TOWER_FUSED_LAYERS,
         enable_async_decode: bool = DEFAULT_ENABLE_ASYNC_DECODE,
         async_decode_min_batch_size: int = DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
     ) -> None:
@@ -115,6 +122,7 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         self.first_frame_cuda_graphs = first_frame_cuda_graphs
         self.first_frame_cuda_graph_max_requests = first_frame_cuda_graph_max_requests
         self.triton_sampling = triton_sampling
+        self.tower_fused_layers = tower_fused_layers
         self.enable_async_decode = enable_async_decode
         self.async_decode_min_batch_size = async_decode_min_batch_size
         self.frame_streamer: S3DramaFrameStreamer | None = None
@@ -270,6 +278,27 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
                 seed=torch.cuda.initial_seed() % PHILOX_SEED_MODULUS,
             )
             logger.info("S3-drama codebook sampling: Triton kernels")
+        kv_pool = sglang_runner.token_to_kv_pool
+        assert isinstance(kv_pool, HybridLinearKVPool)
+        fused_layers_reason = audio_decoder.fused_layers_unsupported_reason(
+            kv_pool=kv_pool,
+            tower_layer_ids=[layer.layer_id for layer in model.tower_attention],
+            context_length=self.context_length,
+            device=torch.device(device),
+        )
+        if not self.tower_fused_layers:
+            logger.info(
+                "S3-drama tower fused layers: off, "
+                "tts_engine.factory.tower_fused_layers is false"
+            )
+        elif fused_layers_reason is not None:
+            logger.info(f"S3-drama tower fused layers: off, {fused_layers_reason}")
+        else:
+            audio_decoder.enable_fused_layers(torch.device(device))
+            logger.info(
+                f"S3-drama tower fused layers: on for passes up to {MAX_FUSED_ROWS} "
+                f"rows ({', '.join(FUSED_KERNELS)})"
+            )
         sglang_runner.extra_prefill_graph_attention_layers = list(model.tower_attention)
         sglang_runner.prefill_graph_runner_class = RequestIdPrefillCudaGraphRunner
         self.sglang_runner = sglang_runner

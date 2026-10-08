@@ -9,12 +9,14 @@ that row's hidden state and the codes of frame p + 1.
 from __future__ import annotations
 
 import math
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import torch
 import torch.nn.functional as F
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import GemmaRMSNorm
+from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from torch import nn
 
 from sglang_omni.models.fishaudio_s3_drama.hf_config import (
@@ -28,6 +30,13 @@ from sglang_omni.models.fishaudio_s3_drama.sampling import (
 from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
     FIRST_CODEBOOK_HEAD_STREAM,
     CodebookSampler,
+)
+from sglang_omni.models.fishaudio_s3_drama.tower_kernels import (
+    FusedTowerLayers,
+    NormWeights,
+    TowerLayerWeights,
+    fused_tower_layers_unsupported_reason,
+    tower_layer_shape,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.interface import JointRopeInplaceKernel
@@ -52,6 +61,23 @@ class DecoderAttention(Protocol):
         owns the rows' requests and positions, which must match the positions
         given to the tower.
         """
+
+
+@runtime_checkable
+class PagedDecoderAttention(DecoderAttention, Protocol):
+    def forward_mode(self) -> ForwardMode: ...
+
+    def cache_slots(self) -> torch.Tensor: ...
+
+    def key_buffer(self, layer_index: int) -> torch.Tensor: ...
+
+    def value_buffer(self, layer_index: int) -> torch.Tensor: ...
+
+    def attend(self, layer_index: int, query: torch.Tensor) -> torch.Tensor: ...
+
+
+def norm_weights(norm: GemmaRMSNorm) -> NormWeights:
+    return NormWeights(weight=norm.weight, eps=norm.variance_epsilon)
 
 
 class InterleavedRotaryEmbedding(nn.Module):
@@ -213,6 +239,22 @@ class DecoderLayer(nn.Module):
         normed, _ = self.final_layernorm(self.mlp(mlp_input), residual)
         return normed
 
+    def tower_layer_weights(self) -> TowerLayerWeights:
+        attention = self.self_attn
+        return TowerLayerWeights(
+            token_embedding=self.token_embedding.weight,
+            enorm=norm_weights(self.enorm),
+            hnorm=norm_weights(self.hnorm),
+            eh_proj=self.eh_proj,
+            input_norm=norm_weights(self.input_layernorm),
+            qkv_proj=attention.qkv_proj,
+            q_norm=norm_weights(attention.q_norm),
+            k_norm=norm_weights(attention.k_norm),
+            o_proj=attention.o_proj,
+            post_norm=norm_weights(self.post_attention_layernorm),
+            gate_up_proj=self.mlp.gate_up_proj,
+        )
+
 
 class AudioDecoder(nn.Module):
     """Frame embeddings and the codebook tower of S3-drama.
@@ -268,6 +310,48 @@ class AudioDecoder(nn.Module):
             "sampling_step", torch.zeros((), dtype=torch.int64), persistent=False
         )
         self.sampler: CodebookSampler | None = None
+        self.fused_layers: FusedTowerLayers | None = None
+
+    def fused_layers_unsupported_reason(
+        self,
+        *,
+        kv_pool: HybridLinearKVPool,
+        tower_layer_ids: list[int],
+        context_length: int,
+        device: torch.device,
+    ) -> str | None:
+        attention = self.shared_layers[0].self_attn
+        return fused_tower_layers_unsupported_reason(
+            layers=[
+                layer.tower_layer_weights()
+                for layer in (*self.shared_layers, *self.residual_layers)
+            ],
+            head_count=attention.head_count,
+            kv_head_count=attention.kv_head_count,
+            rotary_dim=attention.rotary_embedding.rotary_dim,
+            rotary_cos_sin=attention.rotary_embedding.cos_sin_cache,
+            context_length=context_length,
+            kv_pool=kv_pool,
+            tower_layer_ids=tower_layer_ids,
+            device=device,
+        )
+
+    def enable_fused_layers(self, device: torch.device) -> None:
+        layer = self.shared_layers[0]
+        attention = layer.self_attn
+        self.fused_layers = FusedTowerLayers(
+            shape=tower_layer_shape(
+                weights=layer.tower_layer_weights(),
+                head_count=attention.head_count,
+                kv_head_count=attention.kv_head_count,
+                rotary_dim=attention.rotary_embedding.rotary_dim,
+                multiprocessor_count=torch.cuda.get_device_properties(
+                    device
+                ).multi_processor_count,
+            ),
+            rotary_cos_sin=attention.rotary_embedding.cos_sin_cache,
+            device=device,
+        )
 
     def is_semantic(self, token_ids: torch.Tensor) -> torch.Tensor:
         return (token_ids >= self.semantic_begin_id) & (
@@ -317,6 +401,52 @@ class AudioDecoder(nn.Module):
             0.0,
         )
 
+    def run_layer(
+        self,
+        layer: DecoderLayer,
+        layer_index: int,
+        hidden_states: torch.Tensor,
+        code_ids: torch.Tensor,
+        label_is_semantic: torch.Tensor,
+        shared_input: torch.Tensor | None,
+        positions: torch.Tensor,
+        attention: DecoderAttention,
+        decode_pass: bool,
+    ) -> torch.Tensor:
+        fused_layers = self.fused_layers
+        if (
+            fused_layers is not None
+            and decode_pass
+            and isinstance(attention, PagedDecoderAttention)
+            and attention.forward_mode() == ForwardMode.DECODE
+            and fused_layers.covers(hidden_states.shape[0])
+        ):
+            activated, residual = fused_layers.forward_layer(
+                weights=layer.tower_layer_weights(),
+                layer_index=layer_index,
+                hidden_states=hidden_states,
+                code_ids=code_ids,
+                label_is_semantic=label_is_semantic,
+                shared_input=shared_input,
+                positions=positions,
+                cache_slots=attention.cache_slots(),
+                key_cache=attention.key_buffer(layer_index),
+                value_cache=attention.value_buffer(layer_index),
+                attention=attention.attend,
+            )
+            normed, _ = layer.final_layernorm(layer.mlp.down_proj(activated), residual)
+            return normed
+        else:
+            return layer(
+                hidden_states,
+                code_ids,
+                label_is_semantic,
+                shared_input,
+                positions,
+                attention,
+                layer_index,
+            )
+
     def run_shared_layers(
         self,
         hidden_states: torch.Tensor,
@@ -325,16 +455,19 @@ class AudioDecoder(nn.Module):
         shared_input: torch.Tensor,
         positions: torch.Tensor,
         attention: DecoderAttention,
+        decode_pass: bool = False,
     ) -> torch.Tensor:
         for layer_index, layer in enumerate(self.shared_layers):
-            hidden_states = layer(
+            hidden_states = self.run_layer(
+                layer,
+                layer_index,
                 hidden_states,
                 codebook_zero,
                 label_is_semantic,
                 shared_input if layer_index == 0 else None,
                 positions,
                 attention,
-                layer_index,
+                decode_pass,
             )
         return hidden_states
 
@@ -360,14 +493,16 @@ class AudioDecoder(nn.Module):
             attention,
         )
         for residual_index, layer in enumerate(self.residual_layers):
-            hidden_states = layer(
+            hidden_states = self.run_layer(
+                layer,
+                len(self.shared_layers) + residual_index,
                 hidden_states,
                 next_frames[:, 1 + residual_index],
                 label_is_semantic,
                 None,
                 positions,
                 attention,
-                len(self.shared_layers) + residual_index,
+                False,
             )
 
     def decode_step(
@@ -413,19 +548,22 @@ class AudioDecoder(nn.Module):
             self.shared_input(input_frames),
             positions,
             attention,
+            True,
         )
         codes = [codebook_zero]
         for residual_index, (layer, head) in enumerate(
             zip(self.residual_layers, self.codebook_heads)
         ):
-            hidden_states = layer(
+            hidden_states = self.run_layer(
+                layer,
+                len(self.shared_layers) + residual_index,
                 hidden_states,
                 codes[-1],
                 label_is_semantic,
                 None,
                 positions,
                 attention,
-                len(self.shared_layers) + residual_index,
+                True,
             )
             codes.append(
                 sample_top_k_top_p(

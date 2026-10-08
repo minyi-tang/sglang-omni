@@ -22,6 +22,12 @@ from sglang_omni.models.fishaudio_s3_drama.sglang_model import (
     S3DramaForCausalLM,
     S3DramaTowerPrefill,
 )
+from sglang_omni.models.fishaudio_s3_drama.tower_kernels import (
+    FusedTowerLayers,
+    QueryAttention,
+    TowerLayerShape,
+    TowerLayerWeights,
+)
 from tests.unit_test.fishaudio_s3_drama.graph_fixtures import LeanChoice
 
 
@@ -48,9 +54,16 @@ class TowerPrefillRuns:
     other_modes: int = 0
 
 
+@dataclass(kw_only=True)
+class FusedLayerCalls:
+    total: int = 0
+    during_tower_prefill: int = 0
+
+
 @dataclass(frozen=True, kw_only=True)
 class CountingTowerPrefill(S3DramaTowerPrefill):
     runs: TowerPrefillRuns
+    fused_layer_calls: FusedLayerCalls
 
     def run(
         self,
@@ -62,7 +75,54 @@ class CountingTowerPrefill(S3DramaTowerPrefill):
             self.runs.extend_mode += 1
         else:
             self.runs.other_modes += 1
+        calls_before = self.fused_layer_calls.total
         super().run(hidden_states, positions, forward_batch)
+        self.fused_layer_calls.during_tower_prefill += (
+            self.fused_layer_calls.total - calls_before
+        )
+
+
+class CountingFusedTowerLayers(FusedTowerLayers):
+    def __init__(
+        self,
+        *,
+        shape: TowerLayerShape,
+        rotary_cos_sin: torch.Tensor,
+        device: torch.device,
+        calls: FusedLayerCalls,
+    ) -> None:
+        super().__init__(shape=shape, rotary_cos_sin=rotary_cos_sin, device=device)
+        self.calls = calls
+
+    def forward_layer(
+        self,
+        *,
+        weights: TowerLayerWeights,
+        layer_index: int,
+        hidden_states: torch.Tensor,
+        code_ids: torch.Tensor,
+        label_is_semantic: torch.Tensor,
+        shared_input: torch.Tensor | None,
+        positions: torch.Tensor,
+        cache_slots: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attention: QueryAttention,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self.calls.total += 1
+        return super().forward_layer(
+            weights=weights,
+            layer_index=layer_index,
+            hidden_states=hidden_states,
+            code_ids=code_ids,
+            label_is_semantic=label_is_semantic,
+            shared_input=shared_input,
+            positions=positions,
+            cache_slots=cache_slots,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            attention=attention,
+        )
 
 
 class AttentionBreak(Protocol):
@@ -161,6 +221,7 @@ class GraphRecordingModel(S3DramaForCausalLM):
         self.draw_column = 0
         self.first_frame_sampler_calls = 0
         self.tower_prefill_runs = TowerPrefillRuns()
+        self.fused_layer_calls = FusedLayerCalls()
         for head_index, head in enumerate(self.audio_decoder.codebook_heads):
             head.register_forward_hook(
                 functools.partial(self.keep_head_logits, head_index)

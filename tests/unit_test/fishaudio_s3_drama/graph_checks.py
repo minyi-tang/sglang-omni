@@ -569,6 +569,43 @@ def sampling_step_problems(run: GraphEngineRun, is_triton_sampling: bool) -> lis
     ]
 
 
+def fused_layer_problems(run: GraphEngineRun, is_fused: bool) -> list[str]:
+    tower_layer_count = len(run.facts.tower_layer_ids)
+    problems = (
+        []
+        if run.facts.uses_fused_tower_layers == is_fused
+        else [
+            f"{run.kind} engine: uses_fused_tower_layers is "
+            f"{run.facts.uses_fused_tower_layers}, expected {is_fused}"
+        ]
+    )
+    max_rows = run.facts.fused_max_rows
+    for record in run.forwards:
+        if record.is_extend:
+            runs_decode_step_eagerly = record.first_frame_eager_count == 1
+        else:
+            runs_decode_step_eagerly = not record.is_graph_replay
+        is_covered = max_rows is not None and len(record.steps) <= max_rows
+        expected_calls = (
+            tower_layer_count
+            if is_fused and runs_decode_step_eagerly and is_covered
+            else 0
+        )
+        if record.tower_prefill_fused_layer_calls != 0:
+            problems.append(
+                f"{forward_name(record)}: {record.tower_prefill_fused_layer_calls} "
+                f"fused layer calls in the tower prefill"
+            )
+        elif record.fused_layer_calls != expected_calls:
+            problems.append(
+                f"{forward_name(record)}: {record.fused_layer_calls} fused layer "
+                f"calls, expected {expected_calls}"
+            )
+        else:
+            pass
+    return problems
+
+
 def lean_problems(run: GraphEngineRun) -> list[str]:
     facts = run.facts
     problems = (

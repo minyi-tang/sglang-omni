@@ -183,6 +183,31 @@ class PagedTowerAttention:
         assert isinstance(layer, RadixAttention)
         return layer(query, key, value, self.forward_batch)
 
+    def forward_mode(self) -> ForwardMode:
+        return self.forward_batch.forward_mode
+
+    def cache_slots(self) -> torch.Tensor:
+        return self.forward_batch.out_cache_loc
+
+    def key_buffer(self, layer_index: int) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        attention_backend = get_attn_backend()
+        assert isinstance(layer, RadixAttention)
+        assert isinstance(attention_backend, HybridLinearAttnBackend)
+        return attention_backend.token_to_kv_pool.get_key_buffer(layer.layer_id)
+
+    def value_buffer(self, layer_index: int) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        attention_backend = get_attn_backend()
+        assert isinstance(layer, RadixAttention)
+        assert isinstance(attention_backend, HybridLinearAttnBackend)
+        return attention_backend.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+    def attend(self, layer_index: int, query: torch.Tensor) -> torch.Tensor:
+        layer = self.layers[layer_index]
+        assert isinstance(layer, RadixAttention)
+        return layer(query, None, None, self.forward_batch, save_kv_cache=False)
+
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class S3DramaTowerPrefill:
