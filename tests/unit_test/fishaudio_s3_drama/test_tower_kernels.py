@@ -31,6 +31,9 @@ from sglang_omni.models.fishaudio_s3_drama.audio_decoder import (
     DecoderLayer,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    VALIDATED_COMPUTE_CAPABILITY,
+)
 from sglang_omni.models.fishaudio_s3_drama.tower_kernels import (
     MAX_FUSED_ROWS,
     fused_tower_layers_unsupported_reason,
@@ -71,6 +74,17 @@ def published_server_args() -> Iterator[None]:
         ),
     ):
         yield
+
+
+def require_validated_gpu() -> None:
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability != VALIDATED_COMPUTE_CAPABILITY:
+        pytest.skip(
+            f"the fused layers are validated only on compute capability "
+            f"{VALIDATED_COMPUTE_CAPABILITY}, this GPU is {compute_capability}"
+        )
+    else:
+        pass
 
 
 class PagedTestAttention:
@@ -408,6 +422,7 @@ def assert_tracks_like_the_plain_path(
 def test_each_kernel_tracks_the_fp32_reference_like_the_plain_path(
     row_count: int,
 ) -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     fused_layers = decoder.fused_layers
@@ -604,6 +619,7 @@ def test_each_kernel_tracks_the_fp32_reference_like_the_plain_path(
 def test_every_fused_layer_tracks_the_fp32_reference_like_the_plain_path(
     row_count: int,
 ) -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     fused_layers = decoder.fused_layers
@@ -675,6 +691,7 @@ def test_every_fused_layer_tracks_the_fp32_reference_like_the_plain_path(
 def test_the_stacked_fused_tower_tracks_the_fp32_reference_like_the_plain_path() -> (
     None
 ):
+    require_validated_gpu()
     device = torch.device("cuda")
     plain_decoder = build_decoder(device)
     decoder = fuse(build_decoder(device), device)
@@ -713,6 +730,7 @@ def test_the_stacked_fused_tower_tracks_the_fp32_reference_like_the_plain_path()
 @accelerator
 @pytest.mark.accelerator
 def test_a_row_gets_the_same_bits_at_every_row_count_and_every_run() -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     first_step, second_step, _ = tower_steps(
@@ -748,6 +766,7 @@ def test_a_row_gets_the_same_bits_at_every_row_count_and_every_run() -> None:
 @pytest.mark.accelerator
 @pytest.mark.parametrize("row_count", GRAPH_ROW_COUNTS)
 def test_a_captured_tower_step_replays_the_eager_bits(row_count: int) -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     first_step, second_step, third_step = tower_steps(
@@ -791,6 +810,7 @@ def test_a_captured_tower_step_replays_the_eager_bits(row_count: int) -> None:
 @accelerator
 @pytest.mark.accelerator
 def test_a_step_writes_only_its_rows_slots_and_skips_slot_zero() -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     step = tower_steps(decoder, 4, seed=17, device=device)[0]
@@ -811,6 +831,7 @@ def test_a_step_writes_only_its_rows_slots_and_skips_slot_zero() -> None:
 @accelerator
 @pytest.mark.accelerator
 def test_launches_reset_their_counters_and_leave_rows_past_the_pass_alone() -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     decoder = fuse(build_decoder(device), device)
     fused_layers = decoder.fused_layers
@@ -899,6 +920,7 @@ def test_launches_reset_their_counters_and_leave_rows_past_the_pass_alone() -> N
     ],
 )
 def test_only_decode_passes_take_the_fused_layers(forward_mode: ForwardMode) -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     plain_decoder = build_decoder(device)
     decoder = fuse(build_decoder(device), device)
@@ -955,6 +977,7 @@ def test_only_decode_passes_take_the_fused_layers(forward_mode: ForwardMode) -> 
 @accelerator
 @pytest.mark.accelerator
 def test_passes_above_the_fused_rows_keep_the_plain_path_bit_for_bit() -> None:
+    require_validated_gpu()
     device = torch.device("cuda")
     plain_decoder = build_decoder(device)
     decoder = fuse(build_decoder(device), device)
@@ -1022,62 +1045,97 @@ def test_the_resolver_takes_only_plain_bf16_layers_and_a_plain_kv_pool(
     device = torch.device("cuda", torch.cuda.current_device())
     decoder = build_decoder(device)
     kv_pool, layer_ids = tower_kv_pool(decoder, device)
-    assert unsupported_reason(decoder, kv_pool, layer_ids, device) is None
-    assert "not a CUDA device" in unsupported_reason(
-        decoder, kv_pool, layer_ids, torch.device("cpu")
-    )
-    assert "has no full-attention KV buffer" in unsupported_reason(
-        decoder, kv_pool, [*layer_ids, 99], device
-    )
-    rotary = decoder.shared_layers[0].self_attn.rotary_embedding
-    assert "rotary table" in decoder.fused_layers_unsupported_reason(
-        kv_pool=kv_pool,
-        tower_layer_ids=layer_ids,
-        context_length=rotary.cos_sin_cache.shape[0] + 1,
-        device=device,
-    )
-    full_pool = kv_pool.full_kv_pool
-    for attribute, value in (
-        ("use_hnd", True),
-        ("kv_cache_layout", "vectorized_5d"),
-        ("store_dtype", torch.uint8),
-        ("page_size", 16),
-    ):
-        original = getattr(full_pool, attribute)
-        setattr(full_pool, attribute, value)
+    with monkeypatch.context() as untested_gpu:
+        untested_gpu.setattr(
+            torch.cuda, "get_device_capability", lambda device=None: (12, 0)
+        )
+        assert (
+            unsupported_reason(decoder, kv_pool, layer_ids, device)
+            == "untested GPU sm_120"
+        )
+    with monkeypatch.context() as validated_gpu:
+        validated_gpu.setattr(
+            torch.cuda,
+            "get_device_capability",
+            lambda device=None: VALIDATED_COMPUTE_CAPABILITY,
+        )
+        assert unsupported_reason(decoder, kv_pool, layer_ids, device) is None
+        assert "not a CUDA device" in unsupported_reason(
+            decoder, kv_pool, layer_ids, torch.device("cpu")
+        )
+        assert "has no full-attention KV buffer" in unsupported_reason(
+            decoder, kv_pool, [*layer_ids, 99], device
+        )
+        rotary = decoder.shared_layers[0].self_attn.rotary_embedding
+        assert "rotary table" in decoder.fused_layers_unsupported_reason(
+            kv_pool=kv_pool,
+            tower_layer_ids=layer_ids,
+            context_length=rotary.cos_sin_cache.shape[0] + 1,
+            device=device,
+        )
+        full_pool = kv_pool.full_kv_pool
+        for attribute, value in (
+            ("use_hnd", True),
+            ("kv_cache_layout", "vectorized_5d"),
+            ("store_dtype", torch.uint8),
+            ("page_size", 16),
+        ):
+            original = getattr(full_pool, attribute)
+            setattr(full_pool, attribute, value)
+            assert "KV pool" in unsupported_reason(decoder, kv_pool, layer_ids, device)
+            setattr(full_pool, attribute, original)
+        kv_pool.full_kv_pool = Mock(spec=MHATokenToKVPool)
         assert "KV pool" in unsupported_reason(decoder, kv_pool, layer_ids, device)
-        setattr(full_pool, attribute, original)
-    kv_pool.full_kv_pool = Mock(spec=MHATokenToKVPool)
-    assert "KV pool" in unsupported_reason(decoder, kv_pool, layer_ids, device)
-    kv_pool.full_kv_pool = full_pool
-    monkeypatch.setattr(
-        tower_kernels,
-        "get_exec",
-        lambda: SimpleNamespace(
-            deterministic=SimpleNamespace(enable_deterministic_inference=True)
-        ),
-    )
-    assert "deterministic" in unsupported_reason(decoder, kv_pool, layer_ids, device)
-    monkeypatch.undo()
-    layer = decoder.residual_layers[2]
-    original_gate_up = layer.mlp.gate_up_proj
-    in_features = original_gate_up.in_features
-    out_features = original_gate_up.out_features
-    for replacement in (
-        nn.Linear(in_features, out_features, bias=True).to(device, torch.bfloat16),
-        nn.Linear(in_features, out_features, bias=False).to(device, torch.float16),
-        type("QuantizedLinear", (nn.Linear,), {})(
-            in_features, out_features, bias=False
-        ).to(device, torch.bfloat16),
-    ):
-        layer.mlp.gate_up_proj = replacement
-        assert "gate_up_proj" in unsupported_reason(decoder, kv_pool, layer_ids, device)
-    layer.mlp.gate_up_proj = original_gate_up
-    original_table = rotary.cos_sin_cache
-    rotary.cos_sin_cache = original_table.half()
-    assert "rotary table" in unsupported_reason(decoder, kv_pool, layer_ids, device)
-    rotary.cos_sin_cache = original_table
-    assert unsupported_reason(decoder, kv_pool, layer_ids, device) is None
+        kv_pool.full_kv_pool = full_pool
+        with monkeypatch.context() as deterministic_inference:
+            deterministic_inference.setattr(
+                tower_kernels,
+                "get_exec",
+                lambda: SimpleNamespace(
+                    deterministic=SimpleNamespace(enable_deterministic_inference=True)
+                ),
+            )
+            assert "deterministic" in unsupported_reason(
+                decoder, kv_pool, layer_ids, device
+            )
+        layer = decoder.residual_layers[2]
+        original_gate_up = layer.mlp.gate_up_proj
+        in_features = original_gate_up.in_features
+        out_features = original_gate_up.out_features
+        for replacement in (
+            nn.Linear(in_features, out_features, bias=True).to(device, torch.bfloat16),
+            nn.Linear(in_features, out_features, bias=False).to(device, torch.float16),
+            type("QuantizedLinear", (nn.Linear,), {})(
+                in_features, out_features, bias=False
+            ).to(device, torch.bfloat16),
+        ):
+            layer.mlp.gate_up_proj = replacement
+            assert "gate_up_proj" in unsupported_reason(
+                decoder, kv_pool, layer_ids, device
+            )
+        layer.mlp.gate_up_proj = original_gate_up
+        original_table = rotary.cos_sin_cache
+        rotary.cos_sin_cache = original_table.half()
+        assert "rotary table" in unsupported_reason(decoder, kv_pool, layer_ids, device)
+        rotary.cos_sin_cache = original_table
+        assert unsupported_reason(decoder, kv_pool, layer_ids, device) is None
+
+
+@accelerator
+@pytest.mark.accelerator
+@pytest.mark.usefixtures("published_server_args")
+def test_this_gpu_takes_the_fused_layers_only_if_validated() -> None:
+    device = torch.device("cuda", torch.cuda.current_device())
+    decoder = build_decoder(device)
+    kv_pool, layer_ids = tower_kv_pool(decoder, device)
+    major, minor = torch.cuda.get_device_capability(device)
+
+    reason = unsupported_reason(decoder, kv_pool, layer_ids, device)
+
+    if (major, minor) == VALIDATED_COMPUTE_CAPABILITY:
+        assert reason is None
+    else:
+        assert reason == f"untested GPU sm_{major}{minor}"
 
 
 def test_the_resolver_needs_triton(
@@ -1096,6 +1154,63 @@ def test_the_resolver_needs_triton(
         device=torch.device("cuda"),
     )
     assert reason == "Triton is not installed"
+
+
+def resolver_reason_with_compute_capability(
+    monkeypatch: pytest.MonkeyPatch, compute_capability: tuple[int, int]
+) -> str | None:
+    monkeypatch.setattr(tower_kernels, "HAS_TRITON", True)
+    monkeypatch.setattr(
+        tower_kernels, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: compute_capability
+    )
+    monkeypatch.setattr(
+        tower_kernels,
+        "get_exec",
+        lambda: SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=True)
+        ),
+    )
+    return fused_tower_layers_unsupported_reason(
+        layers=[],
+        head_count=4,
+        kv_head_count=2,
+        rotary_dim=32,
+        rotary_cos_sin=torch.zeros((8, 32)),
+        context_length=8,
+        kv_pool=Mock(spec=HybridLinearKVPool),
+        tower_layer_ids=[],
+        device=torch.device("cuda"),
+    )
+
+
+def test_compute_capability_9_0_goes_on_to_the_next_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reason = resolver_reason_with_compute_capability(monkeypatch, (9, 0))
+
+    assert reason is not None and reason.startswith("deterministic inference is on")
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_reason"),
+    [
+        ((8, 6), "untested GPU sm_86"),
+        ((8, 9), "untested GPU sm_89"),
+        ((10, 0), "untested GPU sm_100"),
+        ((12, 0), "untested GPU sm_120"),
+    ],
+)
+def test_other_compute_capabilities_keep_the_module_path(
+    monkeypatch: pytest.MonkeyPatch,
+    compute_capability: tuple[int, int],
+    expected_reason: str,
+) -> None:
+    reason = resolver_reason_with_compute_capability(monkeypatch, compute_capability)
+
+    assert reason == expected_reason
 
 
 def test_tower_kernels_import_without_triton() -> None:

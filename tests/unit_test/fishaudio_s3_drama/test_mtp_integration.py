@@ -1049,6 +1049,11 @@ def test_setup_model_reports_first_frame_graphs_off_without_cuda_graphs(
             "Triton is not installed",
             "S3-drama codebook sampling: PyTorch, Triton is not installed",
         ),
+        (
+            True,
+            "untested GPU sm_120",
+            "S3-drama codebook sampling: PyTorch, untested GPU sm_120",
+        ),
         (True, None, "S3-drama codebook sampling: Triton kernels"),
     ],
 )
@@ -1096,6 +1101,11 @@ def test_setup_model_picks_the_codebook_sampler_and_logs_why(
             True,
             "Triton is not installed",
             "S3-drama tower fused layers: off, Triton is not installed",
+        ),
+        (
+            True,
+            "untested GPU sm_120",
+            "S3-drama tower fused layers: off, untested GPU sm_120",
         ),
         (
             True,

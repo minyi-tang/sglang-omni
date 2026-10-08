@@ -29,6 +29,7 @@ PHILOX_SEED_MODULUS = 1 << 63
 FIRST_DRAW_STREAM = 0
 RAS_DRAW_STREAM = 1
 FIRST_CODEBOOK_HEAD_STREAM = 2
+VALIDATED_COMPUTE_CAPABILITY = (9, 0)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -527,6 +528,14 @@ def main_block_width(candidate_count: int) -> int:
     return 1 << (candidate_count.bit_length() - 1)
 
 
+def untested_gpu_reason(device: torch.device) -> str | None:
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) == VALIDATED_COMPUTE_CAPABILITY:
+        return None
+    else:
+        return f"untested GPU sm_{major}{minor}"
+
+
 def triton_sampling_unsupported_reason(
     device: torch.device, codebook_size: int, candidate_count: int
 ) -> str | None:
@@ -535,6 +544,8 @@ def triton_sampling_unsupported_reason(
         return "Triton is not installed"
     elif device.type != "cuda" or not current_platform.is_cuda():
         return f"device {device} is not a CUDA device of the CUDA platform"
+    elif (gpu_reason := untested_gpu_reason(device)) is not None:
+        return gpu_reason
     elif not SELECTED_CANDIDATES <= codebook_size <= MAX_BLOCK_WIDTH:
         return (
             f"codebook size {codebook_size} is outside "

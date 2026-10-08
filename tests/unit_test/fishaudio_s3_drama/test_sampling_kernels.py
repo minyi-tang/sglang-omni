@@ -26,6 +26,7 @@ from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
     SCORE_KEY_BITS,
     SELECTED_CANDIDATES,
     TAIL_BLOCK_WIDTH,
+    VALIDATED_COMPUTE_CAPABILITY,
     CodebookSampler,
     triton_sampling_unsupported_reason,
 )
@@ -190,6 +191,18 @@ def require_triton_device() -> None:
         pass
 
 
+def require_validated_gpu() -> None:
+    require_triton_device()
+    compute_capability = torch.cuda.get_device_capability()
+    if compute_capability != VALIDATED_COMPUTE_CAPABILITY:
+        pytest.skip(
+            f"the Triton kernels are validated only on compute capability "
+            f"{VALIDATED_COMPUTE_CAPABILITY}, this GPU is {compute_capability}"
+        )
+    else:
+        pass
+
+
 def sampler(step: int) -> CodebookSampler:
     return CodebookSampler(
         step=torch.tensor(step, dtype=torch.int64, device="cuda"), seed=SEED
@@ -325,7 +338,7 @@ def draw_problems(sampled: torch.Tensor, reference: ReferenceDraws) -> list[str]
 def test_head_kernel_draws_what_the_reference_draws_with_the_same_noise(
     width: int, rows: int
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     generator = torch.Generator().manual_seed(width * 1000 + rows)
     logits = head_logits(rows, width, generator)
     temperature, top_k, top_p = mixed_parameters(rows, generator)
@@ -372,7 +385,7 @@ def semantic_inputs(
 def test_semantic_kernel_draws_what_the_reference_draws_with_the_same_noise(
     codebook_size: int, rows: int
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     generator = torch.Generator().manual_seed(codebook_size * 1000 + rows)
     semantic_logits, candidates = semantic_inputs(rows, codebook_size, generator)
     temperature, top_k, top_p = mixed_parameters(rows, generator)
@@ -473,7 +486,7 @@ def kept_probabilities(
 def test_kept_probabilities_follow_the_rule_on_both_branches(
     force_search: bool,
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     rows, width = 300, 1024
     generator = torch.Generator().manual_seed(3)
     logits = head_logits(rows, width, generator)
@@ -521,7 +534,7 @@ def test_kept_probabilities_follow_the_rule_on_both_branches(
 
 @pytest.mark.accelerator
 def test_threshold_search_needs_every_round_of_the_key_width() -> None:
-    require_triton_device()
+    require_validated_gpu()
     logits = torch.ones(1, 64, dtype=torch.bfloat16, device="cuda")
     logits[0, -1] = -1.0
     parameters = (
@@ -544,7 +557,7 @@ def test_threshold_search_needs_every_round_of_the_key_width() -> None:
 
 @pytest.mark.accelerator
 def test_tied_and_signed_zero_scores_split_by_column() -> None:
-    require_triton_device()
+    require_validated_gpu()
     logits = torch.full((2, 64), -3.0, dtype=torch.float32)
     logits[0, :40] = 0.0
     logits[0, 1::2] = -0.0
@@ -581,7 +594,7 @@ def test_tied_and_signed_zero_scores_split_by_column() -> None:
 def test_non_finite_rows_stay_in_range_and_leave_other_rows_alone(
     bad_value: float,
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     rows, width = 16, 4096
     generator = torch.Generator().manual_seed(9)
     logits = head_logits(rows, width, generator)
@@ -604,7 +617,7 @@ def test_non_finite_rows_stay_in_range_and_leave_other_rows_alone(
 
 @pytest.mark.accelerator
 def test_graph_replays_read_the_step_and_parameters_at_replay() -> None:
-    require_triton_device()
+    require_validated_gpu()
     rows, width, codebook_size = 64, 4096, 4096
     generator = torch.Generator().manual_seed(17)
     logits = head_logits(rows, width, generator)
@@ -678,7 +691,7 @@ def test_graph_replays_read_the_step_and_parameters_at_replay() -> None:
 
 @pytest.mark.accelerator
 def test_streams_and_steps_draw_independent_noise() -> None:
-    require_triton_device()
+    require_validated_gpu()
     rows, width = 4096, 64
     pair_count = rows // 2
     logits = torch.zeros(rows, width, dtype=torch.bfloat16, device="cuda")
@@ -722,17 +735,50 @@ def test_streams_and_steps_draw_independent_noise() -> None:
         )
 
 
-def test_unsupported_devices_and_widths_keep_the_pytorch_path() -> None:
+def test_unsupported_devices_and_widths_keep_the_pytorch_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert triton_sampling_unsupported_reason(torch.device("cpu"), 4096, 4097)
     if HAS_TRITON and torch.cuda.is_available():
         cuda = torch.device("cuda")
-        assert triton_sampling_unsupported_reason(cuda, 4096, 4097) is None
-        assert triton_sampling_unsupported_reason(cuda, 64, 65) is None
-        assert triton_sampling_unsupported_reason(cuda, 16, 17)
-        assert triton_sampling_unsupported_reason(cuda, 8192, 8193)
-        assert triton_sampling_unsupported_reason(cuda, 4096, 4096 + 40)
+        with monkeypatch.context() as validated_gpu:
+            validated_gpu.setattr(
+                torch.cuda,
+                "get_device_capability",
+                lambda device=None: VALIDATED_COMPUTE_CAPABILITY,
+            )
+            assert triton_sampling_unsupported_reason(cuda, 4096, 4097) is None
+            assert triton_sampling_unsupported_reason(cuda, 64, 65) is None
+            assert triton_sampling_unsupported_reason(cuda, 16, 17)
+            assert triton_sampling_unsupported_reason(cuda, 8192, 8193)
+            assert triton_sampling_unsupported_reason(cuda, 4096, 4096 + 40)
     else:
         pass
+
+
+@pytest.mark.accelerator
+def test_this_gpu_takes_the_triton_kernels_only_if_validated() -> None:
+    require_triton_device()
+    major, minor = torch.cuda.get_device_capability()
+
+    reason = triton_sampling_unsupported_reason(torch.device("cuda"), 4096, 4097)
+
+    if (major, minor) == VALIDATED_COMPUTE_CAPABILITY:
+        assert reason is None
+    else:
+        assert reason == f"untested GPU sm_{major}{minor}"
+
+
+def patch_cuda_platform(
+    monkeypatch: pytest.MonkeyPatch, compute_capability: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(sampling_kernels, "HAS_TRITON", True)
+    monkeypatch.setattr(
+        sampling_kernels, "current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: compute_capability
+    )
 
 
 @pytest.mark.parametrize(
@@ -741,16 +787,42 @@ def test_unsupported_devices_and_widths_keep_the_pytorch_path() -> None:
 def test_rows_of_32_columns_keep_the_pytorch_path(
     monkeypatch: pytest.MonkeyPatch, codebook_size: int, candidate_count: int
 ) -> None:
-    monkeypatch.setattr(sampling_kernels, "HAS_TRITON", True)
-    monkeypatch.setattr(
-        sampling_kernels, "current_platform", SimpleNamespace(is_cuda=lambda: True)
-    )
+    patch_cuda_platform(monkeypatch, (9, 0))
     cuda = torch.device("cuda")
 
     reason = triton_sampling_unsupported_reason(cuda, codebook_size, candidate_count)
 
     assert reason is not None and "tied logits" in reason
     assert triton_sampling_unsupported_reason(cuda, 33, 33) is None
+
+
+def test_compute_capability_9_0_takes_the_triton_kernels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    patch_cuda_platform(monkeypatch, (9, 0))
+
+    assert triton_sampling_unsupported_reason(torch.device("cuda"), 4096, 4097) is None
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_reason"),
+    [
+        ((8, 6), "untested GPU sm_86"),
+        ((8, 9), "untested GPU sm_89"),
+        ((10, 0), "untested GPU sm_100"),
+        ((12, 0), "untested GPU sm_120"),
+    ],
+)
+def test_other_compute_capabilities_keep_the_pytorch_path(
+    monkeypatch: pytest.MonkeyPatch,
+    compute_capability: tuple[int, int],
+    expected_reason: str,
+) -> None:
+    patch_cuda_platform(monkeypatch, compute_capability)
+
+    reason = triton_sampling_unsupported_reason(torch.device("cuda"), 4096, 4097)
+
+    assert reason == expected_reason
 
 
 def tied_columns(width: int) -> list[list[int]]:
@@ -762,7 +834,7 @@ def tied_columns(width: int) -> list[list[int]]:
 def test_head_kernel_breaks_top_k_one_ties_like_the_pytorch_sampler(
     width: int,
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     rows = tied_columns(width)
     logits = torch.zeros(len(rows), width, device="cuda")
     for row, columns in enumerate(rows):
@@ -788,7 +860,7 @@ def test_head_kernel_breaks_top_k_one_ties_like_the_pytorch_sampler(
 def test_semantic_kernel_breaks_top_k_one_ties_like_the_pytorch_sampler(
     candidate_count: int,
 ) -> None:
-    require_triton_device()
+    require_validated_gpu()
     codebook_size = candidate_count - 1
     candidates = torch.cat(
         (

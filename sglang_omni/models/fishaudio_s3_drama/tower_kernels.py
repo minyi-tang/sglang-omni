@@ -7,6 +7,8 @@ from typing import Protocol
 import torch
 from torch import nn
 
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import untested_gpu_reason
+
 try:
     import triton
     import triton.language as tl
@@ -1089,6 +1091,8 @@ def fused_tower_layers_unsupported_reason(
         return "Triton is not installed"
     elif device.type != "cuda" or not current_platform.is_cuda():
         return f"device {device} is not a CUDA device of the CUDA platform"
+    elif (gpu_reason := untested_gpu_reason(device)) is not None:
+        return gpu_reason
     elif get_exec().deterministic.enable_deterministic_inference:
         return (
             f"deterministic inference is on, and passes above {MAX_FUSED_ROWS} rows "

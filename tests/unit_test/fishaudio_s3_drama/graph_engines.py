@@ -463,6 +463,7 @@ def engine_facts(
         kv_pool_size=sglang_runner.token_to_kv_pool.size,
         max_kv_splits=full_attention_backend.max_kv_splits,
         multiprocessor_count=full_attention_backend.device_core_count,
+        device_capability=torch.cuda.get_device_capability(),
         expert_paths=expert_paths,
         tower_prefill_runs_before_serving=model.tower_prefill_runs.extend_mode,
         tower_prefill_runs_outside_extend=model.tower_prefill_runs.other_modes,

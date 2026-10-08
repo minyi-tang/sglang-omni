@@ -171,6 +171,7 @@ class GraphEngineFacts:
     kv_pool_size: int
     max_kv_splits: int
     multiprocessor_count: int
+    device_capability: tuple[int, int]
     expert_paths: list[ExpertPath]
     tower_prefill_runs_before_serving: int
     tower_prefill_runs_outside_extend: int

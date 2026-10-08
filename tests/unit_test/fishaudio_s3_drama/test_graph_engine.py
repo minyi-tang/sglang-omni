@@ -14,6 +14,9 @@ import pytest
 import torch
 
 from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
+from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
+    VALIDATED_COMPUTE_CAPABILITY,
+)
 from sglang_omni.models.fishaudio_s3_drama.tower_kernels import MAX_FUSED_ROWS
 from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     EnginePair,
@@ -366,6 +369,10 @@ def first_problems(problems: list[str]) -> str:
     return "\n".join(problems[:REPORTED_PROBLEM_COUNT])
 
 
+def is_on_validated_gpu(run: GraphEngineRun) -> bool:
+    return run.facts.device_capability == VALIDATED_COMPUTE_CAPABILITY
+
+
 def test_engines_start_as_specified(engine_runs: GraphEngineRuns) -> None:
     for name, pair in all_pairs(engine_runs).items():
         eager_facts = pair.eager.facts
@@ -713,7 +720,7 @@ def test_triton_sampling_engines_match_bit_for_bit_and_step_once_per_forward(
                 history_problems(run, pair.scenarios)
                 + finite_problems(run)
                 + outcome_problems(run)
-                + sampling_step_problems(run, True)
+                + sampling_step_problems(run, is_on_validated_gpu(run))
             )
         assert not problems, f"{name}:\n{first_problems(problems)}"
     eager_forwards = engine_runs.triton_main.eager.forwards
@@ -737,13 +744,14 @@ def test_sampling_step_check_catches_a_changed_or_mislabeled_run(
     engine_runs: GraphEngineRuns,
 ) -> None:
     triton_run = engine_runs.triton_main.graph
+    is_triton_sampling = is_on_validated_gpu(triton_run)
     record = triton_run.forwards[len(triton_run.forwards) // 2]
     changed_run = with_record(
         triton_run, replace(record, sampling_step=record.sampling_step + 1)
     )
-    assert len(sampling_step_problems(changed_run, True)) == 1
+    assert len(sampling_step_problems(changed_run, is_triton_sampling)) == 1
     assert sampling_step_problems(engine_runs.main.graph, True)
-    assert sampling_step_problems(triton_run, False)
+    assert sampling_step_problems(triton_run, not is_triton_sampling)
 
 
 def test_fused_layers_run_each_eager_decode_step_and_no_tower_prefill(
@@ -755,19 +763,23 @@ def test_fused_layers_run_each_eager_decode_step_and_no_tower_prefill(
         "triton prefill main": engine_runs.triton_prefill_main,
     }
     for name, pair in pairs.items():
-        is_fused = name not in UNFUSED_PAIR_NAMES
         for run in (pair.eager, pair.graph):
+            is_fused = name not in UNFUSED_PAIR_NAMES and is_on_validated_gpu(run)
             problems = fused_layer_problems(run, is_fused)
             assert not problems, f"{name} {run.kind}:\n{first_problems(problems)}"
             assert fused_layer_problems(run, not is_fused), f"{name} {run.kind}"
-    tower_layer_count = len(engine_runs.main.eager.facts.tower_layer_ids)
+    expected_calls = (
+        len(engine_runs.main.eager.facts.tower_layer_ids)
+        if is_on_validated_gpu(engine_runs.main.eager)
+        else 0
+    )
     eager_forwards = engine_runs.main.eager.forwards
     assert any(
-        record.is_extend and record.fused_layer_calls == tower_layer_count
+        record.is_extend and record.fused_layer_calls == expected_calls
         for record in eager_forwards
     )
     assert any(
-        not record.is_extend and record.fused_layer_calls == tower_layer_count
+        not record.is_extend and record.fused_layer_calls == expected_calls
         for record in eager_forwards
     )
 
@@ -777,6 +789,14 @@ def test_fused_layer_check_catches_a_changed_record(
 ) -> None:
     eager_run = engine_runs.main.eager
     graph_run = engine_runs.main.graph
+    if not is_on_validated_gpu(eager_run):
+        pytest.skip(
+            f"the fused layers run only on compute capability "
+            f"{VALIDATED_COMPUTE_CAPABILITY}, this GPU is "
+            f"{eager_run.facts.device_capability}"
+        )
+    else:
+        pass
     extend = next(record for record in eager_run.forwards if record.is_extend)
     decode = next(record for record in eager_run.forwards if not record.is_extend)
     replayed = next(
@@ -819,12 +839,16 @@ def test_tower_prefill_writes_the_unfused_bits_and_the_decode_step_fuses(
                 bits(fused_step.written_cache[:, :-1]),
                 bits(unfused_step.written_cache[:, :-1]),
             ), (fused_extend.forward_index, fused_step.request_id)
-    tower_layer_count = len(engine_runs.main.eager.facts.tower_layer_ids)
+    expected_calls = (
+        len(engine_runs.main.eager.facts.tower_layer_ids)
+        if is_on_validated_gpu(engine_runs.main.eager)
+        else 0
+    )
     first_decode = next(
         record for record in engine_runs.main.eager.forwards if not record.is_extend
     )
-    assert fused_extends[0].fused_layer_calls == tower_layer_count
-    assert first_decode.fused_layer_calls == tower_layer_count
+    assert fused_extends[0].fused_layer_calls == expected_calls
+    assert first_decode.fused_layer_calls == expected_calls
 
 
 def test_decode_attention_keeps_the_standard_kernel(
