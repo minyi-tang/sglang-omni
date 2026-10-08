@@ -109,6 +109,8 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "first_frame_cuda_graphs": True,
         "first_frame_cuda_graph_max_requests": 16,
         "triton_sampling": True,
+        "enable_async_decode": False,
+        "async_decode_min_batch_size": 1,
         "stream_stride": 10,
         "stream_followup_stride_ramp": (10, 12, 32),
         "stream_followup_stride": 64,
@@ -122,6 +124,22 @@ def test_each_factory_gets_the_defaults_written_once() -> None:
         "decode_dtype": "float16",
         "max_new_tokens": 2048,
     }
+
+
+def test_the_engine_takes_the_async_decode_switches() -> None:
+    config = ConfigManager(S3DramaPipelineConfig(model_path="checkpoint")).merge_config(
+        [
+            ("tts_engine.factory.enable_async_decode", "true"),
+            ("tts_engine.factory.async_decode_min_batch_size", "4"),
+        ]
+    )
+    assert isinstance(config, S3DramaPipelineConfig)
+
+    engine_kwargs = launch_kwargs(config, "tts_engine")
+    assert (
+        engine_kwargs["enable_async_decode"],
+        engine_kwargs["async_decode_min_batch_size"],
+    ) == (True, 4)
 
 
 def test_preprocessing_follows_the_engine_cap_and_the_vocoder_codec() -> None:

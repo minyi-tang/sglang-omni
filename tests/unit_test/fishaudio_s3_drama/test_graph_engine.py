@@ -25,6 +25,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_checks import (
     generator_offset_problems,
     history_problems,
     lean_problems,
+    lookahead_problems,
     outcome_problems,
     prefill_path_problems,
     prompt_row_counts,
@@ -82,6 +83,12 @@ SMALL_BUDGET_MAX_PREFILL_TOKENS = 32
 SMALL_BUDGET_CONTEXT_LENGTH = 112
 FIRST_FRAME_REQUEST_COUNTS = list(range(1, max(CUDA_GRAPH_BATCH_SIZES) + 1))
 LOW_FIRST_FRAME_CAP = 3
+LOOKAHEAD_PAIR_NAMES = {
+    "lookahead main",
+    "lookahead prefill main",
+    "lookahead retract",
+    "lookahead prefill retract",
+}
 # One line per problem is enough to locate the first divergence.
 REPORTED_PROBLEM_COUNT = 20
 
@@ -100,6 +107,10 @@ class GraphEngineRuns:
     first_frame_on_against_off: EnginePair
     triton_main: EnginePair
     triton_prefill_main: EnginePair
+    lookahead_main: EnginePair
+    lookahead_prefill_main: EnginePair
+    lookahead_retract: EnginePair
+    lookahead_prefill_retract: EnginePair
     workdir: Path
 
 
@@ -157,6 +168,8 @@ def engine_pairs(
     workdir: Path,
     extra_environment: dict[str, str],
     triton_sampling: bool,
+    *,
+    enable_async_decode: bool,
 ) -> tuple[EnginePair, EnginePair]:
     runs: dict[EngineKind, GraphEngineRun] = {}
     for kind in ("eager", "graph", "prefill_graph"):
@@ -164,6 +177,7 @@ def engine_pairs(
             model_dir=str(model_dir),
             kind=kind,
             triton_sampling=triton_sampling,
+            enable_async_decode=enable_async_decode,
             scenarios=scenarios,
         )
         runs[kind] = run_engine(f"{name}-{kind}", spec, workdir, extra_environment)
@@ -186,10 +200,22 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
     write_expert_variant(checkpoint_dir, fp8_checkpoint_dir, "fp8")
     # Serial on purpose: each engine owns its process and its share of the GPU.
     main, prefill_main = engine_pairs(
-        "main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}, False
+        "main",
+        checkpoint_dir,
+        MAIN_SCENARIOS,
+        workdir,
+        {},
+        False,
+        enable_async_decode=False,
     )
     fp8, prefill_fp8 = engine_pairs(
-        "fp8", fp8_checkpoint_dir, FP8_SCENARIOS, workdir, {}, False
+        "fp8",
+        fp8_checkpoint_dir,
+        FP8_SCENARIOS,
+        workdir,
+        {},
+        False,
+        enable_async_decode=False,
     )
     retract, prefill_retract = engine_pairs(
         "retract",
@@ -198,9 +224,34 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         workdir,
         RETRACT_ENVIRONMENT,
         False,
+        enable_async_decode=False,
     )
     triton_main, triton_prefill_main = engine_pairs(
-        "triton-main", checkpoint_dir, MAIN_SCENARIOS, workdir, {}, True
+        "triton-main",
+        checkpoint_dir,
+        MAIN_SCENARIOS,
+        workdir,
+        {},
+        True,
+        enable_async_decode=False,
+    )
+    lookahead_main, lookahead_prefill_main = engine_pairs(
+        "lookahead-main",
+        checkpoint_dir,
+        MAIN_SCENARIOS,
+        workdir,
+        {},
+        False,
+        enable_async_decode=True,
+    )
+    lookahead_retract, lookahead_prefill_retract = engine_pairs(
+        "lookahead-retract",
+        checkpoint_dir,
+        RETRACT_SCENARIOS,
+        workdir,
+        RETRACT_ENVIRONMENT,
+        False,
+        enable_async_decode=True,
     )
     small_budget_runs = {
         kind: run_engine(
@@ -262,6 +313,10 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> GraphEngineRuns:
         ),
         triton_main=triton_main,
         triton_prefill_main=triton_prefill_main,
+        lookahead_main=lookahead_main,
+        lookahead_prefill_main=lookahead_prefill_main,
+        lookahead_retract=lookahead_retract,
+        lookahead_prefill_retract=lookahead_prefill_retract,
         workdir=workdir,
     )
     print(f"Artifacts: {workdir}")
@@ -279,6 +334,10 @@ def all_pairs(engine_runs: GraphEngineRuns) -> dict[str, EnginePair]:
         "prefill small budget": engine_runs.prefill_small_budget,
         "first-frame off": engine_runs.first_frame_off,
         "first-frame low cap": engine_runs.first_frame_low_cap,
+        "lookahead main": engine_runs.lookahead_main,
+        "lookahead prefill main": engine_runs.lookahead_prefill_main,
+        "lookahead retract": engine_runs.lookahead_retract,
+        "lookahead prefill retract": engine_runs.lookahead_prefill_retract,
     }
 
 
@@ -337,6 +396,52 @@ def test_engines_start_as_specified(engine_runs: GraphEngineRuns) -> None:
         assert expert_path.runner_backend == "TRITON"
         assert expert_path.uses_fp8_w8a8
         assert expert_path.block_shape == [128, 128]
+
+
+def test_lookahead_engines_launch_each_decode_ahead_and_discard_only_ends(
+    engine_runs: GraphEngineRuns,
+) -> None:
+    for name, pair in all_pairs(engine_runs).items():
+        is_lookahead = name in LOOKAHEAD_PAIR_NAMES
+        for run in (pair.eager, pair.graph):
+            problems = lookahead_problems(run, is_lookahead)
+            assert not problems, f"{name}:\n{first_problems(problems)}"
+            assert lookahead_problems(run, not is_lookahead), name
+            assert (
+                any(
+                    step.is_discarded
+                    for record in run.forwards
+                    for step in record.steps
+                )
+                == is_lookahead
+            ), name
+    run = engine_runs.lookahead_main.graph
+    decode_records = [record for record in run.forwards if not record.is_extend]
+    record, kept_step = next(
+        (record, step)
+        for record, next_record in zip(decode_records, decode_records[1:])
+        for step in record.steps
+        if not step.is_discarded
+        and step.request_id in {later.request_id for later in next_record.steps}
+    )
+    wrongly_discarded = replace(
+        run,
+        forwards=[
+            (
+                replace(
+                    candidate,
+                    steps=[
+                        replace(step, is_discarded=True) if step is kept_step else step
+                        for step in candidate.steps
+                    ],
+                )
+                if candidate is record
+                else candidate
+            )
+            for candidate in run.forwards
+        ],
+    )
+    assert lookahead_problems(wrongly_discarded, True)
 
 
 def test_both_engines_run_the_same_batches(engine_runs: GraphEngineRuns) -> None:

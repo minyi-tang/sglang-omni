@@ -8,6 +8,8 @@ Decode steps go through the model's fixed buffers, which a decode CUDA graph rea
 
 from __future__ import annotations
 
+import dataclasses
+
 import torch
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
@@ -46,12 +48,41 @@ from sglang_omni.vendor.sglang.core import (
 )
 
 
-def ras_window(frame_rows: list[list[int]]) -> list[int]:
-    """Main tokens of the last 16 frames, oldest first, left-padded with EMPTY_RAS_SLOT.
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class S3DramaDecodeStatePool:
+    frames: torch.Tensor
+    ras_windows: torch.Tensor
+    temperature: torch.Tensor
+    top_k: torch.Tensor
+    top_p: torch.Tensor
+    row_indices: torch.Tensor
 
-    Built from the whole history each step, so a retracted request re-prefilled
-    from that history gets the same window it would have had.
-    """
+    @classmethod
+    def allocate(
+        cls, *, request_slot_count: int, frame_width: int, device: torch.device
+    ) -> S3DramaDecodeStatePool:
+        row_count = request_slot_count + 1
+        return cls(
+            frames=torch.zeros(
+                (row_count, frame_width), dtype=torch.int64, device=device
+            ),
+            ras_windows=torch.full(
+                (row_count, RAS_WINDOW_FRAMES),
+                EMPTY_RAS_SLOT,
+                dtype=torch.int64,
+                device=device,
+            ),
+            temperature=torch.ones(row_count, dtype=torch.float32, device=device),
+            top_k=torch.ones(row_count, dtype=torch.int64, device=device),
+            top_p=torch.ones(row_count, dtype=torch.float32, device=device),
+            row_indices=torch.zeros(
+                request_slot_count, dtype=torch.int64, device=device
+            ),
+        )
+
+
+def ras_window(frame_rows: list[list[int]]) -> list[int]:
+    """Main tokens of the last 16 frames, oldest first, left-padded with EMPTY_RAS_SLOT."""
     main_tokens = [frame_row[0] for frame_row in frame_rows[-RAS_WINDOW_FRAMES:]]
     return [EMPTY_RAS_SLOT] * (RAS_WINDOW_FRAMES - len(main_tokens)) + main_tokens
 
@@ -81,18 +112,6 @@ def extend_frame_rows(data: S3DramaRequestData) -> list[list[int]]:
         return data.frame_rows
 
 
-def decode_frame_row(data: S3DramaRequestData) -> list[int]:
-    """The newest frame, the input row of a decode step."""
-    req = data.req
-    assert req is not None
-    if len(data.frame_rows) != req.seqlen:
-        raise RuntimeError(
-            f"{req.rid}: {len(data.frame_rows)} frames for a sequence of {req.seqlen}"
-        )
-    else:
-        return data.frame_rows[-1]
-
-
 def request_data_of(request: SchedulerRequest) -> S3DramaRequestData:
     data = request.data
     assert isinstance(data, S3DramaRequestData)
@@ -106,54 +125,6 @@ def request_ids_of(batch_request_data: list[S3DramaRequestData]) -> list[str]:
         assert request is not None
         request_ids.append(request.rid)
     return request_ids
-
-
-def stage_decode_rows(
-    buffers: S3DramaDecodeBuffers, batch_request_data: list[S3DramaRequestData]
-) -> None:
-    """Copy each request's newest frame, RAS window and sampling knobs into its row,
-    in place, since a captured decode graph reads these addresses."""
-    row_count = len(batch_request_data)
-    buffers.frames[:row_count].copy_(
-        torch.tensor(
-            [decode_frame_row(request_data) for request_data in batch_request_data],
-            dtype=torch.int64,
-        )
-    )
-    buffers.ras_windows[:row_count].copy_(
-        torch.tensor(
-            [
-                ras_window(request_data.frame_rows)
-                for request_data in batch_request_data
-            ],
-            dtype=torch.int64,
-        )
-    )
-    buffers.temperature[:row_count].copy_(
-        torch.tensor(
-            [request_data.temperature for request_data in batch_request_data],
-            dtype=torch.float32,
-        )
-    )
-    buffers.top_k[:row_count].copy_(
-        torch.tensor(
-            [request_data.top_k for request_data in batch_request_data],
-            dtype=torch.int64,
-        )
-    )
-    buffers.top_p[:row_count].copy_(
-        torch.tensor(
-            [request_data.top_p for request_data in batch_request_data],
-            dtype=torch.float32,
-        )
-    )
-
-
-def sampled_decode_frames(
-    buffers: S3DramaDecodeBuffers, row_count: int
-) -> torch.Tensor:
-    """The frames the last decode forward sampled, copied before the next overwrites them."""
-    return buffers.sampled_frames[:row_count].clone()
 
 
 class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
@@ -227,41 +198,167 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         else:
             pass
         self.decode_buffers: S3DramaDecodeBuffers = decode_buffers
+        self.request_slot_count = request_pool.size
+        self.state_pool = S3DramaDecodeStatePool.allocate(
+            request_slot_count=request_pool.size,
+            frame_width=decode_buffers.frames.shape[1],
+            device=self.device,
+        )
+        self.row_launch_key: tuple[tuple[str, ...], tuple[int, ...]] | None = None
+        self.row_upload_buffers: list[torch.Tensor] = []
+        self.row_upload_slot = 0
+        self.prefill_inputs: S3DramaStepInputs | None = None
 
     def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
-        """Interface contract; never eligible, since collection publishes the frame."""
-        return False
+        return True
+
+    def state_rows(self, batch_request_data: list[S3DramaRequestData]) -> list[int]:
+        rows = []
+        for request_data in batch_request_data:
+            request = request_data.req
+            assert request is not None
+            row = request.kv.req_pool_idx
+            if row is None or not 0 < row <= self.request_slot_count:
+                raise RuntimeError(
+                    f"{request.rid}: request slot {row} has no state row"
+                )
+            else:
+                rows.append(row)
+        return rows
+
+    def gather_decode_rows(
+        self, batch_request_data: list[S3DramaRequestData], request_ids: list[str]
+    ) -> None:
+        state_pool = self.state_pool
+        rows = self.state_rows(batch_request_data)
+        row_count = len(rows)
+        row_launch_key = (tuple(request_ids), tuple(rows))
+        if row_launch_key != self.row_launch_key:
+            host_rows = self.pinned_pingpong(
+                "row_upload_buffers",
+                "row_upload_slot",
+                (row_count,),
+                torch.int64,
+                realloc_on_grow=True,
+            )
+            host_rows.numpy()[:row_count] = rows
+            state_pool.row_indices[:row_count].copy_(
+                host_rows[:row_count], non_blocking=True
+            )
+            self.row_launch_key = row_launch_key
+        else:
+            pass
+        row_indices = state_pool.row_indices[:row_count]
+        buffers = self.decode_buffers
+        torch.index_select(
+            state_pool.frames, 0, row_indices, out=buffers.frames[:row_count]
+        )
+        torch.index_select(
+            state_pool.ras_windows, 0, row_indices, out=buffers.ras_windows[:row_count]
+        )
+        torch.index_select(
+            state_pool.temperature, 0, row_indices, out=buffers.temperature[:row_count]
+        )
+        torch.index_select(
+            state_pool.top_k, 0, row_indices, out=buffers.top_k[:row_count]
+        )
+        torch.index_select(
+            state_pool.top_p, 0, row_indices, out=buffers.top_p[:row_count]
+        )
+
+    def publish_decode_frames(self, row_count: int) -> torch.Tensor:
+        state_pool = self.state_pool
+        row_indices = state_pool.row_indices[:row_count]
+        frames = self.decode_buffers.sampled_frames[:row_count].clone()
+        ras_windows = state_pool.ras_windows.index_select(0, row_indices)
+        state_pool.frames.index_copy_(0, row_indices, frames)
+        state_pool.ras_windows.index_copy_(
+            0, row_indices, torch.cat((ras_windows[:, 1:], frames[:, :1]), dim=1)
+        )
+        return frames
+
+    def initialize_state_rows(
+        self,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+        first_frames: torch.Tensor,
+    ) -> None:
+        prefill_inputs = self.prefill_inputs
+        request_ids = request_ids_of([request_data_of(request) for request in requests])
+        if prefill_inputs is None or prefill_inputs.request_ids != request_ids:
+            raise RuntimeError(
+                f"the staged prefill inputs are for "
+                f"{None if prefill_inputs is None else prefill_inputs.request_ids}, "
+                f"not the batch's {request_ids}"
+            )
+        elif forward_batch is None:
+            raise RuntimeError("an S3-drama prefill has no forward batch")
+        else:
+            state_pool = self.state_pool
+            rows = forward_batch.req_pool_indices.to(torch.int64)
+            state_pool.frames.index_copy_(0, rows, first_frames)
+            state_pool.ras_windows.index_copy_(
+                0,
+                rows,
+                torch.cat(
+                    (prefill_inputs.ras_windows[:, 1:], first_frames[:, :1]), dim=1
+                ),
+            )
+            state_pool.temperature.index_copy_(0, rows, prefill_inputs.temperature)
+            state_pool.top_k.index_copy_(0, rows, prefill_inputs.top_k)
+            state_pool.top_p.index_copy_(0, rows, prefill_inputs.top_p)
+
+    def prepare_and_forward(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+        is_prefill: bool,
+        *,
+        is_lookahead: bool = False,
+    ) -> GenerationBatchResult:
+        try:
+            return super().prepare_and_forward(
+                forward_batch,
+                schedule_batch,
+                requests,
+                is_prefill,
+                is_lookahead=is_lookahead,
+            )
+        except BaseException:
+            self.prefill_inputs = None
+            raise
 
     def stage_step(
         self, requests: list[SchedulerRequest], frame_rows: list[list[int]]
-    ) -> None:
+    ) -> S3DramaStepInputs:
         request_data = [request_data_of(request) for request in requests]
-        self.model.step_exchange.stage(
-            S3DramaStepInputs(
-                request_ids=request_ids_of(request_data),
-                frames=torch.tensor(frame_rows, dtype=torch.int64, device=self.device),
-                ras_windows=torch.tensor(
-                    [ras_window(data.frame_rows) for data in request_data],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                temperature=torch.tensor(
-                    [data.temperature for data in request_data],
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-                top_k=torch.tensor(
-                    [data.top_k for data in request_data],
-                    dtype=torch.int64,
-                    device=self.device,
-                ),
-                top_p=torch.tensor(
-                    [data.top_p for data in request_data],
-                    dtype=torch.float32,
-                    device=self.device,
-                ),
-            )
+        step_inputs = S3DramaStepInputs(
+            request_ids=request_ids_of(request_data),
+            frames=torch.tensor(frame_rows, dtype=torch.int64, device=self.device),
+            ras_windows=torch.tensor(
+                [ras_window(data.frame_rows) for data in request_data],
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            temperature=torch.tensor(
+                [data.temperature for data in request_data],
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            top_k=torch.tensor(
+                [data.top_k for data in request_data],
+                dtype=torch.int64,
+                device=self.device,
+            ),
+            top_p=torch.tensor(
+                [data.top_p for data in request_data],
+                dtype=torch.float32,
+                device=self.device,
+            ),
         )
+        self.model.step_exchange.stage(step_inputs)
+        return step_inputs
 
     def before_prefill(
         self,
@@ -271,10 +368,11 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
     ) -> None:
         """Stage every request's whole frame history; the batch arguments are the
         interface contract."""
+        self.prefill_inputs = None
         frame_rows: list[list[int]] = []
         for request in requests:
             frame_rows.extend(extend_frame_rows(request_data_of(request)))
-        self.stage_step(requests, frame_rows)
+        self.prefill_inputs = self.stage_step(requests, frame_rows)
 
     def cleanup_prefill(
         self,
@@ -303,7 +401,7 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
                 f"{None if forward_batch is None else forward_batch.rids}"
             )
         else:
-            stage_decode_rows(self.decode_buffers, batch_request_data)
+            self.gather_decode_rows(batch_request_data, request_ids)
 
     def collect_frames(
         self,
@@ -322,8 +420,13 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        """Collect the first frames; the batch arguments are the interface contract."""
-        self.collect_frames(result, requests, self.model.step_exchange.take_frames())
+        """Collect the first frames; the schedule batch is the interface contract."""
+        try:
+            first_frames = self.model.step_exchange.take_frames()
+            self.initialize_state_rows(forward_batch, requests, first_frames)
+            self.collect_frames(result, requests, first_frames)
+        finally:
+            self.prefill_inputs = None
 
     def post_decode(
         self,
@@ -333,8 +436,45 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
         requests: list[SchedulerRequest],
     ) -> None:
         """Collect the next frames; the batch arguments are the interface contract."""
-        self.collect_frames(
-            result,
-            requests,
-            sampled_decode_frames(self.decode_buffers, len(requests)),
-        )
+        self.collect_frames(result, requests, self.publish_decode_frames(len(requests)))
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor | None:
+        if not requests:
+            return None
+        else:
+            row_count = len(requests)
+            frames = self.publish_decode_frames(row_count)
+            host_frames = self.next_host_staging(tuple(frames.shape), frames.dtype)
+            host_frames[:row_count].copy_(frames, non_blocking=True)
+            result.next_token_ids = frames[:, 0]
+            return host_frames
+
+    def post_decode_resolve(
+        self,
+        launch_buf: torch.Tensor | None,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        if launch_buf is None or not requests:
+            return
+        else:
+            frames = launch_buf[: len(requests)]
+            kept_rows = []
+            for row, request in enumerate(requests):
+                sglang_request = request_data_of(request).req
+                assert sglang_request is not None
+                if sglang_request.finished() or self.req_is_retracted(sglang_request):
+                    pass
+                else:
+                    kept_rows.append(row)
+            self.collect_frames(
+                result, [requests[row] for row in kept_rows], frames[kept_rows]
+            )
+            result.next_token_ids = frames[:, 0]

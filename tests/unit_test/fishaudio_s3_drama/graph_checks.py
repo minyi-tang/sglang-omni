@@ -133,6 +133,7 @@ def value_fields(step: GraphRequestStep) -> dict[str, str]:
         "sampling knobs": repr((step.temperature, step.top_k, step.top_p)),
         "draws": repr((step.first_draw, step.ras_draw)),
         "linear-attention state": step.state_digest,
+        "discarded": repr(step.is_discarded),
     }
 
 
@@ -263,7 +264,10 @@ def history_problems(run: GraphEngineRun, scenarios: list[GraphScenario]) -> lis
                 for name in expected
                 if actual[name] != expected[name]
             )
-            history.append(step.sampled_frame)
+            if step.is_discarded:
+                pass
+            else:
+                history.append(step.sampled_frame)
     return problems
 
 
@@ -393,12 +397,22 @@ def stray_write_problems(run: GraphEngineRun) -> list[str]:
     ]
 
 
-def outcome_problems(run: GraphEngineRun) -> list[str]:
-    """One result per finished request, holding its frames; aborts end silently."""
+def kept_sampled_frames(run: GraphEngineRun) -> dict[str, list[list[int]]]:
     sampled_frames: dict[str, list[list[int]]] = {}
     for record in run.forwards:
         for step in record.steps:
-            sampled_frames.setdefault(step.request_id, []).append(step.sampled_frame)
+            if step.is_discarded:
+                pass
+            else:
+                sampled_frames.setdefault(step.request_id, []).append(
+                    step.sampled_frame
+                )
+    return sampled_frames
+
+
+def outcome_problems(run: GraphEngineRun) -> list[str]:
+    """One result per finished request, holding its frames; aborts end silently."""
+    sampled_frames = kept_sampled_frames(run)
     problems = [
         f"{run.kind} scenario {scenario.name} left free pools at "
         f"{scenario.idle_free_counts}, not {run.baseline_free_counts}"
@@ -432,10 +446,7 @@ def outcome_problems(run: GraphEngineRun) -> list[str]:
 
 def stream_problems(run: GraphEngineRun) -> list[str]:
     window = S3DramaVocoderFactoryArgs()
-    sampled_frames: dict[str, list[list[int]]] = {}
-    for record in run.forwards:
-        for step in record.steps:
-            sampled_frames.setdefault(step.request_id, []).append(step.sampled_frame)
+    sampled_frames = kept_sampled_frames(run)
     problems = []
     for request_id, outcome in run.outcomes.items():
         request_frames = sampled_frames.get(request_id, [])
@@ -580,4 +591,48 @@ def lean_problems(run: GraphEngineRun) -> list[str]:
         for choice in record.lean_choices
         if choice.is_lean
     )
+    return problems
+
+
+def lookahead_problems(run: GraphEngineRun, is_lookahead: bool) -> list[str]:
+    facts = run.facts
+    switches = (
+        facts.enable_async_decode,
+        facts.async_decode_min_batch_size,
+        facts.async_decode_resolve_before_prefill,
+    )
+    problems = []
+    if switches != (is_lookahead, 1, True):
+        problems.append(
+            f"{run.kind} async decode switches {switches}, expected "
+            f"{(is_lookahead, 1, True)}"
+        )
+    else:
+        pass
+    follows_a_discarded_step: dict[str, bool] = {}
+    for record in run.forwards:
+        if not record.is_extend and record.is_lookahead != is_lookahead:
+            problems.append(
+                f"{run.kind} {forward_name(record)}: lookahead is "
+                f"{record.is_lookahead}, expected {is_lookahead}"
+            )
+        else:
+            pass
+        for step in record.steps:
+            if step.is_discarded and not is_lookahead:
+                problems.append(
+                    f"{run.kind} {forward_name(record)} {step.request_id}: "
+                    f"discarded without lookahead"
+                )
+            elif (
+                follows_a_discarded_step.get(step.request_id, False)
+                and not record.is_extend
+            ):
+                problems.append(
+                    f"{run.kind} {forward_name(record)} {step.request_id}: a decode "
+                    f"step follows a discarded one"
+                )
+            else:
+                pass
+            follows_a_discarded_step[step.request_id] = step.is_discarded
     return problems

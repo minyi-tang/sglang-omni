@@ -36,11 +36,16 @@ from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.registry import ModelRegistry
 from torch import nn
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.fishaudio_s3_drama.engine_builder import (
     FISH_OMNI_ARCHITECTURE,
     S3DramaEngineBuilder,
 )
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
+from sglang_omni.models.fishaudio_s3_drama.model_runner import (
+    S3DramaModelRunner,
+    request_data_of,
+)
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     S3DramaGenerationInput,
     S3DramaGenerationResult,
@@ -57,6 +62,9 @@ from sglang_omni.scheduling.bootstrap import InfrastructureOptions
 from sglang_omni.scheduling.engine_factory import GenerationDefaults
 from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
+from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.vendor.sglang.core import GenerationBatchResult, ScheduleBatch
 from tests.unit_test.fishaudio_s3_drama.mtp_fixtures import (
     EngineFacts,
     EngineRun,
@@ -410,6 +418,51 @@ def load_facts(model: RecordingS3DramaModel) -> LoadFacts:
     )
 
 
+class LookaheadRecordingRunner(S3DramaModelRunner):
+    model: RecordingS3DramaModel
+
+    def __init__(
+        self, tp_worker: ModelWorker, output_processor: SGLangOutputProcessor
+    ) -> None:
+        super().__init__(tp_worker, output_processor)
+        self.lookahead_forward_indices: list[int] = []
+        self.unresolved_forward_indices: list[int] = []
+        self.discarded_steps: list[tuple[int, str]] = []
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor | None:
+        launch_buffer = super().post_decode_launch(result, forward_batch, requests)
+        forward_index = len(self.model.forwards) - 1
+        self.lookahead_forward_indices.append(forward_index)
+        self.unresolved_forward_indices.append(forward_index)
+        return launch_buffer
+
+    def post_decode_resolve(
+        self,
+        launch_buf: torch.Tensor | None,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        forward_index = self.unresolved_forward_indices[0]
+        for request in requests:
+            sglang_request = request_data_of(request).req
+            assert sglang_request is not None
+            if sglang_request.finished() or self.req_is_retracted(sglang_request):
+                self.discarded_steps.append((forward_index, request.request_id))
+            else:
+                pass
+        super().post_decode_resolve(
+            launch_buf, result, forward_batch, schedule_batch, requests
+        )
+        self.unresolved_forward_indices.pop(0)
+
+
 class RecordingEngineBuilder(S3DramaEngineBuilder):
     """The production builder serving RecordingS3DramaModel with the spec's knobs."""
 
@@ -417,6 +470,8 @@ class RecordingEngineBuilder(S3DramaEngineBuilder):
         super().__init__(
             context_length=spec.context_length,
             max_running_requests=spec.max_running_requests,
+            enable_async_decode=spec.enable_async_decode,
+            async_decode_min_batch_size=spec.async_decode_min_batch_size,
         )
         self.spec = spec
 
@@ -436,6 +491,11 @@ class RecordingEngineBuilder(S3DramaEngineBuilder):
     def infra_kwargs(self) -> InfrastructureOptions:
         return {"total_gpu_memory_fraction": self.spec.total_gpu_memory_fraction}
 
+    def make_model_runner(
+        self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor
+    ) -> LookaheadRecordingRunner:
+        return LookaheadRecordingRunner(model_worker, output_proc)
+
 
 class SchedulerDriver:
     """Feeds OmniScheduler's inbox and files its outbox per request."""
@@ -444,10 +504,12 @@ class SchedulerDriver:
         self,
         scheduler: OmniScheduler[S3DramaRequestData],
         model: RecordingS3DramaModel,
+        runner: LookaheadRecordingRunner,
         prompts: dict[str, list[list[int]]],
     ) -> None:
         self.scheduler = scheduler
         self.model = model
+        self.runner = runner
         self.prompts = prompts
         self.outcomes: dict[str, RequestOutcome] = {}
         self.failures: list[BaseException] = []
@@ -585,11 +647,21 @@ class SchedulerDriver:
             kv_token_count=self.scheduler.token_to_kv_pool_allocator.available_size(),
         )
 
+    def is_pipeline_drained(self) -> bool:
+        return (
+            self.scheduler.async_pending is None
+            and self.scheduler.previous_pending_decode is None
+            and not self.runner.unresolved_forward_indices
+        )
+
     def wait_for_idle(self, baseline: FreePoolCounts) -> FreePoolCounts:
-        """Free counts once every slot is back, or the last counts on timeout."""
+        """Free counts once every slot is back and no launched step is left to
+        resolve, or the last counts on timeout."""
         deadline = time.monotonic() + IDLE_TIMEOUT_SECONDS
         free_counts = self.free_pool_counts()
-        while free_counts != baseline and time.monotonic() < deadline:
+        while (
+            free_counts != baseline or not self.is_pipeline_drained()
+        ) and time.monotonic() < deadline:
             self.pump()
             free_counts = self.free_pool_counts()
         return free_counts
@@ -653,7 +725,9 @@ def run_engine(spec: EngineSpec) -> EngineRun:
     scheduler = builder.build(spec.model_dir, dtype="bfloat16")
     sglang_runner = scheduler.tp_worker.model_runner
     model = sglang_runner.model
+    runner = scheduler.model_runner
     assert isinstance(model, RecordingS3DramaModel)
+    assert isinstance(runner, LookaheadRecordingRunner)
     if spec.record_moe_calls:
         model.record_moe_calls()
     else:
@@ -672,9 +746,14 @@ def run_engine(spec: EngineSpec) -> EngineRun:
         chunked_prefill_size=scheduler.chunked_prefill_size,
         max_prefill_tokens=scheduler.max_prefill_tokens,
         max_running_requests=scheduler.max_running_requests,
+        enable_async_decode=scheduler.enable_async_decode,
+        async_decode_min_batch_size=scheduler.async_decode_min_batch_size,
+        async_decode_resolve_before_prefill=(
+            scheduler.async_decode_resolve_before_prefill
+        ),
     )
     logger.info(f"S3-drama test engine: {facts}")
-    driver = SchedulerDriver(scheduler, model, spec.prompts)
+    driver = SchedulerDriver(scheduler, model, runner, spec.prompts)
     baseline = driver.free_pool_counts()
     driver.start()
     try:
@@ -683,6 +762,13 @@ def run_engine(spec: EngineSpec) -> EngineRun:
         ]
     finally:
         driver.stop_and_drain()
+    if runner.unresolved_forward_indices:
+        raise RuntimeError(
+            f"forwards {runner.unresolved_forward_indices} were launched but never "
+            f"resolved"
+        )
+    else:
+        pass
     return EngineRun(
         facts=facts,
         load_facts=load_facts(model),
@@ -690,6 +776,8 @@ def run_engine(spec: EngineSpec) -> EngineRun:
         scenarios=scenarios,
         outcomes=driver.outcomes,
         forwards=model.forwards,
+        lookahead_forward_indices=runner.lookahead_forward_indices,
+        discarded_steps=runner.discarded_steps,
     )
 
 

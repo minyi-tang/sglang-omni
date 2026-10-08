@@ -78,6 +78,8 @@ class GraphEngineSpec(BaseModel):
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     )
     triton_sampling: bool = False
+    enable_async_decode: bool = False
+    async_decode_min_batch_size: int = 1
     prompts: dict[str, list[list[int]]] = PROMPTS
     scenarios: list[GraphScenario]
 
@@ -111,6 +113,7 @@ class GraphRequestStep:
     final_state: list[torch.Tensor] | None
     semantic_logits: torch.Tensor
     head_logits: torch.Tensor
+    is_discarded: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -125,6 +128,7 @@ class GraphForwardRecord:
     forward_index: int
     scenario_name: str
     is_extend: bool
+    is_lookahead: bool
     is_graph_replay: bool
     graph_batch_size: int | None
     token_count: int
@@ -174,6 +178,9 @@ class GraphEngineFacts:
     lean_attention_override: bool | None
     startup_lean_choices: list[LeanChoice]
     uses_triton_sampling: bool
+    enable_async_decode: bool
+    async_decode_min_batch_size: int
+    async_decode_resolve_before_prefill: bool
 
 
 @dataclass(kw_only=True)

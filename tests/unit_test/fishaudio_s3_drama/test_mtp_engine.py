@@ -110,6 +110,7 @@ SAME_ENGINE_TOLERANCES = BackboneTolerances(
 class EngineRuns:
     main: EngineRun
     test_retract: EngineRun
+    is_lookahead: bool
     workdir: Path
 
 
@@ -160,9 +161,13 @@ def run_engine(
     return run
 
 
-@pytest.fixture(scope="module")
-def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> EngineRuns:
+@pytest.fixture(scope="module", params=[False, True], ids=["sync", "lookahead"])
+def engine_runs(
+    tmp_path_factory: pytest.TempPathFactory, request: pytest.FixtureRequest
+) -> EngineRuns:
     require_cuda()
+    is_lookahead = request.param
+    assert isinstance(is_lookahead, bool)
     workdir = tmp_path_factory.mktemp("s3_drama_mtp")
     checkpoint_dir = workdir / "checkpoint"
     write_synthetic_checkpoint(checkpoint_dir)
@@ -175,6 +180,7 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> EngineRuns:
         total_gpu_memory_fraction=TOTAL_GPU_MEMORY_FRACTION,
         prompts=PROMPTS,
         scenarios=MAIN_SCENARIOS,
+        enable_async_decode=is_lookahead,
     )
     # Serial on purpose: each engine owns its process and its share of the GPU.
     main = run_engine("main", spec, workdir, {})
@@ -188,7 +194,12 @@ def engine_runs(tmp_path_factory: pytest.TempPathFactory) -> EngineRuns:
         },
     )
     print(f"Artifacts: {workdir}")
-    return EngineRuns(main=main, test_retract=test_retract, workdir=workdir)
+    return EngineRuns(
+        main=main,
+        test_retract=test_retract,
+        is_lookahead=is_lookahead,
+        workdir=workdir,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -263,10 +274,14 @@ def dense_tower(
 
 
 def request_steps(run: EngineRun) -> dict[str, list[RequestStep]]:
+    discarded_steps = set(run.discarded_steps)
     steps: dict[str, list[RequestStep]] = {}
     for forward in run.forwards:
         for step in forward.steps:
-            steps.setdefault(step.request_id, []).append(step)
+            if (forward.forward_index, step.request_id) in discarded_steps:
+                pass
+            else:
+                steps.setdefault(step.request_id, []).append(step)
     return steps
 
 
@@ -697,6 +712,79 @@ def test_every_request_finishes_once_with_its_frames(engine_runs: EngineRuns) ->
     assert not problems, "\n".join(problems[:40])
 
 
+def lookahead_problems(run: EngineRun, is_lookahead: bool) -> list[str]:
+    facts = run.facts
+    switches = (
+        facts.enable_async_decode,
+        facts.async_decode_min_batch_size,
+        facts.async_decode_resolve_before_prefill,
+    )
+    decode_forward_indices = [
+        forward.forward_index for forward in run.forwards if not forward.is_extend
+    ]
+    problems = []
+    if switches != (is_lookahead, 1, True):
+        problems.append(
+            f"async decode switches {switches}, expected {(is_lookahead, 1, True)}"
+        )
+    else:
+        pass
+    if run.lookahead_forward_indices != (
+        decode_forward_indices if is_lookahead else []
+    ):
+        problems.append(
+            f"{len(run.lookahead_forward_indices)} of {len(decode_forward_indices)} "
+            f"decode forwards launched ahead"
+        )
+    else:
+        pass
+    discarded_steps = set(run.discarded_steps)
+    follows_a_discarded_step: dict[str, bool] = {}
+    for forward in run.forwards:
+        for step in forward.steps:
+            if (
+                follows_a_discarded_step.get(step.request_id, False)
+                and not step.is_extend
+            ):
+                problems.append(
+                    f"forward {forward.forward_index} {step.request_id}: a decode "
+                    f"step follows a discarded one"
+                )
+            else:
+                pass
+            follows_a_discarded_step[step.request_id] = (
+                forward.forward_index,
+                step.request_id,
+            ) in discarded_steps
+    return problems
+
+
+def test_lookahead_engines_launch_each_decode_ahead_and_discard_only_ends(
+    engine_runs: EngineRuns,
+) -> None:
+    for run in (engine_runs.main, engine_runs.test_retract):
+        assert not lookahead_problems(run, engine_runs.is_lookahead)
+        assert lookahead_problems(run, not engine_runs.is_lookahead)
+    run = engine_runs.main
+    assert bool(run.discarded_steps) == engine_runs.is_lookahead
+    decode_forward_indices: dict[str, list[int]] = {}
+    for forward in run.forwards:
+        for step in forward.steps:
+            if forward.is_extend:
+                pass
+            else:
+                decode_forward_indices.setdefault(step.request_id, []).append(
+                    forward.forward_index
+                )
+    request_id, forward_indices = max(
+        decode_forward_indices.items(), key=lambda item: len(item[1])
+    )
+    wrongly_discarded = replace(
+        run, discarded_steps=[*run.discarded_steps, (forward_indices[0], request_id)]
+    )
+    assert lookahead_problems(wrongly_discarded, engine_runs.is_lookahead)
+
+
 def test_backbone_matches_single_request_runs(engine_runs: EngineRuns) -> None:
     """Both engines against the main engine's single runs of the same prompts."""
     single_runs = single_request_runs(engine_runs.main)
@@ -824,12 +912,16 @@ def with_changed_step(
     run: EngineRun, request_id: str, step_index: int, change: StepChange
 ) -> EngineRun:
     """A copy of run in which the step_index-th step of request_id went through change."""
+    discarded_steps = set(run.discarded_steps)
     changed_forwards = []
     seen_step_count = 0
     for forward in run.forwards:
         steps = []
         for step in forward.steps:
-            if step.request_id != request_id:
+            if (
+                step.request_id != request_id
+                or (forward.forward_index, step.request_id) in discarded_steps
+            ):
                 steps.append(step)
             elif seen_step_count == step_index:
                 steps.append(change(step))

@@ -23,6 +23,8 @@ from sglang_omni.model_runner.request_id_prefill_cuda_graph_runner import (
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
 from sglang_omni.models.fishaudio_s3_drama import CAPABILITIES
 from sglang_omni.models.fishaudio_s3_drama.config import (
+    DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
+    DEFAULT_ENABLE_ASYNC_DECODE,
     DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS,
     DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
     DEFAULT_MAX_NEW_TOKENS_CAP,
@@ -100,6 +102,8 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
             DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
         ),
         triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
+        enable_async_decode: bool = DEFAULT_ENABLE_ASYNC_DECODE,
+        async_decode_min_batch_size: int = DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
     ) -> None:
         self.context_length = context_length
         self.max_running_requests = max_running_requests
@@ -111,6 +115,8 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
         self.first_frame_cuda_graphs = first_frame_cuda_graphs
         self.first_frame_cuda_graph_max_requests = first_frame_cuda_graph_max_requests
         self.triton_sampling = triton_sampling
+        self.enable_async_decode = enable_async_decode
+        self.async_decode_min_batch_size = async_decode_min_batch_size
         self.frame_streamer: S3DramaFrameStreamer | None = None
         self.sglang_runner: SGLModelRunner | None = None
 
@@ -346,4 +352,19 @@ class S3DramaEngineBuilder(SGLangGenerationEngineBuilder[S3DramaRequestData]):
     def extra_scheduler_kwargs(self) -> SchedulerExtras[S3DramaRequestData]:
         """The frame streamer make_adapters created, which build calls first."""
         assert self.frame_streamer is not None
-        return {"stream_output_builder": self.frame_streamer}
+        if self.enable_async_decode:
+            logger.info(
+                f"S3-drama async decode: on, lookahead from batch size "
+                f"{self.async_decode_min_batch_size}"
+            )
+        else:
+            logger.info(
+                "S3-drama async decode: off, "
+                "tts_engine.factory.enable_async_decode is false"
+            )
+        return {
+            "stream_output_builder": self.frame_streamer,
+            "enable_async_decode": self.enable_async_decode,
+            "async_decode_min_batch_size": self.async_decode_min_batch_size,
+            "async_decode_resolve_before_prefill": True,
+        }

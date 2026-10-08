@@ -175,6 +175,8 @@ class EngineSpec(BaseModel):
     prompts: dict[str, list[list[int]]]
     scenarios: list[Scenario]
     record_moe_calls: bool = False
+    enable_async_decode: bool = False
+    async_decode_min_batch_size: int = 1
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -260,6 +262,9 @@ class EngineFacts:
     chunked_prefill_size: int | None
     max_prefill_tokens: int
     max_running_requests: int
+    enable_async_decode: bool
+    async_decode_min_batch_size: int
+    async_decode_resolve_before_prefill: bool
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -300,6 +305,8 @@ class EngineRun:
     scenarios: list[ScenarioOutcome]
     outcomes: dict[str, RequestOutcome]
     forwards: list[ForwardRecord]
+    lookahead_forward_indices: list[int]
+    discarded_steps: list[tuple[int, str]]
 
 
 def prompt_rows(length: int, seed: int) -> list[list[int]]:

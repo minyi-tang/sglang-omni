@@ -22,7 +22,6 @@ from sglang_omni.models.fishaudio_s3_drama.model_runner import (
     S3DramaModelRunner,
     request_data_of,
 )
-from sglang_omni.models.fishaudio_s3_drama.request_builders import S3DramaRequestData
 from sglang_omni.models.fishaudio_s3_drama.sampling import EMPTY_RAS_SLOT
 from sglang_omni.models.fishaudio_s3_drama.sglang_model import S3DramaStepInputs
 from sglang_omni.scheduling.message import IncomingMessage
@@ -110,6 +109,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.first_frame_eager_snapshot = 0
         self.first_frame_sampler_calls_snapshot = 0
         self.lean_choice_count_snapshot = 0
+        self.unresolved_forward_indices: list[int] = []
 
     def state_buffers(self) -> list[torch.Tensor]:
         """Every linear-attention state tensor, [layers, slots, ...]."""
@@ -120,15 +120,20 @@ class GraphRecordingRunner(S3DramaModelRunner):
         request_data = request_data_of(request)
         return len(request_data.frame_rows) - request_data.prompt_row_count
 
-    def stage_end_of_speech(self, requests: list[SchedulerRequest]) -> None:
+    def stage_end_of_speech(
+        self, forward_batch: ForwardBatch | None, requests: list[SchedulerRequest]
+    ) -> None:
+        assert forward_batch is not None
         end_of_speech_logits = [
             (
                 FORCED_END_OF_SPEECH_LOGIT
                 if self.request_specs[request.request_id].end_at_frame
-                == self.sampled_count(request)
+                == sequence_length - request_data_of(request).prompt_row_count
                 else float("-inf")
             )
-            for request in requests
+            for sequence_length, request in zip(
+                forward_batch.seq_lens_cpu.tolist(), requests, strict=True
+            )
         ]
         recording_buffers = self.model.recording_buffers
         assert recording_buffers is not None
@@ -177,7 +182,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
         else:
             pass
         self.staged_prefill_inputs = staged_inputs
-        self.stage_end_of_speech(requests)
+        self.stage_end_of_speech(forward_batch, requests)
         self.take_snapshots()
 
     def before_decode(
@@ -197,7 +202,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
             self.decode_buffers.ras_windows[:row_count].fill_(EMPTY_RAS_SLOT)
         else:
             pass
-        self.stage_end_of_speech(requests)
+        self.stage_end_of_speech(forward_batch, requests)
         self.take_snapshots()
 
     def post_prefill(
@@ -209,7 +214,15 @@ class GraphRecordingRunner(S3DramaModelRunner):
     ) -> None:
         super().post_prefill(result, forward_batch, schedule_batch, requests)
         assert forward_batch is not None
-        self.record_forward(result, forward_batch, requests, is_extend=True)
+        self.record_forward(
+            result,
+            forward_batch,
+            requests,
+            [request_data_of(request).frame_rows[-1] for request in requests],
+            is_extend=True,
+            is_lookahead=False,
+        )
+        self.abort_requests_due(requests)
 
     def post_decode(
         self,
@@ -220,15 +233,76 @@ class GraphRecordingRunner(S3DramaModelRunner):
     ) -> None:
         super().post_decode(result, forward_batch, schedule_batch, requests)
         assert forward_batch is not None
-        self.record_forward(result, forward_batch, requests, is_extend=False)
+        self.record_forward(
+            result,
+            forward_batch,
+            requests,
+            [request_data_of(request).frame_rows[-1] for request in requests],
+            is_extend=False,
+            is_lookahead=False,
+        )
+        self.abort_requests_due(requests)
+
+    def post_decode_launch(
+        self,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor | None:
+        launch_buffer = super().post_decode_launch(result, forward_batch, requests)
+        assert forward_batch is not None
+        self.record_forward(
+            result,
+            forward_batch,
+            requests,
+            self.decode_buffers.sampled_frames[: len(requests)].tolist(),
+            is_extend=False,
+            is_lookahead=True,
+        )
+        self.unresolved_forward_indices.append(len(self.forwards) - 1)
+        return launch_buffer
+
+    def post_decode_resolve(
+        self,
+        launch_buf: torch.Tensor | None,
+        result: GenerationBatchResult,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> None:
+        forward_index = self.unresolved_forward_indices[0]
+        kept_requests = []
+        for request in requests:
+            sglang_request = request_data_of(request).req
+            assert sglang_request is not None
+            if sglang_request.finished() or self.req_is_retracted(sglang_request):
+                pass
+            else:
+                kept_requests.append(request)
+        kept_request_ids = {request.request_id for request in kept_requests}
+        record = self.forwards[forward_index]
+        self.forwards[forward_index] = replace(
+            record,
+            steps=[
+                replace(step, is_discarded=step.request_id not in kept_request_ids)
+                for step in record.steps
+            ],
+        )
+        super().post_decode_resolve(
+            launch_buf, result, forward_batch, schedule_batch, requests
+        )
+        self.abort_requests_due(kept_requests)
+        self.unresolved_forward_indices.pop(0)
 
     def record_forward(
         self,
         result: GenerationBatchResult,
         forward_batch: ForwardBatch,
         requests: list[SchedulerRequest],
+        sampled_frames: list[list[int]],
         *,
         is_extend: bool,
+        is_lookahead: bool,
     ) -> None:
         recording_buffers = self.model.recording_buffers
         assert recording_buffers is not None
@@ -240,6 +314,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
             row_starts = list(range(request_count))
             row_counts = [1] * request_count
         positions = forward_batch.positions.tolist()
+        sequence_lengths = forward_batch.seq_lens_cpu.tolist()
         written_slots = forward_batch.out_cache_loc.tolist()
         request_pool_rows = forward_batch.req_pool_indices.tolist()
         mamba_slots = self.request_pool.translate_mamba_indices(
@@ -327,7 +402,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
                     top_p=top_p[index],
                     first_draw=draws[index][0],
                     ras_draw=draws[index][1],
-                    sampled_frame=request_data.frame_rows[-1],
+                    sampled_frame=sampled_frames[index],
                     written_cache=self.written_cache(written_slots[forward_rows]),
                     state_digest=state_digest.hexdigest(),
                     is_state_finite=all(
@@ -335,7 +410,11 @@ class GraphRecordingRunner(S3DramaModelRunner):
                     ),
                     final_state=(
                         state
-                        if self.is_last_step(request_data, request.request_id)
+                        if self.is_last_step(
+                            sampled_frames[index],
+                            sequence_lengths[index] - request_data.prompt_row_count + 1,
+                            request.request_id,
+                        )
                         else None
                     ),
                     semantic_logits=recording_buffers.semantic_logits[index].cpu(),
@@ -347,6 +426,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 forward_index=len(self.forwards),
                 scenario_name=self.scenario_name,
                 is_extend=is_extend,
+                is_lookahead=is_lookahead,
                 is_graph_replay=is_graph_replay,
                 graph_batch_size=(
                     self.decode_graph_runner.bs
@@ -384,7 +464,6 @@ class GraphRecordingRunner(S3DramaModelRunner):
                 stray_mamba_slots=stray_mamba_slots,
             )
         )
-        self.abort_requests_due(requests)
 
     def written_cache(self, slots: list[int]) -> torch.Tensor:
         """[full-attention layers, slots, 2, kv width] as the pool stores them."""
@@ -404,11 +483,12 @@ class GraphRecordingRunner(S3DramaModelRunner):
             ]
         ).cpu()
 
-    def is_last_step(self, request_data: S3DramaRequestData, request_id: str) -> bool:
+    def is_last_step(
+        self, sampled_frame: list[int], sampled_count: int, request_id: str
+    ) -> bool:
         return (
-            request_data.frame_rows[-1][0] == self.model.config.eos_token_id
-            or len(request_data.frame_rows) - request_data.prompt_row_count
-            == self.request_specs[request_id].max_new_tokens
+            sampled_frame[0] == self.model.config.eos_token_id
+            or sampled_count == self.request_specs[request_id].max_new_tokens
         )
 
     def abort_requests_due(self, requests: list[SchedulerRequest]) -> None:

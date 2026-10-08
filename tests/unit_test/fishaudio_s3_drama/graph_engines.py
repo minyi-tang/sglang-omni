@@ -90,6 +90,8 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
             first_frame_cuda_graphs=spec.first_frame_cuda_graphs,
             first_frame_cuda_graph_max_requests=spec.first_frame_cuda_graph_max_requests,
             triton_sampling=spec.triton_sampling,
+            enable_async_decode=spec.enable_async_decode,
+            async_decode_min_batch_size=spec.async_decode_min_batch_size,
         )
         self.spec = spec
         self.capture_break_recorder = CaptureBreakRecorder(
@@ -293,6 +295,7 @@ class GraphSchedulerDriver:
         while not (
             self.scheduler.running_batch.is_empty()
             and self.scheduler.last_batch is None
+            and self.is_pipeline_drained()
         ):
             if time.monotonic() > deadline:
                 raise TimeoutError("the scheduler never went idle before a wave")
@@ -343,11 +346,21 @@ class GraphSchedulerDriver:
             kv_token_count=self.scheduler.token_to_kv_pool_allocator.available_size(),
         )
 
+    def is_pipeline_drained(self) -> bool:
+        return (
+            self.scheduler.async_pending is None
+            and self.scheduler.previous_pending_decode is None
+            and not self.runner.unresolved_forward_indices
+        )
+
     def wait_for_idle(self, baseline: FreePoolCounts) -> FreePoolCounts:
-        """Free counts once every slot is back, or the last counts on timeout."""
+        """Free counts once every slot is back and no launched step is left to
+        resolve, or the last counts on timeout."""
         deadline = time.monotonic() + IDLE_TIMEOUT_SECONDS
         free_counts = self.free_pool_counts()
-        while free_counts != baseline and time.monotonic() < deadline:
+        while (
+            free_counts != baseline or not self.is_pipeline_drained()
+        ) and time.monotonic() < deadline:
             self.pump()
             free_counts = self.free_pool_counts()
         return free_counts
@@ -453,6 +466,11 @@ def engine_facts(
         lean_attention_override=full_attention_backend.enable_lean_attention,
         startup_lean_choices=list(builder.lean_choice_recorder.choices),
         uses_triton_sampling=model.audio_decoder.sampler is not None,
+        enable_async_decode=scheduler.enable_async_decode,
+        async_decode_min_batch_size=scheduler.async_decode_min_batch_size,
+        async_decode_resolve_before_prefill=(
+            scheduler.async_decode_resolve_before_prefill
+        ),
     )
 
 
@@ -507,6 +525,13 @@ def run_engine(spec: GraphEngineSpec) -> GraphEngineRun:
         ]
     finally:
         driver.stop_and_drain()
+    if runner.unresolved_forward_indices:
+        raise RuntimeError(
+            f"forwards {runner.unresolved_forward_indices} were launched but never "
+            f"resolved"
+        )
+    else:
+        pass
     for request_id, sampled_count in runner.aborted_after_frames.items():
         driver.outcomes[request_id].aborted_after_frames = sampled_count
     return GraphEngineRun(

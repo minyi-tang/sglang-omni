@@ -23,7 +23,9 @@ from sglang_omni.models.fishaudio_s3_drama.channels_last_decoder import (
     ChannelsLastDecoder,
 )
 from sglang_omni.models.fishaudio_s3_drama.config import (
+    DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
     DEFAULT_CONTEXT_LENGTH,
+    DEFAULT_ENABLE_ASYNC_DECODE,
     DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS,
     DEFAULT_FIRST_FRAME_CUDA_GRAPHS,
     DEFAULT_MAX_NEW_TOKENS_CAP,
@@ -158,6 +160,8 @@ def create_tts_engine_executor(
         DEFAULT_FIRST_FRAME_CUDA_GRAPH_MAX_REQUESTS
     ),
     triton_sampling: bool = DEFAULT_TRITON_SAMPLING,
+    enable_async_decode: bool = DEFAULT_ENABLE_ASYNC_DECODE,
+    async_decode_min_batch_size: int = DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
 ) -> OmniScheduler[S3DramaRequestData]:
     """The engine; max_new_tokens caps a request that sets none."""
     overrides = dict(server_args_overrides or {})
@@ -186,6 +190,8 @@ def create_tts_engine_executor(
         first_frame_cuda_graphs=first_frame_cuda_graphs,
         first_frame_cuda_graph_max_requests=first_frame_cuda_graph_max_requests,
         triton_sampling=triton_sampling,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     ).build(
         model_path,
         device=device,

@@ -281,7 +281,9 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
             builder.max_running_requests,
             builder.max_prompt_rows,
             builder.max_new_tokens_cap,
-        ) == (4096, 4, 1024, 512)
+            builder.enable_async_decode,
+            builder.async_decode_min_batch_size,
+        ) == (4096, 4, 1024, 512, True, 3)
         return "engine"
 
     monkeypatch.setattr(S3DramaEngineBuilder, "build", build)
@@ -294,6 +296,8 @@ def test_the_engine_factory_hands_its_knobs_to_the_builder(
         max_new_tokens=512,
         max_prompt_rows=1024,
         server_args_overrides={"mem_fraction_static": 0.5},
+        enable_async_decode=True,
+        async_decode_min_batch_size=3,
     )
 
     assert engine == "engine"
