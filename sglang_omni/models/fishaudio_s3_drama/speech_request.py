@@ -18,12 +18,9 @@ from sglang_omni.models.fishaudio_s3_drama.prompt import (
     SEMANTIC_BEGIN_TOKEN,
     SPEAKER_IDS,
     SPEAKER_TAG_PATTERN,
-    PromptMessage,
-    PromptPart,
     ReferencePart,
-    TextPart,
     build_prompt_rows,
-    references_from_speaker_groups,
+    with_speaker_tag,
 )
 from sglang_omni.models.fishaudio_s3_drama.request_builders import (
     MINIMUM_PROMPT_ROWS,
@@ -301,29 +298,20 @@ class S3DramaSpeechPreprocessor:
             pass
         references = [
             ReferencePart(
-                transcript=transcript,
+                transcript=with_speaker_tag(transcript, 0),
                 audio_codes=self.reference_audio_codes(descriptor, index),
             )
             for index, (descriptor, transcript) in enumerate(
                 zip(reference_descriptors, transcripts, strict=True)
             )
         ]
-        system_parts: list[PromptPart] = [*references_from_speaker_groups([references])]
-        messages = [
-            *(
-                [PromptMessage(role="system", parts=system_parts)]
-                if system_parts
-                else []
-            ),
-            PromptMessage(role="user", parts=[TextPart(text=text)]),
-        ]
         try:
             prompt_rows = build_prompt_rows(
-                messages,
+                text,
+                references,
                 self.tokenizer,
                 num_codebooks=self.num_codebooks,
                 codebook_size=self.codebook_size,
-                should_tag_user_text=True,
             )
         except ValueError as error:
             raise ValueError(f"{REQUEST_ERROR_PREFIX} {error}") from error
