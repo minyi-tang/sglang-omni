@@ -66,6 +66,11 @@ class StubScheduler:
     ) -> list[SimpleNamespace] | None:
         return OmniScheduler.prefill_coalesce_waiting_requests(self, running_batch)
 
+    def prefill_coalesce_holds(
+        self, waiting: list[SimpleNamespace], now_s: float
+    ) -> bool:
+        return OmniScheduler.prefill_coalesce_holds(self, waiting, now_s)
+
     def get_new_batch_prefill(self):
         # Upstream takes running_batch in and hands back a NextBatchPlan;
         # unwrap it so the assertions below stay about the gate decision.
@@ -380,6 +385,17 @@ class CountingLock:
         self.lock.__exit__(exc_type, exc, traceback)
 
 
+class ClockAdvancingLock(CountingLock):
+    def __init__(self, clock: mock.MagicMock, now_after_acquire_s: float) -> None:
+        super().__init__()
+        self.clock = clock
+        self.now_after_acquire_s = now_after_acquire_s
+
+    def __enter__(self) -> bool:
+        self.clock.return_value = self.now_after_acquire_s
+        return super().__enter__()
+
+
 def gate_before_extraction(
     sched: StubScheduler, running_batch: SimpleNamespace
 ) -> NextBatchPlan:
@@ -551,9 +567,49 @@ def test_the_hold_predicate_stamps_nothing_and_agrees_with_the_gate(
         enqueue_times=enqueue_times,
     )
 
-    is_held = OmniScheduler.prefill_coalesce_holds(
-        sched, sched.running_batch, clock.return_value
-    )
+    waiting = sched.prefill_coalesce_waiting_requests(sched.running_batch)
+    assert waiting is not None
+    is_held = OmniScheduler.prefill_coalesce_holds(sched, waiting, clock.return_value)
 
     assert enqueue_stamps(sched) == list(enqueue_times)
     assert is_held == (sched.get_new_batch_prefill() is None)
+
+
+class DecodingStubScheduler(StubScheduler):
+    def __init__(self, *, request_admission_lock: CountingLock) -> None:
+        super().__init__(coalesce_requests=8, requires_pending_builds=True)
+        self.is_mixed_chunk = False
+        self.dllm_config = None
+        self._prefill_decode_interval_remaining = (
+            0  # noqa: leading-underscore  # production name
+        )
+        self.enable_priority_preemption = False
+        self.is_hybrid_swa = False
+        self.enable_hisparse = False
+        self.min_free_slots_delayer = None
+        self.running_batch = SimpleNamespace(
+            is_empty=lambda: False, reqs=[object()], batch_is_full=False
+        )
+        self.request_admission_lock = request_admission_lock
+        self.pending_request_builds = {"build": object()}
+        self.waiting_queue = [make_req(100.0)]
+
+    def get_num_allocatable_reqs(
+        self, running_request_count: int, running_batch: SimpleNamespace
+    ) -> int:
+        return 4
+
+
+def test_the_prefill_expectation_reads_the_clock_before_the_pending_builds(
+    clock: mock.MagicMock,
+) -> None:
+    clock.return_value = 100.059999
+    lock = ClockAdvancingLock(clock, now_after_acquire_s=100.060001)
+    sched = DecodingStubScheduler(request_admission_lock=lock)
+
+    is_expected = OmniScheduler.is_prefill_expected(sched)
+
+    assert lock.acquire_count == 1
+    assert clock.return_value == 100.060001
+    assert is_expected is False
+    assert enqueue_stamps(sched) == [100.0]

@@ -1950,7 +1950,9 @@ class OmniScheduler(Generic[RequestDataT]):
         elif TEST_RETRACT and running_request_count > TEST_RETRACT_NO_PREFILL_BS:
             return False
         else:
-            return not self.prefill_coalesce_holds(running_batch, time.perf_counter())
+            now_s = time.perf_counter()
+            waiting = self.prefill_coalesce_waiting_requests(running_batch)
+            return waiting is None or not self.prefill_coalesce_holds(waiting, now_s)
 
     def prefill_coalesce_waiting_requests(
         self, running_batch: ScheduleBatch | None
@@ -1985,24 +1987,18 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             return waiting
 
-    def prefill_coalesce_holds(
-        self, running_batch: ScheduleBatch | None, now_s: float
-    ) -> bool:
-        waiting = self.prefill_coalesce_waiting_requests(running_batch)
-        if waiting is None:
-            return False
-        else:
-            enqueue_times_s = [
-                getattr(
-                    req, "_coalesce_enqueue_t", None
-                )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-                for req in waiting
-            ]
-            oldest_enqueue_s = min(
-                (enqueue_s for enqueue_s in enqueue_times_s if enqueue_s is not None),
-                default=now_s,
-            )
-            return now_s - oldest_enqueue_s < self.prefill_coalesce_wait_s
+    def prefill_coalesce_holds(self, waiting: list[Req], now_s: float) -> bool:
+        enqueue_times_s = [
+            getattr(
+                req, "_coalesce_enqueue_t", None
+            )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+            for req in waiting
+        ]
+        oldest_enqueue_s = min(
+            (enqueue_s for enqueue_s in enqueue_times_s if enqueue_s is not None),
+            default=now_s,
+        )
+        return now_s - oldest_enqueue_s < self.prefill_coalesce_wait_s
 
     def get_new_batch_prefill(self, running_batch):
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
@@ -2016,23 +2012,18 @@ class OmniScheduler(Generic[RequestDataT]):
         else:
             pass
         now = time.perf_counter()
-        oldest = now
         for req in waiting:
-            t = getattr(
+            enqueue_s = getattr(
                 req, "_coalesce_enqueue_t", None
             )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-            if t is None:
-                t = req._coalesce_enqueue_t = (
-                    now  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
-                )
+            if enqueue_s is None:
+                req._coalesce_enqueue_t = now  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
             else:
                 pass
-            oldest = min(oldest, t)
-        if now - oldest >= self.prefill_coalesce_wait_s:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+        if self.prefill_coalesce_holds(waiting, now):
+            return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
         else:
-            pass
-        return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
+            return _Upstream.get_new_batch_prefill(self, running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):
         try:
