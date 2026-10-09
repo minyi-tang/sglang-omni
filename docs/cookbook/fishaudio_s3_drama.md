@@ -159,6 +159,63 @@ When the engine and the vocoder share one GPU, `--mps on` lets their processes s
 [Same-GPU Data Parallelism with CUDA MPS](../basic_usage/mps_dp.md)). It can raise throughput under high concurrency
 but may make a single stream slower; measure it with your own load before you keep it.
 
+## High Concurrency
+
+The defaults run at most 16 requests at a time on the engine and give it 0.70 of the GPU's memory. For more streams at
+once, raise the request cap; the measurements below also raise the engine's share:
+
+```bash
+sgl-omni serve \
+  --model-path <checkpoint> \
+  --tts_engine.gpu_memory_fraction 0.85 \
+  --tts_engine.factory.max_running_requests 256
+```
+
+These values are sized for an H200: the engine's and the vocoder's shares and the preprocessing reserve must fit one GPU
+together, which the server checks at startup.
+
+### Throughput and Time to First Audio
+
+Measured on H200 GPUs with the settings above, the vocoder's default share and streamed requests, 1,088 requests per
+concurrency level, each cloning a voice from one reference given as `vq_codes` with its transcript, with
+`max_new_tokens` 500, `temperature` 1.0, `top_p` 0.9 and `top_k` 30. Each figure is the
+average over six server starts; the throughput counts every frame the engine generates, including the end-of-speech
+frame that ends a stream:
+
+| Vocoder | Concurrent streams | Median time to first audio | 95th percentile | Throughput (generated frames/s) |
+|---|---|---|---|---|
+| On the engine's GPU | 128 | 685 ms | 1,412 ms | 2,177 |
+| On the engine's GPU | 256 | 3,403 ms | 4,255 ms | 2,422 |
+| On a second GPU | 128 | 401 ms | 995 ms | 3,692 |
+| On a second GPU | 256 | 2,146 ms | 2,469 ms | 4,160 |
+
+With the vocoder on the engine's GPU, at 256 streams the vocoder runs at full load and each new stream's first audio
+waits in its queue. When you need many concurrent streams and a short time to first audio together, put the vocoder on
+a second GPU, as under [Deployment](#deployment): at 256 streams that gave about 72% more throughput and a 37% shorter
+median time to first audio.
+
+### Non-Streaming Requests
+
+The vocoder decodes a non-streaming request's audio in one piece once the engine has finished it, and requests that
+reach it together in one batch, padded to the longest. At startup it sets how many padded frames one such decode may
+take, from its memory share (`--vocoder.gpu_memory_fraction`, 0.10 by default) and the memory it already holds, and
+logs the limit:
+
+```text
+S3-drama vocoder: a non-streaming decode takes up to <frames> padded frames of <bytes> bytes each; share <share> GiB, held <held> GiB
+```
+
+A batch above the limit is split into several decodes. The limit does not count the memory the vocoder process holds
+outside PyTorch's allocator, such as its CUDA context, so a decode close to the limit can take the process past its
+share. With the default shares the GPU has room left for that. With the engine's share raised to 0.85 on the same GPU,
+little memory is left beyond the stages' budgets, and concurrent non-streaming requests can run out of GPU memory. To
+avoid that, do one of these:
+
+- Stream those requests (`"stream": true`): streamed audio is decoded in short windows as it is generated, not in one
+  piece.
+- Keep the engine's default share of 0.70 on the GPU that runs the vocoder.
+- Put the vocoder on a second GPU, as under [Deployment](#deployment).
+
 ## Defaults and How to Change Them
 
 | Default | What it does | Change it with |
@@ -184,4 +241,13 @@ stages:
     factory:
       window_cuda_graphs: false
       decode_dtype: float32
+```
+
+Triton sampling and the fused codebook tower layers have been validated on Hopper GPUs only, so they run only on
+compute capability 9.0; on any other GPU no setting turns them on. The startup log names the path each one takes and,
+for a fallback, the reason, for example:
+
+```text
+S3-drama codebook sampling: PyTorch, untested GPU sm_120
+S3-drama tower fused layers: off, untested GPU sm_120
 ```
