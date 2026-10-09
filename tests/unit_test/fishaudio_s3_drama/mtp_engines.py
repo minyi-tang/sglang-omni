@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Engine for test_mtp_engine, one per process: S3-drama on OmniScheduler, recorded.
+"""Recorded S3-drama engine for test_mtp_engine, one per process.
 
-The recording model keeps the runner's RAS windows as records but samples with
-every window empty, and pins the end-of-speech logit per request, so every
-sampled token is a deterministic argmax.
+Records the runner's RAS windows but samples with empty windows and a pinned
+end-of-speech logit, so every sampled token is a deterministic argmax.
 """
 
 from __future__ import annotations

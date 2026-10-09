@@ -108,7 +108,6 @@ class GraphRecordingRunner(S3DramaModelRunner):
         self.fused_layer_calls_snapshot = FusedLayerCalls()
         self.lean_choice_recorder: LeanChoiceRecorder | None = None
         self.first_frame_replays_snapshot: Counter[int] = Counter()
-        self.first_frame_eager_snapshot = 0
         self.first_frame_sampler_calls_snapshot = 0
         self.lean_choice_count_snapshot = 0
         self.unresolved_forward_indices: list[int] = []
@@ -157,11 +156,7 @@ class GraphRecordingRunner(S3DramaModelRunner):
             tower_prefill_runs.extend_mode + tower_prefill_runs.other_modes
         )
         self.fused_layer_calls_snapshot = replace(self.model.fused_layer_calls)
-        first_frame_runs = self.model.first_frame_runs
-        self.first_frame_replays_snapshot = Counter(
-            first_frame_runs.replays_by_request_count
-        )
-        self.first_frame_eager_snapshot = first_frame_runs.eager_count
+        self.first_frame_replays_snapshot = Counter(self.model.first_frame_replays)
         self.first_frame_sampler_calls_snapshot = self.model.first_frame_sampler_calls
         assert self.lean_choice_recorder is not None
         self.lean_choice_count_snapshot = len(self.lean_choice_recorder.choices)
@@ -358,10 +353,8 @@ class GraphRecordingRunner(S3DramaModelRunner):
         )
         usage = self.model_worker.prefill_cuda_graph_usage
         is_graph_replay = bool(result.can_run_cuda_graph)
-        first_frame_runs = self.model.first_frame_runs
         first_frame_replays = dict(
-            first_frame_runs.replays_by_request_count
-            - self.first_frame_replays_snapshot
+            self.model.first_frame_replays - self.first_frame_replays_snapshot
         )
         first_frame_kv_splits: list[int]
         if not is_extend:
@@ -456,8 +449,8 @@ class GraphRecordingRunner(S3DramaModelRunner):
                     - self.fused_layer_calls_snapshot.during_tower_prefill
                 ),
                 first_frame_replays=first_frame_replays,
-                first_frame_eager_count=first_frame_runs.eager_count
-                - self.first_frame_eager_snapshot,
+                first_frame_eager_count=self.model.first_frame_sampler_calls
+                - self.first_frame_sampler_calls_snapshot,
                 first_frame_sampler_calls=self.model.first_frame_sampler_calls
                 - self.first_frame_sampler_calls_snapshot,
                 first_frame_kv_splits=first_frame_kv_splits,

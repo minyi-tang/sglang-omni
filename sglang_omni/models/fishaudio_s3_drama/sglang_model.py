@@ -34,13 +34,9 @@ from torch import nn
 from sglang_omni.models.fishaudio_s3_drama.audio_decoder import AudioDecoder
 from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
     FirstFrameInputs,
-    FirstFrameRuns,
     S3DramaFirstFrameGraphs,
 )
-from sglang_omni.models.fishaudio_s3_drama.hf_config import (
-    FishOmniConfig,
-    S3DramaTextConfig,
-)
+from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.sampling import (
     EMPTY_RAS_SLOT,
     RAS_WINDOW_FRAMES,
@@ -270,14 +266,7 @@ class S3DramaTowerPrefill:
 
 
 class S3DramaBackbone(Qwen3_5MoeForCausalLM):
-    def __init__(
-        self,
-        config: S3DramaTextConfig,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__(config, quant_config=quant_config, prefix=prefix)
-        self.tower_prefill: S3DramaTowerPrefill | None = None
+    tower_prefill: S3DramaTowerPrefill | None = None
 
     def forward(
         self,
@@ -376,7 +365,6 @@ class S3DramaForCausalLM(nn.Module):
         # The engine builder allocates these once the request pool is sized.
         self.decode_buffers: S3DramaDecodeBuffers | None = None
         self.first_frame_graphs: S3DramaFirstFrameGraphs | None = None
-        self.first_frame_runs = FirstFrameRuns()
 
     @property
     def start_layer(self) -> int:
@@ -469,7 +457,6 @@ class S3DramaForCausalLM(nn.Module):
                     )
                 )
             )
-            self.first_frame_runs.replays_by_request_count[request_count] += 1
             return logits_output
         else:
             pass
@@ -495,7 +482,6 @@ class S3DramaForCausalLM(nn.Module):
             step_inputs.top_p,
             step_batch,
         )
-        self.first_frame_runs.eager_count += 1
         self.step_exchange.publish(sampled_frames)
         return logits_output
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import dataclasses
 import time
-from collections import Counter
 from typing import Protocol
 
 import torch
@@ -61,12 +60,6 @@ class FirstFrameInputs:
                 for field in dataclasses.fields(self)
             }
         )
-
-
-@dataclasses.dataclass(kw_only=True)
-class FirstFrameRuns:
-    replays_by_request_count: Counter[int] = dataclasses.field(default_factory=Counter)
-    eager_count: int = 0
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)

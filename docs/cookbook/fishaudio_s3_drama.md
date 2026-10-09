@@ -77,8 +77,8 @@ These requests fail with HTTP 400:
   and `initial_codec_chunk_frames`.
 - A `task_type` other than `Base`.
 - A `voice` other than `default` or the name of an [uploaded voice](../basic_usage/tts.md#uploaded-voices).
-- More than one speaker: a speaker tag other than speaker 0 in `input` or in a reference transcript.
-- Infill: the server has no infill request, and an `infill` field is refused as an unknown field.
+- A speaker tag other than `<|speaker:0|>` in `input` or in a reference transcript: each request has one speaker,
+  speaker 0.
 - A `repetition_penalty` other than 1.0.
 - A value out of range: `max_new_tokens` below 1, above the engine's cap or beyond the room the prompt leaves in the
   context; a `temperature` that is negative or not finite; a `top_p` outside (0, 1]; a `top_k` outside [1, 2147483647].
@@ -132,8 +132,8 @@ a longer one fails the request with HTTP 400:
 S3-drama request: a prompt of 8193 rows exceeds the maximum allowed length of 8192 rows
 ```
 
-The cap is the engine's `max_prompt_rows`, which preprocessing applies too; change it on the engine with
-`--tts_engine.factory.max_prompt_rows`. A prompt and its `max_new_tokens` must also fit the engine's context length.
+Change the cap with `--tts_engine.factory.max_prompt_rows`. A prompt and its `max_new_tokens` must also fit the
+engine's context length.
 
 ## Attention Backend
 
@@ -153,7 +153,7 @@ sgl-omni serve \
   --vocoder.gpu 1
 ```
 
-The server must see both GPUs. The vocoder already runs in its own process, so nothing else needs to change.
+The server must see both GPUs.
 
 When the engine and the vocoder share one GPU, `--mps on` lets their processes share it through CUDA MPS (see
 [Same-GPU Data Parallelism with CUDA MPS](../basic_usage/mps_dp.md)). It can raise throughput under high concurrency
@@ -196,36 +196,30 @@ median time to first audio.
 
 ### Non-Streaming Requests
 
-The vocoder decodes a non-streaming request's audio in one piece once the engine has finished it, and requests that
-reach it together in one batch, padded to the longest. At startup it sets how many padded frames one such decode may
-take, from its memory share (`--vocoder.gpu_memory_fraction`, 0.10 by default) and the memory it already holds, and
-logs the limit:
+The vocoder decodes a non-streaming request's audio in one piece after the engine finishes it, batching requests that
+finish together up to a frame limit it sets at startup from its memory share (`--vocoder.gpu_memory_fraction`, 0.10
+by default) and logs:
 
 ```text
 S3-drama vocoder: a non-streaming decode takes up to <frames> padded frames of <bytes> bytes each; share <share> GiB, held <held> GiB
 ```
 
-A batch above the limit is split into several decodes. The limit does not count the memory the vocoder process holds
-outside PyTorch's allocator, such as its CUDA context, so a decode close to the limit can take the process past its
-share. With the default shares the GPU has room left for that. With the engine's share raised to 0.85 on the same GPU,
-little memory is left beyond the stages' budgets, and concurrent non-streaming requests can run out of GPU memory. To
-avoid that, do one of these:
-
-- Stream those requests (`"stream": true`): streamed audio is decoded in short windows as it is generated, not in one
-  piece.
-- Keep the engine's default share of 0.70 on the GPU that runs the vocoder.
-- Put the vocoder on a second GPU, as under [Deployment](#deployment).
+The limit does not count the memory the vocoder process holds outside PyTorch's allocator, so it cannot guarantee
+that the process stays within its share. With the engine's share raised to 0.85 on the same GPU, concurrent
+non-streaming requests can run out of GPU memory. To avoid that, stream those requests (`"stream": true`), keep the
+engine's default share of 0.70 on the GPU that runs the vocoder, or put the vocoder on a second GPU, as under
+[Deployment](#deployment).
 
 ## Defaults and How to Change Them
 
 | Default | What it does | Change it with |
 |---|---|---|
 | Decode CUDA graph | Replays decode steps as CUDA graphs. | `--tts_engine.engine.cuda_graph_backend_decode disabled`; `--tts_engine.engine.disable_cuda_graph true` turns off every engine CUDA graph |
-| Breakable prefill CUDA graph, up to 2048 tokens | Replays the backbone and the codebook tower's prefill as one breakable CUDA graph, captured at startup for prefill batches of up to 2048 tokens; a larger prefill batch runs eagerly. It shortens the time to the first audio, adds to startup time and takes GPU memory for the graphs; the KV cache keeps its size. | `--tts_engine.engine.cuda_graph_backend_prefill disabled`; the token cap with `--tts_engine.engine.cuda_graph_max_bs_prefill` |
-| First-frame CUDA graphs, up to 16 requests | Replays the step that samples each request's first frame as a CUDA graph, captured at startup for prefills of 1 to 16 requests (at most the decode CUDA graph's largest batch); a prefill of more requests samples its first frames eagerly. It needs the decode CUDA graph, shortens each prefill, and adds to startup time and GPU memory. | `--tts_engine.factory.first_frame_cuda_graphs false`; the request cap with `--tts_engine.factory.first_frame_cuda_graph_max_requests` |
+| Breakable prefill CUDA graph, up to 2048 tokens | Replays prefill batches of up to 2048 tokens, backbone and codebook tower together, as one breakable CUDA graph; larger batches run eagerly. Shortens the time to the first audio at the cost of startup time and GPU memory; the KV cache keeps its size. | `--tts_engine.engine.cuda_graph_backend_prefill disabled`; the token cap with `--tts_engine.engine.cuda_graph_max_bs_prefill` |
+| First-frame CUDA graphs, up to 16 requests | Replays the step that samples each request's first frame as a CUDA graph for prefills of up to 16 requests (at most the decode CUDA graph's largest batch); larger prefills sample eagerly. Needs the decode CUDA graph; shortens each prefill at the cost of startup time and GPU memory. | `--tts_engine.factory.first_frame_cuda_graphs false`; the request cap with `--tts_engine.factory.first_frame_cuda_graph_max_requests` |
 | `prefill_decode_interval` 4 | After a prefill, new prefills wait for the next 4 scheduling rounds, so running streams keep decoding. | `--tts_engine.engine.prefill_decode_interval 0` schedules prefills without the wait |
-| Triton sampling | Samples each frame's main token and its codes with Triton kernels, one per codebook head and one for the main token's two draws, instead of the PyTorch sampler. The top-k, top-p and repetition-aware rules are the same, but floating-point rounding can keep a candidate in one sampler and drop it in the other when its cumulative probability lies at top_p; the random numbers come from a counter that each sampling step advances, so the same seed draws different tokens than the PyTorch sampler. Without Triton or a CUDA device, on a GPU other than compute capability 9.0 (Hopper), or with a codebook size or main-token candidate count the kernels do not cover, the PyTorch sampler runs. | `--tts_engine.factory.triton_sampling false` |
-| Fused codebook tower layers, up to 16 rows | Runs each codebook tower layer of a decode step, and of a prefill's first-frame step, as four Triton kernels when the step has at most 16 rows, eagerly or inside the step's CUDA graph: the code-embedding mix and its projection; the attention input norm and projections with the rotary embedding and the KV cache write; the attention output gate and projection; the MLP's norm, gate-up projection and activation. The attention, the down projection and the final add-norm run as before. Steps of more rows and the tower's prefill keep the module path. The kernels add in a different order than the module path, so the tower's outputs can differ in the last bits and the sampled frames can differ. Without Triton or a CUDA device, on a GPU other than compute capability 9.0 (Hopper), with deterministic inference, or with tower weights or a KV cache the kernels do not cover, the module path runs. | `--tts_engine.factory.tower_fused_layers false` |
+| Triton sampling | Samples each frame's main token and codes with Triton kernels instead of the PyTorch sampler, under the same top-k, top-p and repetition-aware rules. Using the same seed does not guarantee the same tokens as the PyTorch sampler. Rounding can keep or drop a candidate whose cumulative probability lies at top_p. | `--tts_engine.factory.triton_sampling false` |
+| Fused codebook tower layers, up to 16 rows | Runs the codebook tower layers of decode and first-frame steps of up to 16 rows as fused Triton kernels, eagerly or inside the CUDA graphs; larger steps and the tower's prefill keep the module path. The kernels add in a different order, so the tower's outputs can differ in the last bits and the sampled frames can differ. | `--tts_engine.factory.tower_fused_layers false` |
 | Vocoder window CUDA graphs | Replays the decode of each streaming window length at batch 1 as a CUDA graph; batches and longer windows decode eagerly. | `--vocoder.factory.window_cuda_graphs false` |
 | Vocoder fp16 decoding | Decodes frames into audio in fp16. | `--vocoder.factory.decode_dtype float32` |
 
@@ -244,7 +238,10 @@ stages:
 ```
 
 Triton sampling and the fused codebook tower layers have been validated on Hopper GPUs only, so they run only on
-compute capability 9.0; on any other GPU no setting turns them on. The startup log names the path each one takes and,
+compute capability 9.0; on any other GPU no setting turns them on. Both also fall back without Triton or a CUDA
+device. Triton sampling falls back to the PyTorch sampler when its kernels do not cover the codebook size or the
+main-token candidate count, and the fused layers fall back to the module path with deterministic inference or when
+their kernels do not cover the tower weights or the KV cache. The startup log names the path each one takes and,
 for a fallback, the reason, for example:
 
 ```text

@@ -13,9 +13,9 @@ from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import (
     sample_semantic_candidates,
 )
 
-# note (SunskyXH): repetition-aware sampling is fixed by the training recipe:
+# note (SunskyXH): RAS settings are fixed for S3-drama, not request parameters:
 # when the first draw repeats a main token from the last 16 frames, the frame
-# takes a second draw made with these parameters instead.
+# takes a second draw with these parameters instead.
 RAS_WINDOW_FRAMES = 16
 # Pads the windows of requests with fewer than 16 frames; matches no token id.
 EMPTY_RAS_SLOT = -1
@@ -33,11 +33,10 @@ def sample_top_k_top_p(
     sampler: CodebookSampler | None,
     stream_id: int,
 ) -> torch.Tensor:
-    """One token id per row of [rows, vocab] logits, computed in fp32.
+    """Sample one token per row in fp32.
 
-    Sorted descending, a candidate is dropped when its rank is >= top_k or when
-    the cumulative probability up to and including it exceeds top_p; the most
-    likely token always stays. top_k must be >= 1.
+    Drop ranks >= top_k and tokens whose inclusive cumulative probability exceeds
+    top_p; always keep rank 0.
     """
     if sampler is not None:
         return sample_codebook_head(
@@ -78,10 +77,9 @@ def sample_semantic_with_ras(
     codebook_size: int,
     sampler: CodebookSampler | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample each frame's main token and its codebook-0 code.
+    """Sample each frame's main token and codebook-0 code.
 
-    previous_main_tokens [rows, 16] are the main tokens of the last 16 frames.
-    Both draws always happen, so the random stream does not depend on the window.
+    Both draws always run, so the random stream does not depend on the RAS window.
     """
     if previous_main_tokens.shape[-1] != RAS_WINDOW_FRAMES:
         raise ValueError(

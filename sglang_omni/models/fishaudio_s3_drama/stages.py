@@ -165,7 +165,6 @@ def create_tts_engine_executor(
     enable_async_decode: bool = DEFAULT_ENABLE_ASYNC_DECODE,
     async_decode_min_batch_size: int = DEFAULT_ASYNC_DECODE_MIN_BATCH_SIZE,
 ) -> OmniScheduler[S3DramaRequestData]:
-    """The engine; max_new_tokens caps a request that sets none."""
     overrides = dict(server_args_overrides or {})
     mem_fraction_static = overrides.get("mem_fraction_static")
     if total_gpu_memory_fraction is None:

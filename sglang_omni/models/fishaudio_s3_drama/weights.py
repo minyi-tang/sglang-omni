@@ -27,7 +27,6 @@ AUDIO_DECODER_PREFIXES = (
     "audio_decoder_mtp_shared.",
     "audio_decoder_mtp.",
 )
-# Checked in order; "audio_decoder_mtp_shared." must come before "audio_decoder_mtp.".
 MODULE_PREFIXES = (
     ("audio_decoder_mtp_shared.layers.", "shared_layers."),
     ("audio_decoder_mtp.layers.", "residual_layers."),
@@ -96,7 +95,7 @@ def parameter_shard(checkpoint_name: str) -> ParameterShard:
 
 def expected_parameter_shards(decoder: AudioDecoder) -> set[ParameterShard]:
     shards: set[ParameterShard] = set()
-    for parameter_name in dict(decoder.named_parameters()):
+    for parameter_name, _ in decoder.named_parameters():
         if parameter_name.endswith(GATE_UP_SUFFIX):
             shards.add(ParameterShard(parameter_name=parameter_name, shard_name="gate"))
             shards.add(ParameterShard(parameter_name=parameter_name, shard_name="up"))

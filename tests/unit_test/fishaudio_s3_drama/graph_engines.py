@@ -9,6 +9,7 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import fields
 from pathlib import Path
 
 import torch
@@ -60,6 +61,7 @@ from tests.unit_test.fishaudio_s3_drama.graph_fixtures import (
 )
 from tests.unit_test.fishaudio_s3_drama.graph_recording_model import (
     CaptureBreakRecorder,
+    CountingFirstFrameGraphs,
     CountingFusedTowerLayers,
     CountingTowerPrefill,
     DrawRecorder,
@@ -191,6 +193,18 @@ class GraphRecordingEngineBuilder(S3DramaEngineBuilder):
         )
         for buffer, contents in zip(kv_buffers, kv_contents, strict=True):
             buffer.copy_(contents)
+        first_frame_graphs = model.first_frame_graphs
+        if first_frame_graphs is not None:
+            assert isinstance(model, GraphRecordingModel)
+            model.first_frame_graphs = CountingFirstFrameGraphs(
+                **{
+                    field.name: getattr(first_frame_graphs, field.name)
+                    for field in fields(first_frame_graphs)
+                },
+                replays_by_request_count=model.first_frame_replays,
+            )
+        else:
+            pass
 
     def make_model_runner(
         self, model_worker: ModelWorker, output_proc: SGLangOutputProcessor

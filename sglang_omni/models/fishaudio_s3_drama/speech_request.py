@@ -62,17 +62,19 @@ def explicit_generation_fields(
     """Sampling fields the caller set, as recorded in tts_params for speech requests or
     in metadata[EXPLICIT_GENERATION_PARAMS_KEY] otherwise. A direct Client caller lists
     there every sampling field it sets, placeholder values included."""
-    is_recorded = isinstance(request.metadata.get("tts_params"), Mapping) or any(
-        isinstance(source.get(EXPLICIT_GENERATION_PARAMS_KEY), list | tuple)
-        for source in (tts_params, request.metadata)
+    is_recorded = isinstance(request.metadata.get("tts_params"), Mapping) or isinstance(
+        request.metadata.get(EXPLICIT_GENERATION_PARAMS_KEY), list | tuple
     )
-    unrecorded_fields = [
-        field_name
-        for field_name in PLACEHOLDER_SAMPLING_FIELDS
-        if not is_recorded
-        and request.params.get(field_name, CLIENT_SAMPLING_PLACEHOLDERS[field_name])
-        != CLIENT_SAMPLING_PLACEHOLDERS[field_name]
-    ]
+    unrecorded_fields = (
+        []
+        if is_recorded
+        else [
+            field_name
+            for field_name in PLACEHOLDER_SAMPLING_FIELDS
+            if request.params.get(field_name, CLIENT_SAMPLING_PLACEHOLDERS[field_name])
+            != CLIENT_SAMPLING_PLACEHOLDERS[field_name]
+        ]
+    )
     if unrecorded_fields:
         raise ValueError(
             f"{REQUEST_ERROR_PREFIX} {', '.join(unrecorded_fields)} set without "

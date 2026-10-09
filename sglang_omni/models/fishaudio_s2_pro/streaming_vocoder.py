@@ -563,7 +563,7 @@ class S2ProVocoderScheduler(StreamingSimpleScheduler):
 
         samples_per_token = int(self.codec.frame_length)
         return [
-            audio[idx, 0, : int(length * samples_per_token)].float().cpu()
+            audio[idx, 0, : length * samples_per_token].float().cpu()
             for idx, length in enumerate(lengths)
         ]
 

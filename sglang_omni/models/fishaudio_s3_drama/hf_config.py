@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """HF config for S3-drama checkpoints (model_type fish_omni).
 
-A fish_omni_text text_config is validated and converted to S3DramaTextConfig, a
-Qwen3_5MoeTextConfig whose full-attention layer ids also cover the decoder
-tower; the converted form is what to_dict writes and what a saved config
-reloads from.
+A fish_omni_text text_config converts to S3DramaTextConfig, the form a saved config
+stores and reloads.
 """
 
 from __future__ import annotations

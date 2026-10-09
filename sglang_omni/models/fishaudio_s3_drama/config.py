@@ -55,8 +55,8 @@ class S3DramaPreprocessingStageConfig(StageConfig):
 
 
 class S3DramaEngineFactoryArgs(FactoryArgs):
-    """Engine knobs; max_new_tokens caps a request that sets none, and preprocessing
-    refuses prompts by the same max_prompt_rows."""
+    """Engine knobs; max_new_tokens is the most a request may set and bounds one that
+    sets none, and preprocessing refuses prompts by the same max_prompt_rows."""
 
     context_length: int = Field(default=DEFAULT_CONTEXT_LENGTH, gt=0)
     max_running_requests: int = Field(default=DEFAULT_MAX_RUNNING_REQUESTS, ge=1)
@@ -79,9 +79,7 @@ class S3DramaEngineStageConfig(EngineStageConfig):
 
 
 class S3DramaVocoderFactoryArgs(FactoryArgs):
-    """The codec preprocessing also encodes with, and the streaming windows in frames:
-    chunks of 10, 10, 12 and 32 new frames, then 64 each, decoded with up to 32
-    emitted frames of left context and no crossfade."""
+    """Codec path (shared with preprocessing) and the streaming window schedule, in frames."""
 
     codec_path: str = DEFAULT_CODEC_PATH
     stream_stride: int = Field(default=DEFAULT_STREAM_STRIDE, ge=1)

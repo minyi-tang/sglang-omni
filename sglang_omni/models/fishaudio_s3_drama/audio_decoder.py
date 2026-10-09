@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""S3-drama codebook decoder: frame embeddings and the tower predicting codes 1..N-1.
-
-The tower's key/value cache stays with the caller: every layer attends through
-a DecoderAttention callback. The cache slot of backbone row p is computed from
-that row's hidden state and the codes of frame p + 1.
-"""
+"""S3-drama frame embeddings and the codebook tower that predicts codes
+1..num_codebooks - 1."""
 
 from __future__ import annotations
 
@@ -50,16 +46,14 @@ class DecoderAttention(Protocol):
         key: torch.Tensor,
         value: torch.Tensor,
     ) -> torch.Tensor:
-        """Store this call's key/value rows in tower layer layer_index, then attend.
+        """Write this call's key/value rows to tower layer layer_index (0-based, shared
+        layers first), then attend.
 
-        layer_index counts tower layers from 0, shared layers first. query
-        [rows, heads * head_dim] and key [rows, kv_heads * head_dim] are already
-        normed and rotated; value is [rows, kv_heads * head_dim]. Each row attends
-        causally over its own request's cached rows up to its position, with
-        grouped kv heads and a 1 / sqrt(head_dim) scale. The result
-        [rows, heads * head_dim] is returned before the output gate. The callee
-        owns the rows' requests and positions, which must match the positions
-        given to the tower.
+        query [rows, heads * head_dim] and key/value [rows, kv_heads * head_dim];
+        query and key arrive normed and rotated. Return causal GQA attention (scale
+        1 / sqrt(head_dim)) over each row's own request, [rows, heads * head_dim],
+        before the output gate. The callee owns request/position metadata, which
+        must match the tower's positions.
         """
 
 
@@ -380,7 +374,8 @@ class AudioDecoder(nn.Module):
     def embed_backbone(
         self, frames: torch.Tensor, text_embeddings: torch.Tensor
     ) -> torch.Tensor:
-        """Backbone input: semantic frames add codes 1..N to the token embedding."""
+        """Backbone input: semantic frames add codes 1..backbone_codebook_count to the
+        token embedding."""
         mixed = (
             text_embeddings
             + self.codebook_embedding_sum(
@@ -392,7 +387,8 @@ class AudioDecoder(nn.Module):
         )
 
     def shared_input(self, frames: torch.Tensor) -> torch.Tensor:
-        """Extra input of the first shared layer: codes N+1.. of semantic frames."""
+        """Extra input of the first shared layer: codes backbone_codebook_count + 1.. of
+        semantic frames."""
         return torch.where(
             self.is_semantic(frames[:, 0]).unsqueeze(-1),
             self.codebook_embedding_sum(
@@ -517,12 +513,12 @@ class AudioDecoder(nn.Module):
         top_p: torch.Tensor,
         attention: DecoderAttention,
     ) -> torch.Tensor:
-        """Sample the frame after each backbone row, filling the cache at its position.
+        """Sample the next int64 frame [rows, 1 + num_codebooks] per backbone row,
+        filling the tower cache at its position.
 
-        hidden_states is the backbone's final-norm output (the lm_head input) and
-        semantic_logits its raw lm_head logits, before bias or temperature.
-        Returns int64 frames [rows, 1 + num_codebooks]. A frame whose main token
-        is not semantic (end of speech) still runs every layer.
+        semantic_logits are the raw lm_head logits (no bias or temperature) of
+        hidden_states, the backbone's final-norm output; an end-of-speech frame still
+        runs every layer.
         """
         sampler = self.sampler
         if sampler is not None:

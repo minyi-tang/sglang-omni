@@ -67,9 +67,9 @@ CheckpointProblem = Literal[
 ]
 
 # Frames are [main token, code 0, code 1, code 2, code 3]. Request "a" walks
-# through text -> semantic -> semantic -> eos -> text -> semantic; text and
-# eos rows carry out-of-range placeholder codes. "b" has one row (no prefill
-# row at all) and "c" two.
+# through text -> semantic -> semantic -> eos -> text -> semantic; its text rows
+# carry out-of-range placeholder codes. "b" has one row (no prefill row at all)
+# and "c" two.
 REQUEST_FRAMES = {
     "a": [
         [10, 99, -4, 99, 99],

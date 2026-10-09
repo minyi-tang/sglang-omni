@@ -5,6 +5,7 @@ fixed buffers, inside any captured graph, and takes its eos logits from one."""
 from __future__ import annotations
 
 import functools
+from collections import Counter
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -15,6 +16,10 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from torch import nn
 
+from sglang_omni.models.fishaudio_s3_drama.first_frame_graphs import (
+    FirstFrameInputs,
+    S3DramaFirstFrameGraphs,
+)
 from sglang_omni.models.fishaudio_s3_drama.hf_config import FishOmniConfig
 from sglang_omni.models.fishaudio_s3_drama.sampling import RAS_WINDOW_FRAMES
 from sglang_omni.models.fishaudio_s3_drama.sampling_kernels import CodebookSampler
@@ -58,6 +63,15 @@ class TowerPrefillRuns:
 class FusedLayerCalls:
     total: int = 0
     during_tower_prefill: int = 0
+
+
+@dataclass(frozen=True, kw_only=True)
+class CountingFirstFrameGraphs(S3DramaFirstFrameGraphs):
+    replays_by_request_count: Counter[int]
+
+    def replay(self, inputs: FirstFrameInputs) -> torch.Tensor:
+        self.replays_by_request_count[inputs.semantic_logits.shape[0]] += 1
+        return super().replay(inputs)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -220,6 +234,7 @@ class GraphRecordingModel(S3DramaForCausalLM):
         self.recording_buffers: RecordingBuffers | None = None
         self.draw_column = 0
         self.first_frame_sampler_calls = 0
+        self.first_frame_replays: Counter[int] = Counter()
         self.tower_prefill_runs = TowerPrefillRuns()
         self.fused_layer_calls = FusedLayerCalls()
         for head_index, head in enumerate(self.audio_decoder.codebook_heads):

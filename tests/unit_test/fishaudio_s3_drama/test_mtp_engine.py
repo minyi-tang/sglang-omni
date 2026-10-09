@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""S3-drama tower cache and four-stage steps on a GPU, against a dense recompute.
-
-A synthetic checkpoint with the S3-drama layout (mtp_fixtures.py) runs on
-OmniScheduler in a subprocess (mtp_engines.py) that records every forward. The
-dense reference recomputes each request's tower rows from scratch in fp32; the
-paged cache, the sampled codes, the backbone and the scheduler bookkeeping are
-checked against it and against single-request runs of the same prompts.
-"""
+"""S3-drama tower cache and four-stage steps on a GPU: paged cache, sampled codes,
+backbone and scheduler bookkeeping against a dense fp32 recompute and single-request
+runs."""
 
 from __future__ import annotations
 

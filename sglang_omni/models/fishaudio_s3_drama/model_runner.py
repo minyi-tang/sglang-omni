@@ -82,7 +82,8 @@ class S3DramaDecodeStatePool:
 
 
 def ras_window(frame_rows: list[list[int]]) -> list[int]:
-    """Main tokens of the last 16 frames, oldest first, left-padded with EMPTY_RAS_SLOT."""
+    """Main tokens of the last RAS_WINDOW_FRAMES frames, oldest first, left-padded with
+    EMPTY_RAS_SLOT."""
     main_tokens = [frame_row[0] for frame_row in frame_rows[-RAS_WINDOW_FRAMES:]]
     return [EMPTY_RAS_SLOT] * (RAS_WINDOW_FRAMES - len(main_tokens)) + main_tokens
 
@@ -204,7 +205,7 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
             frame_width=decode_buffers.frames.shape[1],
             device=self.device,
         )
-        self.row_launch_key: tuple[tuple[str, ...], tuple[int, ...]] | None = None
+        self.row_launch_key: tuple[int, ...] | None = None
         self.row_upload_buffers: list[torch.Tensor] = []
         self.row_upload_slot = 0
         self.prefill_inputs: S3DramaStepInputs | None = None
@@ -226,13 +227,11 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
                 rows.append(row)
         return rows
 
-    def gather_decode_rows(
-        self, batch_request_data: list[S3DramaRequestData], request_ids: list[str]
-    ) -> None:
+    def gather_decode_rows(self, batch_request_data: list[S3DramaRequestData]) -> None:
         state_pool = self.state_pool
         rows = self.state_rows(batch_request_data)
         row_count = len(rows)
-        row_launch_key = (tuple(request_ids), tuple(rows))
+        row_launch_key = tuple(rows)
         if row_launch_key != self.row_launch_key:
             host_rows = self.pinned_pingpong(
                 "row_upload_buffers",
@@ -401,7 +400,7 @@ class S3DramaModelRunner(ModelRunner[S3DramaRequestData]):
                 f"{None if forward_batch is None else forward_batch.rids}"
             )
         else:
-            self.gather_decode_rows(batch_request_data, request_ids)
+            self.gather_decode_rows(batch_request_data)
 
     def collect_frames(
         self,

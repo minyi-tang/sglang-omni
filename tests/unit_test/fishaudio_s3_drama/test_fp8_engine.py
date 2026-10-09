@@ -73,18 +73,19 @@ EXPERT_CHECKPOINT_PREFIX = "model.language_model.layers"
 # The activation quant kernel floors a 128-column group's fp32 amax here.
 ACTIVATION_AMAX_FLOOR = 1e-10
 DIVIDE_BLOCK_SIZE = 1024
-# Measured on this fixture (one calibration run), twice the maximum: per-row
-# relative error of the emulation against the dequantized weights, on the torch
-# backbone's routed-expert inputs.
+# Twice the maximum per-row relative error of the emulation against the
+# dequantized weights on the torch backbone's routed-expert inputs, measured on
+# this fixture.
 MOE_ACTIVATION_TOLERANCE = 0.139
 # note (SunskyXH): Triton accumulates fp8 dot products inexactly on sm_90, so some
-# fp8 steps land off this emulation. Bounds are about twice the H200 maxima: 3.5e-2
-# for a row, 2.8e-3 for the median row of a layer over the run or of a call of at
-# least MEDIAN_MINIMUM_ROWS rows (fewer rows leave a median at hardware noise).
+# fp8 steps land off this emulation. Bounds are about twice the maxima measured on
+# H200: 3.5e-2 for a row, 2.8e-3 for the median row of a layer over the run or of a
+# call of at least MEDIAN_MINIMUM_ROWS rows (fewer rows leave a median at hardware
+# noise).
 MOE_KERNEL_TOLERANCE = 7.1e-2
 MOE_KERNEL_MEDIAN_TOLERANCE = 5.5e-3
 MEDIAN_MINIMUM_ROWS = 32
-# Same run, twice the torch backbone's fp8-emulated vs dequantized deviation on
+# Twice the torch backbone's fp8-emulated vs dequantized deviation measured on
 # shared greedy histories: prompt-row hidden mean, then the semantic band and
 # each head's logits over every decision row.
 FP8_ENGINE_TOLERANCES = BackboneTolerances(
@@ -378,13 +379,8 @@ class MoeCallCheck:
 def moe_call_check(
     run: EngineRun, weights_by_layer: dict[int, ExpertWeights]
 ) -> MoeCallCheck:
-    """Routed-expert calls against the fp8 emulation and the dequantized weights.
-
-    A forward must hold one call per MoE layer over all of its rows; a missing,
-    repeated or misshapen call, a non-finite value, or too far a median row from
-    the emulation, for a layer over the run or a call of MEDIAN_MINIMUM_ROWS rows
-    or more, is a problem.
-    """
+    """Validate complete per-layer expert calls against emulated and dequantized
+    outputs, with finite-value, per-row and grouped-median bounds."""
     problems = []
     checked_call_count = 0
     largest_kernel_error = 0.0

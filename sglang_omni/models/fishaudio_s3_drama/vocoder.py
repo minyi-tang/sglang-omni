@@ -236,8 +236,8 @@ class S3DramaVocoderScheduler(S2ProVocoderScheduler):
             return self.stream_frames(request_id, frame_codes)
 
     def on_stream_done(self, request_id: str) -> list[OutgoingMessage]:
-        """Streams the frames no chunk carried, counted from the streamed ones so none
-        replays, then flushes the tail and the final result."""
+        """Stream the frames no chunk carried, skipping those already streamed, then
+        flush the tail and send the final result."""
         frames = generation_result_of(self.payloads[request_id]).frames
         streamed_frame_count = self.stream_states.setdefault(
             request_id, StreamVocoderState()
