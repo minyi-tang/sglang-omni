@@ -209,6 +209,15 @@ def changed_saved_text(key: str, value: object) -> ConfigChange:
     return change
 
 
+def removed_saved_text(key: str) -> ConfigChange:
+    def change(config: ConfigDict) -> None:
+        text_config = FishOmniConfig(**fish_config_dict()).text_config.to_dict()
+        text_config.pop(key)
+        config["text_config"] = text_config
+
+    return change
+
+
 def changed_decoder(key: str, value: object) -> ConfigChange:
     def change(config: ConfigDict) -> None:
         decoder_config = config["audio_decoder_config"]
@@ -512,6 +521,30 @@ def test_unsupported_configs_are_rejected(change: ConfigChange, error: str) -> N
 
     with pytest.raises((ValueError, NotImplementedError), match=error):
         FishOmniConfig(**config)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(removed_text("attn_output_gate"), id="fish-form"),
+        pytest.param(removed_saved_text("attn_output_gate"), id="saved-form"),
+    ],
+)
+def test_a_text_config_without_attn_output_gate_loads_with_the_gate(
+    change: ConfigChange, tmp_path: Path
+) -> None:
+    config_dict = fish_config_dict()
+    change(config_dict)
+
+    config = FishOmniConfig(**config_dict)
+    config.save_pretrained(tmp_path)
+    reloaded = FishOmniConfig.from_pretrained(tmp_path)
+
+    saved = json.loads((tmp_path / "config.json").read_text())
+    assert config.text_config.attn_output_gate is True
+    assert saved["text_config"]["attn_output_gate"] is True
+    assert config.to_dict() == FishOmniConfig(**fish_config_dict()).to_dict()
+    assert reloaded.to_dict() == config.to_dict()
 
 
 def test_saved_form_without_rope_copies_reads_rope_parameters() -> None:

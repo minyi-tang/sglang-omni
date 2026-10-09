@@ -206,6 +206,7 @@ def checked_text_config(text_kwargs: dict[str, object]) -> S3DramaTextConfig:
         text_kwargs["shared_expert_intermediate_size"] = 0
     else:
         pass
+    text_kwargs.setdefault("attn_output_gate", True)
     text_config = S3DramaTextConfig(**text_kwargs)
     for name in POSITIVE_TEXT_FIELDS:
         checked_int(getattr(text_config, name), f"text_config.{name}", 1)
