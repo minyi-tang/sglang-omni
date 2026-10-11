@@ -310,10 +310,10 @@ ENGINE_FACTORIES = {
         "sglang_omni.models.fishaudio_s2_pro.engine_builder",
         "FishS2ProEngineBuilder",
     ),
-    "fishaudio_s3_drama": (
-        "sglang_omni.models.fishaudio_s3_drama.stages.create_tts_engine_executor",
-        "sglang_omni.models.fishaudio_s3_drama.engine_builder",
-        "S3DramaEngineBuilder",
+    "fishaudio_drama3": (
+        "sglang_omni.models.fishaudio_drama3.stages.create_tts_engine_executor",
+        "sglang_omni.models.fishaudio_drama3.engine_builder",
+        "Drama3EngineBuilder",
     ),
     "higgs_tts": (
         "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor",
