@@ -63,7 +63,7 @@ curl -N -X POST http://localhost:8000/v1/audio/speech \
   --output output.pcm
 ```
 
-Sampling fields: `temperature` (default 0.7), `top_p` (default 0.7) and `top_k` (default 30). `max_new_tokens` counts
+Sampling fields: `temperature` (default 1.0), `top_p` (default 0.9) and `top_k` (default 30). `max_new_tokens` counts
 audio frames; a request that sets none generates until the end of speech, up to the engine's cap
 (`--tts_engine.factory.max_new_tokens`, 2048 frames by default) and the remaining context. A value the request sets
 above the cap or beyond the context left after the prompt fails the request with HTTP 400 (see below).

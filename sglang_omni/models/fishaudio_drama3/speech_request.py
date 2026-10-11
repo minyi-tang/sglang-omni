@@ -34,8 +34,8 @@ from sglang_omni.proto.request import (
 )
 from sglang_omni.scheduling.reference_encoder import ReferenceEncodeService
 
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.7
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 0.9
 DEFAULT_TOP_K = 30
 # Lowered speech fields the model cannot honor; a value other than None was given.
 UNSUPPORTED_TTS_PARAMS = (

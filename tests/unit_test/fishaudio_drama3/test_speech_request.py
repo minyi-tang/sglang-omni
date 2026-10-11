@@ -196,9 +196,9 @@ def test_text_becomes_a_tts_prompt_spoken_by_speaker_zero(
 @pytest.mark.parametrize(
     ("sampling_fields", "sampling"),
     [
-        pytest.param({}, (0.7, 0.7, 30, None), id="omitted"),
-        pytest.param(dict.fromkeys(GENERATION_FIELDS), (0.7, 0.7, 30, None), id="null"),
-        pytest.param({"temperature": 0.5}, (0.5, 0.7, 30, None), id="only-temperature"),
+        pytest.param({}, (1.0, 0.9, 30, None), id="omitted"),
+        pytest.param(dict.fromkeys(GENERATION_FIELDS), (1.0, 0.9, 30, None), id="null"),
+        pytest.param({"temperature": 0.5}, (0.5, 0.9, 30, None), id="only-temperature"),
         pytest.param(
             {
                 "temperature": 0.0,
@@ -254,7 +254,7 @@ def test_a_generate_request_keeps_its_set_fields_and_max_tokens(
         generation_input.top_p,
         generation_input.top_k,
         generation_input.max_new_tokens,
-    ) == (0.5, 0.7, 30, 12)
+    ) == (0.5, 0.9, 30, 12)
 
 
 def test_references_become_a_reference_prompt(tokenizer: Tokenizer) -> None:
@@ -525,8 +525,8 @@ def test_a_preprocessed_request_is_admitted_with_the_engine_cap(
     assert request_data.max_new_tokens == MAX_NEW_TOKENS_CAP
     assert request_data.req.sampling_params.max_new_tokens == MAX_NEW_TOKENS_CAP
     assert (request_data.temperature, request_data.top_p, request_data.top_k) == (
-        0.7,
-        0.7,
+        1.0,
+        0.9,
         30,
     )
 
@@ -684,7 +684,7 @@ def direct_client_payload(
 @pytest.mark.parametrize(
     ("sampling", "metadata", "expected_sampling"),
     [
-        pytest.param(SamplingParams(), {}, (0.7, 0.7, 30), id="placeholders-unlisted"),
+        pytest.param(SamplingParams(), {}, (1.0, 0.9, 30), id="placeholders-unlisted"),
         pytest.param(
             SamplingParams(temperature=0.0, top_p=1.0, top_k=1),
             {EXPLICIT_GENERATION_PARAMS_KEY: ["temperature", "top_p", "top_k"]},
@@ -694,7 +694,7 @@ def direct_client_payload(
         pytest.param(
             SamplingParams(temperature=0.5),
             {EXPLICIT_GENERATION_PARAMS_KEY: []},
-            (0.7, 0.7, 30),
+            (1.0, 0.9, 30),
             id="an-empty-list-is-the-record",
         ),
     ],
