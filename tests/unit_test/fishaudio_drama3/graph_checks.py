@@ -26,7 +26,12 @@ from tests.unit_test.fishaudio_drama3.graph_fixtures import (
     GraphScenario,
     bits,
 )
-from tests.unit_test.fishaudio_drama3.mtp_fixtures import EOS_TOKEN_ID, PROMPTS
+from tests.unit_test.fishaudio_drama3.mtp_fixtures import (
+    EOS_TOKEN_ID,
+    PROMPTS,
+    SEMANTIC_END_TOKEN_ID,
+    SEMANTIC_START_TOKEN_ID,
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -272,7 +277,8 @@ def history_problems(run: GraphEngineRun, scenarios: list[GraphScenario]) -> lis
 
 
 def draw_problems(run: GraphEngineRun) -> list[str]:
-    """The main token is the RAS draw exactly when the first draw repeats the window."""
+    """The main token is the RAS draw exactly when a semantic first draw repeats the
+    window."""
     return [
         f"{forward_name(record)} {step.request_id}: main token "
         f"{step.sampled_frame[0]} from draws {step.first_draw}, {step.ras_draw} "
@@ -283,15 +289,19 @@ def draw_problems(run: GraphEngineRun) -> list[str]:
         != (
             step.ras_draw
             if step.first_draw in step.model_ras_window
+            and SEMANTIC_START_TOKEN_ID <= step.first_draw <= SEMANTIC_END_TOKEN_ID
             else step.first_draw
         )
     ]
 
 
 def resampled_choice_count(run: GraphEngineRun, scenario_name: str) -> int:
-    """Steps where a repeated first draw was replaced by a different RAS draw."""
+    """Steps where a repeated semantic first draw was replaced by a different RAS
+    draw."""
     return sum(
-        step.first_draw in step.model_ras_window and step.ras_draw != step.first_draw
+        step.first_draw in step.model_ras_window
+        and SEMANTIC_START_TOKEN_ID <= step.first_draw <= SEMANTIC_END_TOKEN_ID
+        and step.ras_draw != step.first_draw
         for record in run.forwards
         if record.scenario_name == scenario_name
         for step in record.steps

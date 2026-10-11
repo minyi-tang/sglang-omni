@@ -135,7 +135,7 @@ def ras_logits(rows: int) -> torch.Tensor:
     return logits
 
 
-def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
+def test_ras_takes_the_second_draw_exactly_when_a_semantic_first_draw_repeats() -> None:
     """Both draws happen in order; the fixed-parameter one wins only on a window hit."""
     rows = 8
     logits = ras_logits(rows)
@@ -177,6 +177,67 @@ def test_ras_takes_the_second_draw_exactly_when_the_first_repeats() -> None:
     assert torch.equal(main_tokens, torch.where(is_repeat, second_draw, first_draw))
     assert not torch.equal(second_draw[::2], first_draw[::2])
     assert torch.equal(codebook_zero, main_tokens - SEMANTIC_BEGIN_ID)
+
+
+@pytest.mark.parametrize("band_edge", ["inside", "start", "end"])
+def test_ras_keeps_repeated_eos_and_replaces_repeated_semantic(band_edge: str) -> None:
+    rows = 8
+    semantic_end_id = SEMANTIC_BEGIN_ID + CODEBOOK_SIZE - 1
+    eos_token_id, repeated_semantic_token = {
+        "inside": (EOS_TOKEN_ID, SEMANTIC_BEGIN_ID + 5),
+        "start": (SEMANTIC_BEGIN_ID - 1, SEMANTIC_BEGIN_ID),
+        "end": (semantic_end_id + 1, semantic_end_id),
+    }[band_edge]
+    is_eos_row = torch.arange(rows) % 2 == 0
+    top_token_ids = torch.where(is_eos_row, eos_token_id, repeated_semantic_token)
+    logits = torch.zeros(rows, TEXT_VOCAB_SIZE)
+    logits[:, SEMANTIC_BEGIN_ID : SEMANTIC_BEGIN_ID + CODEBOOK_SIZE] = torch.linspace(
+        0.0, 0.3, CODEBOOK_SIZE
+    )
+    logits[torch.arange(rows), top_token_ids] = 1.0
+    temperature, top_k, top_p = request_parameters(rows, 1.0, 1, 1.0)
+    candidates = torch.tensor(
+        sorted([eos_token_id, *range(SEMANTIC_BEGIN_ID, semantic_end_id + 1)])
+    )
+    candidate_logits = logits[:, candidates]
+    torch.manual_seed(3)
+    first_draw = candidates[
+        sample_top_k_top_p(
+            candidate_logits, temperature, top_k, top_p, None, FIRST_DRAW_STREAM
+        )
+    ]
+    second_draw = candidates[
+        sample_top_k_top_p(
+            candidate_logits,
+            *request_parameters(rows, RAS_TEMPERATURE, RAS_TOP_K, RAS_TOP_P),
+            None,
+            RAS_DRAW_STREAM,
+        )
+    ]
+    window = torch.full((rows, 16), EMPTY_WINDOW_TOKEN)
+    window[:, 3] = eos_token_id
+    window[:, 9] = repeated_semantic_token
+
+    torch.manual_seed(3)
+    main_tokens, codebook_zero = sample_semantic_with_ras(
+        logits,
+        candidates,
+        window,
+        temperature,
+        top_k,
+        top_p,
+        SEMANTIC_BEGIN_ID,
+        CODEBOOK_SIZE,
+        None,
+    )
+
+    assert torch.equal(first_draw, top_token_ids)
+    assert torch.equal(main_tokens, torch.where(is_eos_row, first_draw, second_draw))
+    assert bool((second_draw[is_eos_row] != eos_token_id).any())
+    assert bool((second_draw[~is_eos_row] != repeated_semantic_token).any())
+    assert torch.equal(
+        codebook_zero, (main_tokens - SEMANTIC_BEGIN_ID).clamp(0, CODEBOOK_SIZE - 1)
+    )
 
 
 def test_ras_draws_the_same_random_numbers_with_or_without_a_hit() -> None:

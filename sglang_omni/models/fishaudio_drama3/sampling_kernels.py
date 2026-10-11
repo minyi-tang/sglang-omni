@@ -511,7 +511,10 @@ if HAS_TRITON:
             + tl.arange(0, WINDOW_FRAMES)
         )
         is_repeat = tl.max((window == first_token).to(tl.int32), axis=0) > 0
-        main_token = tl.where(is_repeat, ras_token, first_token)
+        is_semantic = (first_token >= semantic_begin_id) & (
+            first_token < semantic_begin_id + CODEBOOK_SIZE
+        )
+        main_token = tl.where(is_repeat & is_semantic, ras_token, first_token)
         tl.store(main_tokens_pointer + row, main_token)
         tl.store(
             codebook_zero_pointer + row,

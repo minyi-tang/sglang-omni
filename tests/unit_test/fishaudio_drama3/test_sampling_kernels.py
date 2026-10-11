@@ -426,8 +426,13 @@ def test_semantic_kernel_draws_what_the_reference_draws_with_the_same_noise(
         codebook_sampler,
     )
 
+    is_semantic = (first_tokens >= SYNTHETIC_SEMANTIC_BEGIN_ID) & (
+        first_tokens < SYNTHETIC_SEMANTIC_BEGIN_ID + codebook_size
+    )
     expected_tokens = torch.where(
-        (windows == first_tokens.unsqueeze(-1)).any(dim=-1), ras_tokens, first_tokens
+        (windows == first_tokens.unsqueeze(-1)).any(dim=-1) & is_semantic,
+        ras_tokens,
+        first_tokens,
     )
     problems = mismatch_problems(
         main_tokens != expected_tokens,
@@ -437,6 +442,69 @@ def test_semantic_kernel_draws_what_the_reference_draws_with_the_same_noise(
         | ras_reference.is_near_tie,
     )
     assert not problems, problems
+    assert torch.equal(
+        codebook_zero,
+        (main_tokens - SYNTHETIC_SEMANTIC_BEGIN_ID).clamp(0, codebook_size - 1),
+    )
+
+
+@pytest.mark.accelerator
+@pytest.mark.parametrize("band_edge", ["inside", "start", "end"])
+def test_semantic_kernel_keeps_repeated_eos_and_replaces_repeated_semantic(
+    band_edge: str,
+) -> None:
+    require_validated_gpu()
+    rows, codebook_size = 64, 64
+    semantic_end_id = SYNTHETIC_SEMANTIC_BEGIN_ID + codebook_size - 1
+    eos_token_id, repeated_semantic_token = {
+        "inside": (SYNTHETIC_EOS_TOKEN_ID, SYNTHETIC_SEMANTIC_BEGIN_ID + 5),
+        "start": (SYNTHETIC_SEMANTIC_BEGIN_ID - 1, SYNTHETIC_SEMANTIC_BEGIN_ID),
+        "end": (semantic_end_id + 1, semantic_end_id),
+    }[band_edge]
+    semantic_token_ids = torch.arange(
+        SYNTHETIC_SEMANTIC_BEGIN_ID, semantic_end_id + 1, device="cuda"
+    )
+    candidates = torch.tensor(
+        sorted([eos_token_id, *semantic_token_ids.tolist()]), device="cuda"
+    )
+    is_eos_row = torch.arange(rows, device="cuda") % 2 == 0
+    top_token_ids = torch.where(is_eos_row, eos_token_id, repeated_semantic_token)
+    semantic_logits = torch.zeros(rows, SYNTHETIC_VOCAB_SIZE, device="cuda")
+    semantic_logits[:, semantic_token_ids] = torch.linspace(
+        0.0, 0.3, codebook_size, device="cuda"
+    )
+    semantic_logits[torch.arange(rows, device="cuda"), top_token_ids] = 1.0
+    windows = torch.full(
+        (rows, RAS_WINDOW_FRAMES), EMPTY_RAS_SLOT, dtype=torch.int64, device="cuda"
+    )
+    windows[:, 3] = eos_token_id
+    windows[:, 9] = repeated_semantic_token
+    codebook_sampler = sampler(9)
+    ras_reference = reference_draws(
+        semantic_logits[:, candidates],
+        torch.full((rows,), RAS_TEMPERATURE, device="cuda"),
+        torch.full((rows,), RAS_TOP_K, dtype=torch.int64, device="cuda"),
+        torch.full((rows,), RAS_TOP_P, device="cuda"),
+        kernel_noise(codebook_sampler, RAS_DRAW_STREAM, rows, candidates.shape[0]),
+    )
+    ras_tokens = candidates[ras_reference.tokens]
+
+    main_tokens, codebook_zero = sample_semantic_with_ras(
+        semantic_logits,
+        candidates,
+        windows,
+        torch.ones(rows, device="cuda"),
+        torch.ones(rows, dtype=torch.int64, device="cuda"),
+        torch.ones(rows, device="cuda"),
+        SYNTHETIC_SEMANTIC_BEGIN_ID,
+        codebook_size,
+        codebook_sampler,
+    )
+
+    assert not bool((ras_reference.is_near_cut | ras_reference.is_near_tie).any())
+    assert torch.equal(main_tokens, torch.where(is_eos_row, top_token_ids, ras_tokens))
+    assert bool((ras_tokens[is_eos_row] != eos_token_id).any())
+    assert bool((ras_tokens[~is_eos_row] != repeated_semantic_token).any())
     assert torch.equal(
         codebook_zero,
         (main_tokens - SYNTHETIC_SEMANTIC_BEGIN_ID).clamp(0, codebook_size - 1),

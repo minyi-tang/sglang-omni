@@ -14,8 +14,8 @@ from sglang_omni.models.fishaudio_drama3.sampling_kernels import (
 )
 
 # note (SunskyXH): RAS settings are fixed for Drama 3, not request parameters:
-# when the first draw repeats a main token from the last 16 frames, the frame
-# takes a second draw with these parameters instead.
+# when a semantic first draw repeats a main token from the last 16 frames, the
+# frame takes a second draw with these parameters instead.
 RAS_WINDOW_FRAMES = 16
 # Pads the windows of requests with fewer than 16 frames; matches no token id.
 EMPTY_RAS_SLOT = -1
@@ -125,6 +125,9 @@ def sample_semantic_with_ras(
         )
     ]
     is_repeat = (previous_main_tokens == first_draw.unsqueeze(-1)).any(dim=-1)
-    main_tokens = torch.where(is_repeat, ras_draw, first_draw)
+    is_semantic = (first_draw >= semantic_begin_id) & (
+        first_draw < semantic_begin_id + codebook_size
+    )
+    main_tokens = torch.where(is_repeat & is_semantic, ras_draw, first_draw)
     codebook_zero = (main_tokens - semantic_begin_id).clamp(0, codebook_size - 1)
     return main_tokens, codebook_zero
