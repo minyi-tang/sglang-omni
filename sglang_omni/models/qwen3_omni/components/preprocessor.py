@@ -144,6 +144,16 @@ def merge_extracted_video_audio(
     return [*extracted_audios, *explicit], True
 
 
+def count_top_level_media(top_level: object) -> int:
+    """Items in a top-level media field, one placeholder per loaded item."""
+    if top_level is None:
+        return 0
+    elif isinstance(top_level, list):
+        return len(top_level)
+    else:
+        return 1
+
+
 def with_content_media(content_urls: list[str], top_level: object) -> object:
     """Content-part media first, then the top-level field's: their placeholder order."""
     if not content_urls:
@@ -412,7 +422,7 @@ class Qwen3OmniPreprocessor:
         max_new_tokens: int,
         request_id: str,
     ) -> None:
-        """Reject prompt text that cannot fit before the tokenizer spends time on it.
+        """Reject prompt text that cannot fit before media loads or the tokenizer runs.
 
         A token spans at most max_token_chars characters of the NFC text the
         tokenizer encodes, and NFC keeps at least a quarter of its input
@@ -745,7 +755,6 @@ class Qwen3OmniPreprocessor:
             video_seconds_per_chunk = inputs.get("video_seconds_per_chunk")
             video_position_id_per_seconds = inputs.get("video_position_id_per_seconds")
             audio_from_video = False
-            num_explicit_audios = 0
             resolved_video_fps = float(video_fps) if video_fps is not None else None
             resolved_video_max_frames = (
                 int(video_max_frames) if video_max_frames is not None else None
@@ -770,13 +779,28 @@ class Qwen3OmniPreprocessor:
                 else None
             )
 
-            # Count explicit audio inputs (for placeholder insertion)
-            if raw_audios is not None:
-                num_explicit_audios = (
-                    len(raw_audios) if isinstance(raw_audios, list) else 1
-                )
-            else:
-                pass
+            # Insert placeholders:
+            # - Explicit audio files get independent audio placeholders
+            # - Video audio (when use_audio_in_video=True) is handled by video token, no separate placeholder
+            messages_mm = self.build_multimodal_messages(
+                messages,
+                num_images=count_top_level_media(raw_images),
+                num_audios=count_top_level_media(raw_audios),
+                num_videos=count_top_level_media(raw_videos),
+            )
+            prompt_text = self.processor.apply_chat_template(
+                messages_mm,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            max_new_tokens = payload.request.params.get(
+                "max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS
+            )
+            self.validate_prompt_text_len(
+                prompt_text,
+                max_new_tokens=max_new_tokens,
+                request_id=payload.request_id,
+            )
 
             request_images = with_content_media(content_media.images, raw_images)
             request_videos = with_content_media(content_media.videos, raw_videos)
@@ -842,15 +866,6 @@ class Qwen3OmniPreprocessor:
         else:
             raise ValueError("Preprocessing expects a list of chat messages")
 
-        # Insert placeholders:
-        # - Explicit audio files get independent audio placeholders
-        # - Video audio (when use_audio_in_video=True) is handled by video token, no separate placeholder
-        messages_mm = self.build_multimodal_messages(
-            messages,
-            num_images=len(images) - len(content_media.images),
-            num_audios=num_explicit_audios,
-            num_videos=len(videos) - len(content_media.videos),
-        )
         if audio_from_video and (content_media.audios or content_media.videos):
             # note (ratish): the processor reads one audio per audio placeholder and per video
             # placeholder in text order; only content parts can put an audio before a video.
@@ -876,20 +891,6 @@ class Qwen3OmniPreprocessor:
         # Image and video keys follow the same rule and hash the loaded media.
         image_cache_key = compute_image_cache_key(images)
         video_cache_key = compute_video_cache_key(videos)
-
-        prompt_text = self.processor.apply_chat_template(
-            messages_mm,
-            add_generation_prompt=True,
-            tokenize=False,
-        )
-        max_new_tokens = payload.request.params.get(
-            "max_new_tokens", DEFAULT_THINKER_MAX_NEW_TOKENS
-        )
-        self.validate_prompt_text_len(
-            prompt_text,
-            max_new_tokens=max_new_tokens,
-            request_id=payload.request_id,
-        )
 
         videos_kwargs: VideoProcessorKwargs = {}
         if sampled_video_fps:
