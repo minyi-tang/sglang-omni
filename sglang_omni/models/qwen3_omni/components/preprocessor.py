@@ -702,18 +702,6 @@ class Qwen3OmniPreprocessor:
             audio_target_sr = int(inputs.get("audio_target_sr", 16000))
             audio_bytes = inputs.get("audio_bytes")
             if audio_bytes is not None:
-                try:
-                    prepared_audio = await asyncio.to_thread(
-                        prepare_audio,
-                        payload,
-                        source_name="Qwen3-Omni",
-                        target_sample_rate=audio_target_sr,
-                    )
-                except AudioDecodeError as exc:
-                    raise ValueError(
-                        "Qwen3-Omni could not decode the uploaded audio; "
-                        "provide a valid audio file."
-                    ) from exc
                 transcription_prompt = (
                     "Please transcribe the speech in the audio verbatim. "
                     "Output only the transcription in its original language, "
@@ -731,7 +719,6 @@ class Qwen3OmniPreprocessor:
                 else:
                     pass
                 messages = [{"role": "user", "content": transcription_prompt}]
-                raw_audios = [prepared_audio.waveform]
             else:
                 pass
             video_fps = inputs.get("video_fps", self.default_video_fps)
@@ -785,7 +772,9 @@ class Qwen3OmniPreprocessor:
             messages_mm = self.build_multimodal_messages(
                 messages,
                 num_images=count_top_level_media(raw_images),
-                num_audios=count_top_level_media(raw_audios),
+                num_audios=(
+                    1 if audio_bytes is not None else count_top_level_media(raw_audios)
+                ),
                 num_videos=count_top_level_media(raw_videos),
             )
             prompt_text = self.processor.apply_chat_template(
@@ -801,6 +790,22 @@ class Qwen3OmniPreprocessor:
                 max_new_tokens=max_new_tokens,
                 request_id=payload.request_id,
             )
+            if audio_bytes is not None:
+                try:
+                    prepared_audio = await asyncio.to_thread(
+                        prepare_audio,
+                        payload,
+                        source_name="Qwen3-Omni",
+                        target_sample_rate=audio_target_sr,
+                    )
+                except AudioDecodeError as exc:
+                    raise ValueError(
+                        "Qwen3-Omni could not decode the uploaded audio; "
+                        "provide a valid audio file."
+                    ) from exc
+                raw_audios = [prepared_audio.waveform]
+            else:
+                pass
 
             request_images = with_content_media(content_media.images, raw_images)
             request_videos = with_content_media(content_media.videos, raw_videos)
