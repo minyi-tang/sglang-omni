@@ -134,6 +134,40 @@ HTTP **503** (`The request queue is full.`) before preprocessing, or later
 if the AR waiting queue or request-build backlog is full. Qwen3-TTS
 defaults to 4 request-build workers with pending depth 16.
 
+A finished request no longer counts toward that capacity, but its streamed
+audio waits in the API process until the client reads it.
+`--stream_delivery.max_total_backlog_bytes` caps the undelivered stream bytes
+all requests may hold together, per API process (default `1073741824`,
+1 GiB; `none` turns it off).
+
+A client that reads at least as fast as audio is generated holds almost
+nothing in the API process. A slower client holds the audio that is
+generated but not yet in its socket buffers; 24 kHz float32 audio is
+about 96 kB per second. This includes a client that reads at playback
+speed while generation runs faster than real time, once its socket
+buffers are full.
+
+Over the cap, the streams whose readers have been idle longest fail first,
+until the total fits. A failed stream's generation is aborted if it is
+still running. SSE (`stream_format=sse`) and WebSocket clients get an error
+event with `The request queue is full.`; a raw PCM stream is closed early.
+New requests are not refused because of the cap. `/health` reports the
+backlog under `stream_delivery`, including the held bytes, open streams and
+failed streams.
+
+### Server Readiness
+
+Before it reports ready, the server sends itself a streaming speech request in
+its checkpoint's mode, once per replica of its most replicated process, one
+after another: CustomVoice uses its first built-in speaker, VoiceDesign a short
+voice description, and Base a one-second tone as its reference clip. `/health`
+returns 503 with status `starting` until these requests finish, so the first
+requests after that do not wait for the kernel loading and first-use setup of
+the speech path. The sampler is compiled for single and batched requests while
+the model loads, so the first concurrent requests need no warmup of their own.
+A failed warmup stops the server. `SGLANG_OMNI_WARMUP_TIMEOUT` (seconds, default
+600) bounds each request, and `--skip-server-warmup` reports ready without them.
+
 ### Prefill CUDA graphs
 
 Every Qwen3-TTS checkpoint (Base, CustomVoice, VoiceDesign) defaults to a
@@ -386,9 +420,6 @@ sgl-omni serve \
   --tts_engine.factory.leading_silence_mask_frames 0 \
   --port 8000
 ```
-
-Details and the full sweep are in
-[the leading-silence benchmark](../benchmarks/qwen3_tts_leading_silence.md).
 
 ### Language Hint
 

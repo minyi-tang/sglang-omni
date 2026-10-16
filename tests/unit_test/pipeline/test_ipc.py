@@ -28,7 +28,11 @@ from sglang_omni.pipeline.stage_workers import StageLaunchConfig, StageWorkerPro
 from sglang_omni.profiler.event_recorder import get_recorder
 from sglang_omni.serve import launcher
 from sglang_omni.serve.openai_api import ServerStatus
-from sglang_omni.serve.protocol import ChatCompletionRequest, ChatMessage
+from sglang_omni.serve.protocol import (
+    ChatCompletionRequest,
+    ChatMessage,
+    CreateSpeechRequest,
+)
 from sglang_omni.serve.server_warmup import (
     TranscriptionWarmupRequest,
     warmup_tone_wav_bytes,
@@ -346,6 +350,7 @@ async def test_mp_runner_stop_cleans_runtime_dir(
             replica_topology=None,
             logical_process_plan=None,
             max_in_flight=None,
+            max_total_backlog_bytes: int | None = None,
         ) -> None:
             del (
                 abort_endpoint,
@@ -356,6 +361,7 @@ async def test_mp_runner_stop_cleans_runtime_dir(
                 logical_process_plan,
                 max_in_flight,
             )
+            self.max_total_backlog_bytes = max_total_backlog_bytes
             self.control_plane = SimpleNamespace(
                 completion_endpoint=completion_endpoint
             )
@@ -418,6 +424,7 @@ async def test_mp_runner_stop_cleans_runtime_dir(
     await runner.start()
     capacity.assert_called_once_with()
     assert len([path for path in tmp_path.iterdir() if path.is_dir()]) == 1
+    assert runner.coordinator.max_total_backlog_bytes == 1024**3
 
     await runner.stop()
 
@@ -719,6 +726,41 @@ async def test_transcription_warmup_uploads_a_form_the_transcription_route_parse
         "json",
         False,
     )
+
+
+@pytest.mark.asyncio
+async def test_speech_warmup_posts_its_request_to_the_speech_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posted: list[tuple[str, CreateSpeechRequest]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        posted.append(
+            (
+                request.url.path,
+                CreateSpeechRequest.model_validate_json(request.content),
+            )
+        )
+        return httpx.Response(200)
+
+    route_warmup_to(monkeypatch, httpx.MockTransport(respond))
+    server = SimpleNamespace(started=True, should_exit=False)
+    app = FastAPI()
+    app.state.server_status = ServerStatus.STARTING
+    request = CreateSpeechRequest(
+        input="Hi", voice="Ryan", response_format="pcm", stream=True
+    )
+
+    await launcher.warm_up_server(
+        server,
+        app,
+        base_url="http://127.0.0.1:8000",
+        requests=[request],
+        timeout_s=5,
+    )
+
+    assert posted == [("/v1/audio/speech", request)]
+    assert app.state.server_status is ServerStatus.UP
 
 
 @pytest.mark.asyncio
