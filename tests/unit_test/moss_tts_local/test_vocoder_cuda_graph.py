@@ -10,6 +10,11 @@ import textwrap
 import pytest
 import torch
 
+from sglang_omni.models.moss_tts.vocoder_cuda_graph import (
+    CapturedVocoderGraph,
+    MossVocoderCudaGraphRunner,
+)
+
 pytestmark = pytest.mark.accelerator
 
 CODEC_MODEL_ID = "OpenMOSS-Team/MOSS-Audio-Tokenizer-v2"
@@ -354,11 +359,6 @@ def test_capture_failure_falls_back_to_eager(session_bundle):
 
 @pytest.mark.skipif(not HAS_CUDA, reason="needs CUDA")
 def test_partial_batch_after_full_batch_resets_padding_to_scratch_slots():
-    from sglang_omni.models.moss_tts.vocoder_cuda_graph import (
-        CapturedVocoderGraph,
-        MossVocoderCudaGraphRunner,
-    )
-
     class CountingGraph:
         def __init__(self) -> None:
             self.replays = 0
