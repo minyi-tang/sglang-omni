@@ -1,0 +1,112 @@
+name: Voxt 3397 verify (scratch, not for merge)
+on:
+  push:
+    branches: [voxt-3397-verify]
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [base, fix]
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      # HEAD = this workflow, HEAD~1 = the fix, HEAD~2 = main. "base" keeps the new
+      # regression test but restores the app sources from main.
+      - name: Select sources
+        run: |
+          git log --oneline -3
+          test "$(git rev-parse HEAD~2)" = e94104cc63428be3efeba6dd49ef9feb820c5f5d
+          if [ "${{ matrix.variant }}" = base ]; then git checkout HEAD~2 -- Voxt/Voxt; fi
+          git status --short
+          echo "uses catalogStore: $(grep -c catalogStore Voxt/Voxt/Settings/Models/ModelSettingsView.swift || true)"
+      - name: Select newest Xcode
+        run: |
+          xcode="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$xcode/Contents/Developer"
+          xcodebuild -version
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Build for testing
+        working-directory: Voxt
+        run: |
+          xcodebuild build-for-testing -project Voxt.xcodeproj -scheme Voxt -configuration TestDebug \
+            -destination platform=macOS -derivedDataPath "$RUNNER_TEMP/dd" \
+            -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/build-test.log" 2>&1 \
+            || { grep -E "error:" "$RUNNER_TEMP/build-test.log" | head -60; tail -60 "$RUNNER_TEMP/build-test.log"; exit 1; }
+      - name: Regression test
+        continue-on-error: true
+        run: |
+          xctestrun="$(find "$RUNNER_TEMP/dd/Build/Products" -maxdepth 1 -name 'Voxt_*.xctestrun' -print -quit)"
+          set +e
+          xcodebuild test-without-building -xctestrun "$xctestrun" -destination platform=macOS \
+            -only-testing:VoxtTests/ModelSettingsViewRefreshTests > "$RUNNER_TEMP/regression.log" 2>&1
+          status=$?
+          grep -E "error: |' (passed|failed) \(|Executed 1 test" "$RUNNER_TEMP/regression.log" | head -20
+          grep -E "error: |XCTAssert|' (passed|failed) \(|Executed [0-9]+ test" "$RUNNER_TEMP/regression.log" | head -40
+          echo "regression test exit status: $status"
+          exit $status
+      - name: Full unit suite
+        continue-on-error: true
+        run: |
+          xctestrun="$(find "$RUNNER_TEMP/dd/Build/Products" -maxdepth 1 -name 'Voxt_*.xctestrun' -print -quit)"
+          set +e
+          xcodebuild test-without-building -xctestrun "$xctestrun" -destination platform=macOS > "$RUNNER_TEMP/unit.log" 2>&1
+          status=$?
+          grep -E "' failed \(|Executed [0-9]+ tests" "$RUNNER_TEMP/unit.log" | tail -60
+          echo "full suite exit status: $status"
+          exit $status
+      - name: Build Debug app
+        working-directory: Voxt
+        run: |
+          xcodebuild build -project Voxt.xcodeproj -scheme Voxt -configuration Debug \
+            -destination platform=macOS -derivedDataPath "$RUNNER_TEMP/dd" \
+            -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/build-app.log" 2>&1 \
+            || { grep -E "error:" "$RUNNER_TEMP/build-app.log" | head -60; tail -60 "$RUNNER_TEMP/build-app.log"; exit 1; }
+      - name: Measure idle Model page in the real app
+        run: |
+          app="$(find "$RUNNER_TEMP/dd/Build/Products/Debug" -maxdepth 1 -name '*.app' -print -quit)"
+          echo "app: $app"
+          codesign --force --deep -s - "$app" >/dev/null 2>&1 || true
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print CFBundleIdentifier' "$app/Contents/Info.plist")"
+          defaults write "$bundle_id" onboardingCompleted -bool true
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$app/Contents/Info.plist")"
+          "$exe" > "$RUNNER_TEMP/app.log" 2>&1 &
+          pid=$!
+          sleep 25
+          kill -0 "$pid" || { echo "app exited"; tail -50 "$RUNNER_TEMP/app.log"; exit 1; }
+          measure() {
+            arrays="$(sudo heap "$pid" 2>/dev/null | awk '/ContiguousArrayStorage<Voxt.ModelCatalogEntry>/ {print $1; exit}')"
+            fp="$(sudo footprint -p "$pid" 2>/dev/null | awk '/phys_footprint:/ {print $2 $3; exit}')"
+            echo "$1 catalogEntryArrays=${arrays:-0} footprint=$fp cpu=$(ps -o %cpu= -p "$pid") cputime=$(ps -o time= -p "$pid")"
+          }
+          measure "before-navigation"
+          sudo lldb -p "$pid" --batch -o "thread select 1" \
+            -o 'expr -l objc -- (void)[[NSNotificationCenter defaultCenter] postNotificationName:@"voxt.settings.navigate" object:nil userInfo:@{@"tab":@"model"}]' \
+            -o detach 2>&1 | grep -iE "error|detached" || true
+          sleep 20
+          measure "model-page+20s"
+          sleep 60
+          measure "model-page+80s"
+          sleep 60
+          measure "model-page+140s"
+          echo "--- 3 s sample: frames under the installation handler / catalog rebuild"
+          sudo sample "$pid" 3 1 -file "$RUNNER_TEMP/sample.txt" >/dev/null 2>&1 || true
+          grep -E "closure #1 in ModelSettingsView.contentWithLifecycle|ModelSettingsView.rebuildCatalogSnapshot" "$RUNNER_TEMP/sample.txt" | sed 's/^[ +!:|]*//' | sort | uniq -c | head || true
+          kill "$pid" || true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.variant }}
+          path: |
+            ${{ runner.temp }}/regression.log
+            ${{ runner.temp }}/unit.log
+            ${{ runner.temp }}/app.log
+            ${{ runner.temp }}/sample.txt
+          if-no-files-found: ignore
