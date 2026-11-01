@@ -1,0 +1,39 @@
+name: Voxt scratch unit tests
+on:
+  push:
+    branches: ['voxt-scratch-*']
+jobs:
+  unit:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select newest Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          xcode="$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR="$xcode/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          if ! xcrun --find metal >/dev/null 2>&1 || ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+      - name: Build for testing
+        working-directory: Voxt
+        run: |
+          xcodebuild build-for-testing -project Voxt.xcodeproj -scheme Voxt -configuration TestDebug \
+            -destination platform=macOS -derivedDataPath "$RUNNER_TEMP/voxt-derived" \
+            -skipPackagePluginValidation -skipMacroValidation CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/voxt-build.log" 2>&1 \
+            || { grep -E "error:" "$RUNNER_TEMP/voxt-build.log" | head -60; tail -60 "$RUNNER_TEMP/voxt-build.log"; exit 1; }
+      - name: Unit tests
+        run: |
+          xctestrun="$(find "$RUNNER_TEMP/voxt-derived/Build/Products" -maxdepth 1 -name 'Voxt_*.xctestrun' -print -quit)"
+          set +e
+          xcodebuild test-without-building -xctestrun "$xctestrun" -destination platform=macOS > "$RUNNER_TEMP/voxt-test.log" 2>&1
+          status=$?
+          echo "xcodebuild exit status: $status"
+          grep -E "error: |' failed \(|Executed [0-9]+ tests" "$RUNNER_TEMP/voxt-test.log" | grep -v "with 0 failures" | head -200
+          echo "--- selected suites ---"
+          for t in $(cat "$GITHUB_WORKSPACE/.github/voxt-scratch-tests.txt" 2>/dev/null || echo); do grep -E "Test Suite '$t' (passed|failed)" "$RUNNER_TEMP/voxt-test.log" -A1; done
+          exit $status
